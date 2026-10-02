@@ -1,0 +1,61 @@
+#!/bin/sh
+# Fake ESXi `vim-cmd` for level-2 tests, run by test/bin/ssh inside the
+# bridge's real remote command. State lives in $FAKE_ESXI_DIR:
+#   vms        one VM per line:  <id>|<name>|<behaviour>
+#              behaviour: ok:<secs>  guest shuts down <secs> after the request
+#                         hang       never shuts down (needs a hard power-off)
+#                         notools    VMware Tools not running: shutdown refused
+#   state_<id> on | off | stopping <epoch when off>
+# Output formats follow real vim-cmd (header line, "Retrieved runtime info").
+
+d=${FAKE_ESXI_DIR:?}
+now=$(date +%s)
+
+vm_state() {
+    s=$(cat "$d/state_$1" 2>/dev/null || echo on)
+    case $s in
+        stopping*)
+            if [ "$now" -ge "${s#stopping }" ]; then
+                echo off > "$d/state_$1"
+                s=off
+            fi
+            ;;
+    esac
+    echo "$s"
+}
+
+case $1 in
+    vmsvc/getallvms)
+        echo "Vmid   Name                 File                         Guest OS         Version   Annotation"
+        while IFS='|' read -r id name beh; do
+            [ -n "$id" ] || continue
+            echo "$id      $name      [datastore1] vm$id/vm$id.vmx      otherGuest64     vmx-19"
+        done < "$d/vms"
+        ;;
+    vmsvc/power.getstate)
+        echo "Retrieved runtime info"
+        if [ "$(vm_state "$2")" = off ]; then echo "Powered off"; else echo "Powered on"; fi
+        ;;
+    vmsvc/power.shutdown)
+        beh=$(grep "^$2|" "$d/vms" | cut -d'|' -f3)
+        case $beh in
+            notools)
+                # Real vim-cmd prints the fault and may still exit 0.
+                echo "(vim.fault.ToolsUnavailable) {"
+                echo "   msg = \"Cannot complete operation because VMware Tools is not running in this virtual machine.\""
+                echo "}"
+                ;;
+            hang) echo "stopping 9999999999" > "$d/state_$2" ;;
+            ok:*) echo "stopping $((now + ${beh#ok:}))" > "$d/state_$2" ;;
+            *) echo "fake vim-cmd: no VM $2" >&2; exit 1 ;;
+        esac
+        ;;
+    vmsvc/power.off)
+        echo off > "$d/state_$2"
+        echo "Powering off VM:"
+        ;;
+    *)
+        echo "fake vim-cmd: unsupported: $*" >&2
+        exit 1
+        ;;
+esac

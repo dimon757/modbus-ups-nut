@@ -1,0 +1,73 @@
+#!/bin/sh
+# Fake Proxmox `qm` for level-2 tests, run by test/bin/ssh inside the
+# bridge's real remote command. State lives in $FAKE_PROXMOX_DIR:
+#   vms        one VM per line:  <id>|<name>|<behaviour>
+#              behaviour: ok:<secs>  guest shuts down <secs> after the request
+#                         hang       never shuts down (needs a hard power-off)
+#                         notools    guest agent not running: shutdown refused
+#   state_<id> on | off | stopping <epoch when off>
+# Output formats follow real Proxmox qm commands.
+
+d=${FAKE_PROXMOX_DIR:?}
+now=$(date +%s)
+
+vm_state() {
+    s=$(cat "$d/state_$1" 2>/dev/null || echo on)
+    case $s in
+        stopping*)
+            if [ "$now" -ge "${s#stopping }" ]; then
+                echo off > "$d/state_$1"
+                s=off
+            fi
+            ;;
+    esac
+    echo "$s"
+}
+
+case $1 in
+    list)
+        printf "%10s %-20s %-10s %10s %15s %-10s\n" "VMID" "NAME" "STATUS" "MEM(MB)" "BOOTDISK(GB)" "PID"
+        if [ -f "$d/vms" ]; then
+            while IFS='|' read -r id name beh; do
+                [ -n "$id" ] || continue
+                st=$(vm_state "$id")
+                if [ "$st" = off ]; then
+                    status="stopped"
+                    pid="0"
+                else
+                    status="running"
+                    pid="1234"
+                fi
+                printf "%10s %-20s %-10s %10s %15s %-10s\n" "$id" "$name" "$status" "2048" "32.00" "$pid"
+            done < "$d/vms"
+        fi
+        ;;
+    status)
+        if [ "$(vm_state "$2")" = off ]; then
+            echo "status: stopped"
+        else
+            echo "status: running"
+        fi
+        ;;
+    shutdown)
+        beh=$(grep "^$2|" "$d/vms" 2>/dev/null | cut -d'|' -f3)
+        case $beh in
+            notools|noagent)
+                # Real qm prints error if QEMU guest agent is not running
+                echo "VM $2 qmp command 'guest-ping' failed - got timeout" >&2
+                echo "QEMU guest agent is not running" >&2
+                exit 1
+                ;;
+            hang) echo "stopping 9999999999" > "$d/state_$2" ;;
+            ok:*) echo "stopping $((now + ${beh#ok:}))" > "$d/state_$2" ;;
+            *) echo "fake qm: no VM $2" >&2; exit 1 ;;
+        esac
+        ;;
+    stop)
+        echo off > "$d/state_$2"
+        ;;
+    *)
+        echo "fake qm: unsupported: $*" >&2
+        exit 1
+        ;;
+esac

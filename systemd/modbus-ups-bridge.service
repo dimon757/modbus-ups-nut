@@ -1,0 +1,26 @@
+[Unit]
+Description=Sunsynk inverter Modbus UPS bridge (Modbus -> SSH shutdown + WOL wake)
+# No dependency on the serial device unit: the onboard ttyS ports exist from
+# early boot, and the bridge retries opening the port every 5s anyway.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/modbus-ups-bridge /etc/modbus-ups-bridge/bridge.toml
+Restart=always
+RestartSec=5
+User=root
+# Needs: raw access to the RS485 device node, the watchdog device (if
+# configured), UDP broadcast for Wake-on-LAN, and SSH out to every endpoint
+# -- kept as root for simplicity on a single-purpose bridge box. Tighten with
+# SupplementaryGroups=dialout and CAP_NET_BROADCAST/CAP_SYS_ADMIN-only if you
+# would rather not run as root.
+Environment=RUST_LOG=info
+# Creates /var/lib/modbus-ups-bridge, where the shutdown marker lives. It
+# must survive reboots: it is how the bridge knows, after a power cut or
+# watchdog reset, that it still has to wake the endpoints on recovery.
+StateDirectory=modbus-ups-bridge
+
+[Install]
+WantedBy=multi-user.target

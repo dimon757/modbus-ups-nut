@@ -1,0 +1,19 @@
+#!/bin/sh
+# Fake Proxmox `systemctl` for level-2 tests.
+# Only `poweroff` is simulated. If $FAKE_PROXMOX_DIR/systemctl-refuse exists,
+# it simulates refusal (e.g. permission or systemd error).
+
+d=${FAKE_PROXMOX_DIR:?}
+case "$*" in
+    "poweroff"*)
+        if [ -e "$d/systemctl-refuse" ]; then
+            echo "(simulated) Failed to power off system: Operation not permitted." >&2
+            exit 1
+        fi
+        echo "poweroff via systemctl" > "$d/host"
+        ;;
+    *)
+        echo "fake systemctl: unsupported: $*" >&2
+        exit 1
+        ;;
+esac

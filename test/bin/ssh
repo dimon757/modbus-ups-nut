@@ -1,0 +1,72 @@
+#!/bin/sh
+# Fake `ssh` for level-2 tests. run-bridge.sh puts this directory first on
+# PATH, so the bridge runs this instead of the real ssh: it logs what would
+# have been sent and connects to nothing.
+#
+# Log:   $MUB_TEST_DIR/ssh.log   (default /tmp/mub-test)
+# Simulate an unreachable endpoint:  echo 10.99.0.3 >> /tmp/mub-test/ssh-fail
+# Simulate a hung endpoint:          echo 10.99.0.3 >> /tmp/mub-test/ssh-hang
+#   (the bridge should give up after its 60 s SSH timeout)
+#
+# Fake Proxmox hosts: for a host with a directory /tmp/mub-test/proxmox/<host>/
+# (made by setup.sh), commands using qm or systemctl are really EXECUTED,
+# with the fake qm/systemctl from test/pve-bin/ answering from that
+# directory's simulated VMs -- so the bridge's actual remote shell snippets
+# are exercised, not just logged. See CHECKLIST.md, scenarios N.
+
+dir=${MUB_TEST_DIR:-/tmp/mub-test}
+here=$(cd "$(dirname "$0")" && pwd)
+target=""
+for arg in "$@"; do
+    case $arg in *@*) target=$arg ;; esac
+    remote_cmd=$arg   # the last argument is the remote command
+done
+host=${target#*@}
+
+if [ -f "$dir/ssh-fail" ] && grep -qxF "$host" "$dir/ssh-fail"; then
+    echo "$(date +%T) $target FAILED (simulated): $remote_cmd" >> "$dir/ssh.log"
+    echo "ssh: connect to host $host port 22: Connection timed out (simulated)" >&2
+    exit 255
+fi
+if [ -f "$dir/ssh-hang" ] && grep -qxF "$host" "$dir/ssh-hang"; then
+    echo "$(date +%T) $target HANGING (simulated): $remote_cmd" >> "$dir/ssh.log"
+    exec sleep 600
+fi
+
+proxmox="$dir/proxmox/$host"
+if [ -d "$proxmox" ]; then
+    case $remote_cmd in
+        *qm*|*systemctl*)
+            out=$(PATH="$here/../pve-bin:$PATH" FAKE_PROXMOX_DIR="$proxmox" sh -c "$remote_cmd" 2>"$proxmox/stderr")
+            rc=$?
+            printf '%s\n' "$(date +%T) $target: $remote_cmd  -> exit $rc" >> "$dir/ssh.log"
+            [ -n "$out" ] && printf '%s\n' "$out"
+            cat "$proxmox/stderr" >&2
+            exit $rc
+            ;;
+        */sbin/poweroff*)
+            echo "poweroff via /sbin/poweroff" > "$proxmox/host"
+            ;;
+    esac
+fi
+
+esxi="$dir/esxi/$host"
+if [ -d "$esxi" ]; then
+    case $remote_cmd in
+        *shutdown.sh*) ;;
+        *vim-cmd*|*esxcli*)
+            out=$(PATH="$here/../esxi-bin:$PATH" FAKE_ESXI_DIR="$esxi" sh -c "$remote_cmd" 2>"$esxi/stderr")
+            rc=$?
+            printf '%s\n' "$(date +%T) $target: $remote_cmd  -> exit $rc" >> "$dir/ssh.log"
+            [ -n "$out" ] && printf '%s\n' "$out"
+            cat "$esxi/stderr" >&2
+            exit $rc
+            ;;
+        */sbin/poweroff*)
+            echo "poweroff via /sbin/poweroff" > "$esxi/host"
+            ;;
+    esac
+fi
+
+echo "$(date +%T) $target: $remote_cmd" >> "$dir/ssh.log"
+exit 0

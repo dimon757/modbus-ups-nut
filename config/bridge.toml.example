@@ -1,0 +1,128 @@
+# modbus-ups-bridge configuration
+# Install to /etc/modbus-ups-bridge/bridge.toml (0600, owned by the
+# service user) and fill in the values marked VERIFY.
+
+# Subnet broadcast address for Wake-on-LAN, e.g. 192.168.1.255:9 for a
+# 192.168.1.0/24 site LAN -- the subnet on the Ethernet port the endpoints
+# are connected to. Don't use 255.255.255.255 on this two-port box: it only
+# leaves through the default-route port, which may be the wrong one.
+# Must stay above the first [section] header -- TOML assigns every key after
+# a header to that section.
+wol_broadcast_addr = "192.168.1.255:9"
+
+# Where the bridge remembers that it shut everything down (so it still wakes
+# the endpoints after its own reboot). Default below; leave it -- only the
+# test config changes it.
+# state_file = "/var/lib/modbus-ups-bridge/shutdown_fired"
+
+# SSH host keys are pinned: ssh only talks to endpoints whose host key is
+# already recorded (docs/installation.md, step 8), and the bridge logs an
+# error at startup for any endpoint missing. Default: root's
+# ~/.ssh/known_hosts -- leave it; only the test config changes it.
+# ssh_known_hosts_file = "/root/.ssh/known_hosts"
+
+[modbus]
+device = "/dev/ttyS0"            # onboard RS485 port wired to the inverter;
+                                  # VERIFY which ttyS it is (dmesg | grep ttyS)
+                                  # and set that port to RS485 in the BIOS.
+baud_rate = 9600                 # fixed by the protocol document (8N1)
+slave_id = 1                     # VERIFY: the inverter's Modbus address
+                                  # setting (register 1), 1 unless changed
+poll_interval_secs = 5
+# The Sunsynk register map (which registers, what units) is not set here: it
+# belongs to the inverter model, not the site, and is defined once in
+# src/modbus.rs. Change it there and rebuild.
+
+[thresholds]
+grid_lost_voltage = 100.0        # volts; below this = 220V AC considered lost.
+                                  # This is the sole gate: above this voltage,
+                                  # nothing here shuts anything down, ever,
+                                  # regardless of SOC.
+on_battery_debounce_secs = 60
+
+# low_battery_soc MUST be set higher than inverter_cutoff_soc -- the bridge
+# refuses to start otherwise (see config.rs validate()). Put the inverter's
+# own low-SOC shutdown setting ("Battery capacity ShutDown", register 217)
+# in inverter_cutoff_soc below, then set low_battery_soc with real margin
+# above it so the graceful sequence finishes before the inverter's own
+# hardware protection cuts output. On every connect the bridge also reads
+# registers 213/217/220 from the inverter itself and logs an error if the
+# live cutoff leaves no margin, or a warning if the inverter manages the
+# battery by voltage instead of SOC.
+low_battery_soc = 30.0           # percent; triggers the shutdown sequence
+                                  # once 2 of the last 3 readings are at/below it
+inverter_cutoff_soc = 20.0       # percent; the inverter's OWN cutoff setting
+
+recovery_debounce_secs = 180     # grid must be back this long (3 min) before
+                                  # Wake-on-LAN is sent -- whatever the SOC
+stagger_secs = 30                # delay between each endpoint in the sequence
+
+# Wake-on-LAN is sent once on recovery, then resent this many times, this
+# far apart -- a machine still shutting down (e.g. Proxmox walking its VMs
+# down) when the first round goes out is woken by a later one. Make
+# count x interval comfortably longer than your slowest shutdown.
+wol_resend_count = 8             # default 8
+wol_resend_interval_secs = 120   # default 120 -> rounds over ~16 minutes
+
+# Shutdown order: top to bottom. Workstations first, then Proxmox hosts, is a
+# reasonable default -- adjust to taste.
+
+[[endpoints]]
+name = "workstation-1"
+kind = "windows"
+host = "10.x.x.x"
+ssh_user = "ups-shutdown"        # dedicated low-privilege local account --
+                                  # see README for setup and the ForceCommand
+                                  # lockdown that keeps this key single-purpose
+ssh_key_path = "/etc/modbus-ups-bridge/workstation_key"
+shutdown_delay_secs = 60         # user-visible countdown. IGNORED once the
+                                  # README's sshd ForceCommand is in place --
+                                  # its own /t wins; keep the two equal.
+mac_address = "AA:BB:CC:DD:EE:01"
+
+[[endpoints]]
+name = "workstation-2"
+kind = "windows"
+host = "10.x.x.x"
+ssh_user = "ups-shutdown"
+ssh_key_path = "/etc/modbus-ups-bridge/workstation_key"
+shutdown_delay_secs = 60
+mac_address = "AA:BB:CC:DD:EE:02"
+
+[[endpoints]]
+name = "proxmox-a"
+kind = "proxmox"
+host = "10.x.x.x"
+ssh_user = "root"
+ssh_key_path = "/etc/modbus-ups-bridge/proxmox_key"
+shutdown_delay_secs = 10
+mac_address = "AA:BB:CC:DD:EE:03"
+
+[[endpoints]]
+name = "proxmox-b"
+kind = "proxmox"
+host = "10.x.x.x"
+ssh_user = "root"
+ssh_key_path = "/etc/modbus-ups-bridge/proxmox_key"
+shutdown_delay_secs = 10
+mac_address = "AA:BB:CC:DD:EE:04"
+
+# Omit this whole section if the board has no watchdog device.
+[watchdog]
+device = "/dev/watchdog"
+
+# How the Proxmox hosts are shut down. Decide with the on-site test,
+# docs/proxmox-shutdown-test.md, then set `method` to what passed.
+#   poweroff          -- /sbin/poweroff: systemd stops pve-guests cleanly
+#                        (ordered guest shutdown) and powers off the host. (default)
+#   vms_then_poweroff -- the bridge shuts each running VM down itself
+#                        (QEMU guest agent / ACPI), waits up to
+#                        vm_shutdown_timeout_secs, powers off hard any VM
+#                        still running, then `systemctl poweroff` (falls back
+#                        to /sbin/poweroff if refused). Every VM logged.
+# Either way, enable Start at boot on each guest so VMs start again at boot.
+[proxmox]
+method = "poweroff"
+vm_shutdown_timeout_secs = 300   # vms_then_poweroff only; must fit, with the
+                                  # stagger, between low_battery_soc and the
+                                  # inverter's cutoff

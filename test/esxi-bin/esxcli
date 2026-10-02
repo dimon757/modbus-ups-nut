@@ -1,0 +1,19 @@
+#!/bin/sh
+# Fake ESXi `esxcli` for level-2 tests (see vim-cmd in this directory).
+# Only `system shutdown poweroff` is supported. If $FAKE_ESXI_DIR/esxcli-refuse
+# exists, it refuses the way a build requiring maintenance mode would.
+
+d=${FAKE_ESXI_DIR:?}
+case "$*" in
+    "system shutdown poweroff"*)
+        if [ -e "$d/esxcli-refuse" ]; then
+            echo "(simulated) Unable to power off the host: host is not in maintenance mode." >&2
+            exit 1
+        fi
+        echo "poweroff via esxcli: $*" > "$d/host"
+        ;;
+    *)
+        echo "fake esxcli: unsupported: $*" >&2
+        exit 1
+        ;;
+esac

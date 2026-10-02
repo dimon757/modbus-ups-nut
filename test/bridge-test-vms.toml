@@ -1,0 +1,70 @@
+# Level-2 test config, Proxmox method vms_then_poweroff (scenarios N) -- identical
+# to bridge-test.toml except for the [proxmox] section at the end.
+#
+# Level-2 test config: the real bridge against the inverter simulator, fake
+# ssh and a local Wake-on-LAN listener. Waits are cut from minutes to
+# seconds; everything lives in /tmp/mub-test (made by setup.sh). See
+# CHECKLIST.md.
+
+wol_broadcast_addr = "127.0.0.1:40009"      # wol_listen.py, not the LAN
+state_file = "/tmp/mub-test/shutdown_fired" # never the real service's marker
+ssh_known_hosts_file = "/tmp/mub-test/known_hosts"  # made by setup.sh
+
+[modbus]
+device = "/tmp/mub-test/ttyBR"   # bridge end of the socat virtual cable
+baud_rate = 9600
+slave_id = 1
+poll_interval_secs = 1
+
+[thresholds]
+grid_lost_voltage = 100.0
+on_battery_debounce_secs = 5     # real: 60
+low_battery_soc = 30.0
+inverter_cutoff_soc = 20.0
+recovery_debounce_secs = 10      # real: 180
+stagger_secs = 2                 # real: 30
+wol_resend_count = 3             # real: 8
+wol_resend_interval_secs = 5     # real: 120
+
+# Hosts are in a range nothing answers on; the fake ssh never connects anyway.
+[[endpoints]]
+name = "ws-1"
+kind = "windows"
+host = "10.99.0.1"
+ssh_user = "ups-shutdown"
+ssh_key_path = "/tmp/mub-test/fake_key"   # dummy, made by setup.sh (0600)
+shutdown_delay_secs = 60
+mac_address = "AA:BB:CC:00:00:01"
+
+[[endpoints]]
+name = "ws-2"
+kind = "windows"
+host = "10.99.0.2"
+ssh_user = "ups-shutdown"
+ssh_key_path = "/tmp/mub-test/fake_key"   # dummy, made by setup.sh (0600)
+shutdown_delay_secs = 60
+mac_address = "AA:BB:CC:00:00:02"
+
+[[endpoints]]
+name = "proxmox-a"
+kind = "proxmox"
+host = "10.99.0.3"
+ssh_user = "root"
+ssh_key_path = "/tmp/mub-test/fake_key"   # dummy, made by setup.sh (0600)
+shutdown_delay_secs = 10
+mac_address = "AA:BB:CC:00:00:03"
+
+[[endpoints]]
+name = "proxmox-b"
+kind = "proxmox"
+host = "10.99.0.4"
+ssh_user = "root"
+ssh_key_path = "/tmp/mub-test/fake_key"   # dummy, made by setup.sh (0600)
+shutdown_delay_secs = 10
+mac_address = "AA:BB:CC:00:00:04"
+
+# No [watchdog]: a test run must never be able to reboot the machine.
+
+[proxmox]
+method = "vms_then_poweroff"
+vm_shutdown_timeout_secs = 15    # real: 180 -- short, so a hung VM is quick to test
