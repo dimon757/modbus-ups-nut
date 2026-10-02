@@ -1,2 +1,38 @@
-/target
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.profraw
+
+# Python (test environment)
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+
+# Local test artifacts and runtime state
+*.log
+fake_key
+fake_key.pub
+fake_hostkey
+fake_hostkey.pub
+known_hosts
+shutdown_fired
+mub-test/
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
