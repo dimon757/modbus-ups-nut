@@ -223,11 +223,13 @@ async fn proxmox_vms_then_poweroff(ep: &Endpoint, opts: &ShutdownOptions) -> Res
         power_off_hard(ep, opts, vm).await;
     }
 
-    // 5. The host. `systemctl poweroff` is the standard systemd command; if it's refused
-    //    (e.g. systemctl fails or permission issue), the VMs are down by now, so
+    // 5. The host. `systemctl poweroff --no-block` is the standard systemd command;
+    //    --no-block ensures systemctl returns immediately and doesn't hold the SSH session
+    //    until network termination cuts it off abruptly (exiting 255).
+    //    If it's refused (e.g. systemctl fails or permission issue), the VMs are down by now, so
     //    a plain /sbin/poweroff is the safe fallback.
     let delay = ep.shutdown_delay_secs.max(10);
-    match ssh_exec(ep, opts, "systemctl poweroff").await {
+    match ssh_exec(ep, opts, "systemctl poweroff --no-block").await {
         Ok(_) => log::warn!("{}: host power-off scheduled via systemctl poweroff", ep.name),
         Err(e) => {
             log::error!(

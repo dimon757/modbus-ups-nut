@@ -69,13 +69,14 @@ fn wake_one(mac: &str, broadcast_addr: &str) -> Result<()> {
 }
 
 pub(crate) fn parse_mac(mac: &str) -> Result<[u8; 6]> {
-    let parts: Vec<&str> = mac.split([':', '-']).collect();
+    let trimmed = mac.trim();
+    let parts: Vec<&str> = trimmed.split([':', '-']).collect();
     if parts.len() != 6 {
         bail!("invalid MAC address {:?}: expected 6 colon/dash-separated octets", mac);
     }
     let mut out = [0u8; 6];
     for (i, p) in parts.iter().enumerate() {
-        out[i] = u8::from_str_radix(p, 16)
+        out[i] = u8::from_str_radix(p.trim(), 16)
             .with_context(|| format!("invalid octet {:?} in MAC address {:?}", p, mac))?;
     }
     Ok(out)
@@ -96,6 +97,20 @@ mod tests {
             shutdown_delay_secs: 0,
             mac_address: mac.into(),
         }
+    }
+
+    #[test]
+    fn parse_mac_handles_whitespace_and_separators() {
+        assert_eq!(
+            parse_mac(" AA:BB:CC:DD:EE:FF \n").unwrap(),
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]
+        );
+        assert_eq!(
+            parse_mac("11-22-33-44-55-66").unwrap(),
+            [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]
+        );
+        assert!(parse_mac("AA:BB:CC:DD:EE").is_err());
+        assert!(parse_mac("AA:BB:CC:DD:EE:GG").is_err());
     }
 
     #[tokio::test]

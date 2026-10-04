@@ -34,7 +34,7 @@ poll_interval_secs = 5
 # src/modbus.rs. Change it there and rebuild.
 
 [thresholds]
-grid_lost_voltage = 100.0        # volts; below this = 220V AC considered lost.
+grid_lost_voltage = 100.0        # volts (1.0-400.0); below this = 220V AC considered lost.
                                   # This is the sole gate: above this voltage,
                                   # nothing here shuts anything down, ever,
                                   # regardless of SOC.
@@ -61,6 +61,8 @@ stagger_secs = 30                # delay between each endpoint in the sequence
 # far apart -- a machine still shutting down (e.g. Proxmox walking its VMs
 # down) when the first round goes out is woken by a later one. Make
 # count x interval comfortably longer than your slowest shutdown.
+# When using vms_then_poweroff, count * interval must be at least
+# vm_shutdown_timeout_secs (checked at startup).
 wol_resend_count = 8             # default 8
 wol_resend_interval_secs = 120   # default 120 -> rounds over ~16 minutes
 
@@ -118,7 +120,7 @@ device = "/dev/watchdog"
 #   vms_then_poweroff -- the bridge shuts each running VM down itself
 #                        (QEMU guest agent / ACPI), waits up to
 #                        vm_shutdown_timeout_secs, powers off hard any VM
-#                        still running, then `systemctl poweroff` (falls back
+#                        still running, then `systemctl poweroff --no-block` (falls back
 #                        to /sbin/poweroff if refused). Every VM logged.
 # Either way, enable Start at boot on each guest so VMs start again at boot.
 [proxmox]

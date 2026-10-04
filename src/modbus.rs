@@ -134,6 +134,21 @@ impl ModbusClient {
         })
     }
 
+    /// Read an optional holding register. If the inverter returns a Modbus error
+    /// (e.g. Illegal Data Address on older firmware), returns Ok(None).
+    /// If the read times out, returns an Err so the caller reconnects rather than
+    /// leaving stale bytes on the serial line that would desynchronize RTU framing.
+    async fn read_optional(&mut self, addr: u16) -> Result<Option<u16>> {
+        match tokio::time::timeout(READ_TIMEOUT, self.ctx.read_holding_registers(addr, 1)).await {
+            Ok(Ok(rsp)) => Ok(rsp.first().copied()),
+            Ok(Err(e)) => {
+                log::debug!("optional register {:#06x} not available: {}", addr, e);
+                Ok(None)
+            }
+            Err(_) => bail!("timed out reading register {:#06x}", addr),
+        }
+    }
+
     /// Reads the inverter's own identity and battery-protection settings, so
     /// they can be checked against the bridge's thresholds (see
     /// `InverterSettings::findings`).
@@ -148,10 +163,10 @@ impl ModbusClient {
         let shutdown_voltage =
             self.read_one(REG_BATTERY_SHUTDOWN_VOLTAGE).await? as f64 / BATTERY_VOLTAGE_SCALE;
         Ok(InverterSettings {
-            // Informational: a failed read (older or other firmware) must
-            // not stop the cutoff checks.
-            protocol_version: self.read_one(REG_PROTOCOL_VERSION).await.ok(),
-            ac_power_ratio: self.read_one(REG_AC_POWER_RATIO).await.ok(),
+            // Informational: an unsupported register returns None cleanly;
+            // a timeout is an error that reconnects to keep RTU framing in sync.
+            protocol_version: self.read_optional(REG_PROTOCOL_VERSION).await?,
+            ac_power_ratio: self.read_optional(REG_AC_POWER_RATIO).await?,
             device_type,
             battery_mode,
             shutdown_soc_pct,

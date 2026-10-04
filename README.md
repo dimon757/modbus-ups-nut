@@ -58,9 +58,9 @@ flowchart TD
     low -- "no" --> onbatt
     low -- "yes" --> write["Write + fsync the<br/>shutdown marker"]
 
-    write --> seq["SSH shutdown sequence<br/>one endpoint every 30 s, in config order<br/><i>stagger_secs</i>"]
+    write --> seq["SSH shutdown sequence<br/>(cancels any previous in-flight task)<br/>one endpoint every 30 s, in config order<br/><i>stagger_secs</i>"]
     seq --> win["Windows<br/>shutdown /s /t 60"]
-    seq --> pve["Proxmox VE<br/>poweroff (pve-guests)<br/>or vms_then_poweroff"]
+    seq --> pve["Proxmox VE<br/>poweroff (pve-guests)<br/>or vms_then_poweroff (--no-block)"]
     win --> latched
     pve --> latched
 
@@ -74,7 +74,7 @@ flowchart TD
     sent -- "no" --> onbatt
     recover -- "yes" --> fired{"Did this outage<br/>shut anything down?"}
     fired -- "no, just a blip" --> poll
-    fired -- "yes" --> wol["Wake-on-LAN to every endpoint<br/>now, then 8 more rounds 2 min apart<br/><i>wol_resend_count · wol_resend_interval_secs</i>"]
+    fired -- "yes" --> wol["Wake-on-LAN to every endpoint<br/>(stops in-flight shutdown sequence)<br/>now, then 8 more rounds 2 min apart<br/><i>wol_resend_count · wol_resend_interval_secs</i>"]
     wol --> clear["Delete the<br/>shutdown marker"]
     clear --> poll
 
@@ -113,12 +113,12 @@ stateDiagram-v2
 | Transition | Exact condition | Action |
 |---|---|---|
 | GridLostDebouncing → OnBattery | grid lost for `on_battery_debounce_secs` | -- |
-| OnBattery → ShutdownLatched | SOC ≤ `low_battery_soc` on 2 of the last 3 readings | **fire** the shutdown sequence |
+| OnBattery → ShutdownLatched | SOC ≤ `low_battery_soc` on 2 of the last 3 readings | **fire** the shutdown sequence (aborts any previous in-flight task) |
 | ShutdownLatched → RecoveryDebouncing | grid back (whatever the SOC) | -- |
 | RecoveryDebouncing → ShutdownLatched | grid lost and the shutdown was already sent | -- (no second shutdown) |
-| RecoveryDebouncing → ShutdownLatched | grid lost, not yet sent, SOC low on 2 of the last 3 readings | **fire** the shutdown sequence |
+| RecoveryDebouncing → ShutdownLatched | grid lost, not yet sent, SOC low on 2 of the last 3 readings | **fire** the shutdown sequence (aborts any previous in-flight task) |
 | RecoveryDebouncing → OnBattery | grid lost, not yet sent, SOC not (yet) confirmed low | -- |
-| RecoveryDebouncing → Idle | grid back for `recovery_debounce_secs` (3 min) | **Wake-on-LAN** (with resends), only if a shutdown was sent |
+| RecoveryDebouncing → Idle | grid back for `recovery_debounce_secs` (3 min) | **Wake-on-LAN** (stops in-flight shutdown, with resends), only if a shutdown was sent |
 
 ## Target platform
 
@@ -261,10 +261,11 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
    so see it happen once before relying on it.
 
 The bridge checks at startup, and refuses to start on, a wrong SOC range,
-a poll interval outside 1-10 s (the watchdog margin), a malformed
-`wol_broadcast_addr` or MAC address, and duplicate endpoint names. SSH key
-files that are missing or readable by others are logged as errors (ssh
-refuses such keys).
+a `grid_lost_voltage` outside 1.0-400.0 V, a poll interval outside 1-10 s
+(the watchdog margin), a malformed `wol_broadcast_addr` or MAC address,
+duplicate endpoint names, and (when `vms_then_poweroff` is selected) a WOL
+window shorter than `vm_shutdown_timeout_secs`. SSH key files that are missing
+or readable by others are logged as errors (ssh refuses such keys).
 
 ## Layout
 
@@ -282,7 +283,7 @@ refuses such keys).
   and containers gracefully with their configured timeout/ordering, then powers
   off the host; `vms_then_poweroff` has the bridge shut every running VM down
   itself (`qm shutdown`, QEMU guest agent / ACPI), wait, power off hard any VM
-  still running after `vm_shutdown_timeout_secs` (`qm stop`), then `systemctl poweroff`
+  still running after `vm_shutdown_timeout_secs` (`qm stop`), then `systemctl poweroff --no-block`
   (falls back to `/sbin/poweroff` if refused) -- each such host runs in parallel
   with the rest of the sequence. Start at boot on each guest ensures VMs start
   again at boot after WOL. Which method to use is decided on site:
@@ -310,7 +311,7 @@ refuses such keys).
 
 Full explanation and step-by-step instructions: [TESTING.md](TESTING.md).
 
-1. **Unit tests** -- `cargo test`. The decision logic, config parsing, the
+1. **Unit tests** -- `cargo test` (42 tests). The decision logic, config parsing, the
    inverter-settings check, the Proxmox commands, the marker file and
    Wake-on-LAN rounds, in under a second with no hardware.
 2. **Simulated site** -- `test/`: the real binary against an inverter

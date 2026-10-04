@@ -41,6 +41,7 @@ class TestRunner:
         self.wol_proc = None
         self.bridge_proc = None
         self.bridge_logs = []
+        self.log_cursor = 0
         self.log_queue = queue.Queue()
 
     def stop_existing(self):
@@ -260,6 +261,12 @@ class TestRunner:
         log("\n=======================================================", Color.BOLD)
         log("RUNNING SCENARIO B: Short Grid Blip (< 5s)", Color.BOLD)
         log("=======================================================", Color.BOLD)
+        if not self.bridge_proc:
+            self.reset_env()
+            self.send_sim_cmd("restore")
+            self.send_sim_cmd("soc 80")
+            self.start_bridge()
+            self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
 
         self.send_sim_cmd("outage")
         line = self.wait_for_bridge_log(r"state: Idle -> GridLostDebouncing")
@@ -278,6 +285,12 @@ class TestRunner:
         log("\n=======================================================", Color.BOLD)
         log("RUNNING SCENARIO C: Outage Without Low Battery", Color.BOLD)
         log("=======================================================", Color.BOLD)
+        if not self.bridge_proc:
+            self.reset_env()
+            self.send_sim_cmd("restore")
+            self.send_sim_cmd("soc 80")
+            self.start_bridge()
+            self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
 
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: Idle -> GridLostDebouncing")

@@ -17,13 +17,14 @@ procedures: [docs/register-verification.md](docs/register-verification.md)
 (inverter registers) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)
 (Proxmox shutdown command).
 
-**Status (2026-10-02).** Level 1: 39 tests, all passing on Debian 13 (38 on
+**Status (2026-10-04).** Level 1: 42 tests, all passing on Debian 13 (41 on
 Windows, where the one Linux-only test is skipped). Level 2: all 18 scenarios
 (A-M plus the 60 s SSH timeout, and N1-N5 for the Proxmox method
 `vms_then_poweroff` against simulated VMs) passing on Debian 13 under WSL2.
 Earlier runs found and fixed a serial-port lock that stopped the bridge
-reconnecting, `setup.sh` hanging when its output was piped, and misleading
-log lines. Level 3 not yet done -- including which Proxmox method to use.
+reconnecting, `setup.sh` hanging when its output was piped, misleading
+log lines, and SSH connection drop handling on Proxmox poweroff. Level 3
+not yet done -- including which Proxmox method to use.
 
 ---
 
@@ -78,7 +79,7 @@ on immediately. A wait of **3600 s** can never pass during the test, so the
 state is guaranteed to stay put. That's also the main limit: the tests
 can't check exact timings ("fires at 60 s, not at 59 s").
 
-### The 39 tests
+### The 42 tests
 
 **State machine -- `src/state.rs`**
 
@@ -107,11 +108,13 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `poll_interval_beyond_watchdog_margin_is_rejected` | A poll interval of 0 or above 10 s is refused (the 30 s watchdog would reboot the box between polls) |
 | `duplicate_endpoint_names_are_rejected` | Two endpoints with the same name are refused (the log would be ambiguous) |
 | `soc_outside_0_100_is_rejected` | SOC thresholds outside 0-100 % are refused |
+| `grid_lost_voltage_outside_range_is_rejected` | Grid-lost voltage outside 1.0-400.0 V is refused (prevents 0 or negative voltage disabling outage detection) |
 | `loose_ssh_key_permissions_are_reported` | *Linux only.* An SSH key readable by others, or missing, is reported at startup -- ssh would refuse it during a real shutdown |
 | `old_register_settings_are_rejected` | A config that still sets register addresses (`reg_...`) is rejected: the register map lives in `src/modbus.rs` now, so the setting would do nothing |
 | `proxmox_section_is_optional_and_defaults_to_poweroff` | A config without `[proxmox]` loads, with method `poweroff` and a 300 s VM timeout |
 | `proxmox_vms_then_poweroff_can_be_selected` | `method = "vms_then_poweroff"` is accepted |
 | `proxmox_bad_method_or_timeout_is_rejected` | An unknown method, or a VM timeout outside 10-1800 s, stops the bridge at startup |
+| `wol_window_shorter_than_vm_timeout_is_rejected` | For `vms_then_poweroff`, a WOL window shorter than `vm_shutdown_timeout_secs` is refused (marker must not be cleared before host powers off) |
 
 **Inverter settings check -- `src/modbus.rs`**
 
@@ -137,6 +140,7 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `persist::set_is_set_clear_roundtrip` | The marker file is created (with its folder), is seen by a fresh instance -- i.e. after a reboot -- and is deleted |
 | `watchdog::feeds_then_disarms_through_a_clone_with_magic_v` | Feeding writes a zero byte; a requested stop writes the magic `V` through the stop handler's second handle, so `systemctl stop` doesn't reboot the box |
 | `watchdog::without_a_watchdog_configured_everything_is_a_no_op` | With no `[watchdog]` section (e.g. the test config), feeding and disarming do nothing |
+| `wol::parse_mac_handles_whitespace_and_separators` | MAC address parsing handles leading/trailing whitespace, dash or colon separators, and rejects invalid octets |
 | `wol::sends_first_round_plus_resends` | Wake-on-LAN sends 1 + N rounds of valid 102-byte packets (caught on a local socket) |
 
 ### How to run them
@@ -176,7 +180,7 @@ after that it takes seconds.
 
 | Command | Runs |
 |---|---|
-| `cargo test` | All tests (39 on Linux, 38 on Windows) |
+| `cargo test` | All tests (42 on Linux, 41 on Windows) |
 | `cargo test state::` | Only tests whose name contains `state::` (the state machine) |
 | `cargo test grid_flap` | Only tests with `grid_flap` in the name |
 | `cargo test -- --nocapture` | All tests, also showing the bridge's log messages |
@@ -187,7 +191,7 @@ after that it takes seconds.
 A good run ends with:
 
 ```
-test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
 ```
 
 A failing test is named, followed by the line where the check failed --
@@ -254,6 +258,7 @@ packets, real marker file -- but everything *around* it is simulated:
 flowchart LR
     sim["inverter_sim.py<br/>you type: outage, soc 25 …"] <-- "virtual serial cable<br/>/tmp/mub-test/ttyINV ⇄ ttyBR" --> bridge["modbus-ups-bridge<br/>(real binary, test config)"]
     bridge -- "runs ssh" --> fake["test/bin/ssh<br/>→ /tmp/mub-test/ssh.log"]
+    fake --> pve_sim["test/pve-bin/<br/>qm · systemctl<br/>(simulated VMs)"]
     bridge -- "Wake-on-LAN" --> wol["wol_listen.py<br/>127.0.0.1:40009"]
     bridge -- "marker" --> marker[("/tmp/mub-test/<br/>shutdown_fired")]
 ```

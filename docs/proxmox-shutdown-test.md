@@ -6,7 +6,7 @@ the `[proxmox]` section of `bridge.toml`:
 | `method` | What the bridge does | Relies on |
 |---|---|---|
 | `poweroff` (default) | Sends `/sbin/poweroff` detached with `nohup` | Proxmox's systemd unit `pve-guests.service` to stop running VMs and containers cleanly with their configured timeout/ordering, then powers off the host |
-| `vms_then_poweroff` | Asks every running VM to shut down (`qm shutdown <id>`, via QEMU guest agent / ACPI), waits for them, powers off hard any still running after `vm_shutdown_timeout_secs` (`qm stop <id>`), then `systemctl poweroff` (`/sbin/poweroff` fallback if refused) | The bridge directly querying and managing each VM. Every VM's shutdown and status is explicitly logged by the bridge |
+| `vms_then_poweroff` | Asks every running VM to shut down (`qm shutdown <id>`, via QEMU guest agent / ACPI), waits for them, powers off hard any still running after `vm_shutdown_timeout_secs` (`qm stop <id>`), then `systemctl poweroff --no-block` (`/sbin/poweroff` fallback if refused) | The bridge directly querying and managing each VM. Every VM's shutdown and status is explicitly logged by the bridge |
 
 This test settles which method works best for your Proxmox VE hosts on the real
 hardware, in about an hour, with one test VM:
@@ -144,7 +144,7 @@ Run the individual steps by hand from the bridge box to verify each command:
    Note how long the VM took to shut down. (The setting `vm_shutdown_timeout_secs` must exceed this duration).
 5. **Power off the host**:
    ```bash
-   sudo ssh -i /etc/modbus-ups-bridge/proxmox_key -o BatchMode=yes root@<proxmox-host> "systemctl poweroff"
+   sudo ssh -i /etc/modbus-ups-bridge/proxmox_key -o BatchMode=yes root@<proxmox-host> "systemctl poweroff --no-block"
    ```
    *(If `systemctl poweroff` is ever refused by permissions or systemd, test the fallback:)*
    ```bash

@@ -112,6 +112,13 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
                     }
                     t.abort();
                 }
+                if let Some((t, stop)) = shutdown_task.take() {
+                    if !t.is_finished() {
+                        log::warn!("cancelling previous in-flight shutdown sequence");
+                        let _ = stop.send(true);
+                        t.abort();
+                    }
+                }
                 // Before anything goes out, so a power cut mid-sequence still
                 // leaves a record that recovery needs to wake the endpoints.
                 marker.set();

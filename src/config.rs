@@ -188,6 +188,30 @@ impl Config {
                 t.inverter_cutoff_soc
             );
         }
+        if !(1.0..=400.0).contains(&t.grid_lost_voltage) {
+            bail!(
+                "thresholds.grid_lost_voltage is {:.1} V -- expected 1.0 to 400.0 V",
+                t.grid_lost_voltage
+            );
+        }
+        if t.on_battery_debounce_secs > 3600 {
+            bail!(
+                "thresholds.on_battery_debounce_secs is {} s -- must be <= 3600",
+                t.on_battery_debounce_secs
+            );
+        }
+        if t.recovery_debounce_secs > 3600 {
+            bail!(
+                "thresholds.recovery_debounce_secs is {} s -- must be <= 3600",
+                t.recovery_debounce_secs
+            );
+        }
+        if t.stagger_secs > 300 {
+            bail!(
+                "thresholds.stagger_secs is {} s -- must be <= 300",
+                t.stagger_secs
+            );
+        }
         // The watchdog must be fed more often than its timeout (30 s for the
         // N2840's iTCO_wdt). The longest gap between feeds is one poll
         // interval plus at most three 3 s read timeouts (a failed poll, then
@@ -212,6 +236,19 @@ impl Config {
                 "proxmox.vm_shutdown_timeout_secs is {} -- must be 10-1800",
                 self.proxmox.vm_shutdown_timeout_secs
             );
+        }
+        if self.proxmox.method == ProxmoxMethod::VmsThenPoweroff {
+            let total_wol_window = u64::from(t.wol_resend_count) * t.wol_resend_interval_secs;
+            if total_wol_window < self.proxmox.vm_shutdown_timeout_secs {
+                bail!(
+                    "WOL window ({} resends x {}s = {}s) is shorter than proxmox.vm_shutdown_timeout_secs ({}s) -- \
+                     the marker could be cleared before the host finishes powering off",
+                    t.wol_resend_count,
+                    t.wol_resend_interval_secs,
+                    total_wol_window,
+                    self.proxmox.vm_shutdown_timeout_secs
+                );
+            }
         }
         let mut names = std::collections::HashSet::new();
         for ep in &self.endpoints {
@@ -430,5 +467,21 @@ mod tests {
         }
         let err = toml::from_str::<Config>(&moved).unwrap_err().to_string();
         assert!(err.contains("wol_broadcast_addr"), "{err}");
+    }
+
+    #[test]
+    fn grid_lost_voltage_outside_range_is_rejected() {
+        let err = validate_err(&example_with("grid_lost_voltage = 100.0", "grid_lost_voltage = 0.0"));
+        assert!(err.contains("grid_lost_voltage"), "{err}");
+    }
+
+    #[test]
+    fn wol_window_shorter_than_vm_timeout_is_rejected() {
+        let text = example_with("method = \"poweroff\"", "method = \"vms_then_poweroff\"")
+            .replacen("wol_resend_count = 8", "wol_resend_count = 1", 1)
+            .replacen("wol_resend_interval_secs = 120", "wol_resend_interval_secs = 10", 1);
+        let cfg: Config = toml::from_str(&text).unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains("WOL window"), "{err}");
     }
 }
