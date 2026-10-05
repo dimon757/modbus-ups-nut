@@ -127,6 +127,11 @@ pub struct Thresholds {
     pub wol_resend_count: u32,
     #[serde(default = "default_wol_resend_interval_secs")]
     pub wol_resend_interval_secs: u64,
+    /// How long to keep retrying SSH connection if an endpoint is unreachable
+    /// or connection is refused (e.g. still booting from a recent wake-up).
+    /// Retries run concurrently without delaying the shutdown of other endpoints.
+    #[serde(default = "default_ssh_connect_retry_secs")]
+    pub ssh_connect_retry_secs: u64,
 }
 
 fn default_wol_resend_count() -> u32 {
@@ -135,6 +140,10 @@ fn default_wol_resend_count() -> u32 {
 
 fn default_wol_resend_interval_secs() -> u64 {
     120
+}
+
+fn default_ssh_connect_retry_secs() -> u64 {
+    90
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +219,12 @@ impl Config {
             bail!(
                 "thresholds.stagger_secs is {} s -- must be <= 300",
                 t.stagger_secs
+            );
+        }
+        if t.ssh_connect_retry_secs > 600 {
+            bail!(
+                "thresholds.ssh_connect_retry_secs is {} s -- must be <= 600",
+                t.ssh_connect_retry_secs
             );
         }
         // The watchdog must be fed more often than its timeout (30 s for the
@@ -413,6 +428,15 @@ mod tests {
     fn soc_outside_0_100_is_rejected() {
         let err = validate_err(&example_with("low_battery_soc = 30.0", "low_battery_soc = 130.0"));
         assert!(err.contains("0-100"), "{err}");
+    }
+
+    #[test]
+    fn ssh_connect_retry_secs_beyond_limit_is_rejected() {
+        let err = validate_err(&example_with(
+            "ssh_connect_retry_secs = 90",
+            "ssh_connect_retry_secs = 900",
+        ));
+        assert!(err.contains("ssh_connect_retry_secs"), "{err}");
     }
 
     #[cfg(unix)]

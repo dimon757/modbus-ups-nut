@@ -61,7 +61,7 @@ flowchart TD
     low -- "no" --> onbatt
     low -- "yes" --> write["Write + fsync<br/>shutdown marker"]
 
-    write --> seq["SSH shutdown sequence<br/>(cancels any previous in-flight task)<br/>fsync dispatched endpoint before each call<br/>one endpoint every 30 s, in config order<br/><i>stagger_secs</i>"]
+    write --> seq["SSH shutdown sequence<br/>(cancels any previous in-flight task)<br/>record dispatched endpoint in manifest<br/>one endpoint every 30 s, in config order<br/><i>stagger_secs</i><br/>(retries transient connection errors up to 90 s<br/><i>ssh_connect_retry_secs</i>)"]
     seq --> win["Windows<br/>shutdown /s /t 60"]
     seq --> pve["Proxmox VE<br/>poweroff (pve-guests)<br/>or vms_then_poweroff<br/>(parallel qm shutdown --timeout)"]
     win --> done_seq
@@ -281,8 +281,10 @@ or readable by others are logged as errors (ssh refuses such keys).
   and sequence completion across reboots, enabling mid-sequence resumption
   without duplicate commands.
 - `src/remote_shutdown.rs` -- SSH shutdown sequence, endpoints started in
-  configured order, `stagger_secs` apart. Windows: native
-  `shutdown /s /t ... /c "..."`. Proxmox VE, by `[proxmox] method`:
+  configured order, `stagger_secs` apart. Each endpoint's initial SSH connection
+  automatically retries transient connection errors (connection refused / timed out)
+  every 2 s up to `ssh_connect_retry_secs` (e.g. if the host is still booting from a
+  recent wake-up). Windows: native `shutdown /s /t ... /c "..."`. Proxmox VE, by `[proxmox] method`:
   `poweroff` (default) sends `/sbin/poweroff`, detached with `nohup` --
   Debian/Proxmox's systemd unit `pve-guests.service` stops all running VMs
   and containers gracefully with their configured timeout/ordering, then powers
@@ -316,15 +318,15 @@ or readable by others are logged as errors (ssh refuses such keys).
 
 Full explanation and step-by-step instructions: [TESTING.md](TESTING.md).
 
-1. **Unit tests** -- `cargo test` (46 tests). The decision logic, config parsing, the
-   inverter-settings check, the Proxmox commands, the marker file manifest and
-   Wake-on-LAN rounds, in under a second with no hardware.
+1. **Unit tests** -- `cargo test` (48 tests). The decision logic, config parsing, the
+   inverter-settings check, the Proxmox commands, the marker file manifest, SSH connection
+   retries for booting hosts, and Wake-on-LAN rounds, in under a second with no hardware.
 2. **Simulated site** -- `test/`: the real binary against an inverter
    simulator on a virtual serial cable, with a fake `ssh` and a local
    Wake-on-LAN listener, on any Linux machine (including the N2840 before
    it goes to site). Needs no root and can't shut down anything. Start with
-   `test/setup.sh`, then follow the 18 scenarios in
-   [`test/CHECKLIST.md`](test/CHECKLIST.md).
+   `test/setup.sh`, then follow the 20 scenarios in
+   [`test/CHECKLIST.md`](test/CHECKLIST.md) (18 automated in `test/auto_level2.py`).
 3. **On site** -- the real inverter and machines: step 8 of the deployment
    sketch below, after [docs/register-verification.md](docs/register-verification.md)
    (inverter) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)

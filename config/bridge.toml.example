@@ -57,6 +57,13 @@ recovery_debounce_secs = 180     # grid must be back this long (3 min) before
                                   # Wake-on-LAN is sent -- whatever the SOC
 stagger_secs = 30                # delay between each endpoint in the sequence
 
+# If the grid flaps and a host is still booting from a previous wake-up when
+# shutdown is triggered, its initial SSH connection may fail (connection
+# refused / timeout). The bridge retries connecting concurrently in the
+# background for up to ssh_connect_retry_secs without stalling the shutdown
+# of other endpoints. Set to 0 to disable retries.
+ssh_connect_retry_secs = 90       # seconds; default 90 (0 to disable)
+
 # Wake-on-LAN is sent once on recovery, then resent this many times, this
 # far apart -- a machine still shutting down (e.g. Proxmox walking its VMs
 # down) when the first round goes out is woken by a later one. Make

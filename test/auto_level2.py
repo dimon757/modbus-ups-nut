@@ -98,6 +98,13 @@ class TestRunner:
             p = f"{DIR}/{f}"
             if os.path.exists(p):
                 os.remove(p)
+        if os.path.exists(DIR):
+            for f in os.listdir(DIR):
+                if f.startswith("ssh-booting-"):
+                    try:
+                        os.remove(os.path.join(DIR, f))
+                    except Exception:
+                        pass
         # reset simulated proxmox and esxi vms
         for parent in ["proxmox", "esxi"]:
             for h in ["10.99.0.3", "10.99.0.4"]:
@@ -895,6 +902,69 @@ class TestRunner:
         log("  [OK] proxmox-a completed normally while proxmox-b failed as expected", Color.GREEN)
         log("--> SCENARIO N5: PASSED", Color.GREEN + Color.BOLD)
 
+    def test_scenario_o(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO O: Host Booting on Wakeup (SSH Connection Retry)", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+
+        # Simulate ws-1 (10.99.0.1) booting: 2 connection refused attempts before succeeding
+        with open(f"{DIR}/ssh-booting-10.99.0.1", "w") as f:
+            f.write("2\n")
+
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.start_bridge()
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
+
+        self.send_sim_cmd("outage")
+        self.wait_for_bridge_log(r"state: Idle -> GridLostDebouncing")
+        self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
+
+        self.send_sim_cmd("soc 25")
+        self.wait_for_bridge_log(r"firing shutdown sequence", timeout=5)
+
+        # ws-1 fails initially and logs retry warning
+        line = self.wait_for_bridge_log(r"ws-1: SSH connection failed .* host may still be booting; retrying", timeout=8)
+        log(f"  [OK] Caught retry warning: {line}", Color.GREEN)
+
+        # ws-1 eventually succeeds after booting
+        line = self.wait_for_bridge_log(r"ws-1: shutdown command accepted", timeout=12)
+        log(f"  [OK] ws-1 recovered and succeeded: {line}", Color.GREEN)
+
+        # ws-2 is then dispatched on schedule and accepted
+        line = self.wait_for_bridge_log(r"shutting down ws-2", timeout=8)
+        log(f"  [OK] ws-2 dispatched: {line}", Color.GREEN)
+        self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=8)
+
+        # Full sequence finishes
+        self.wait_for_bridge_log(r"shutdown sequence complete", timeout=15)
+        log("  [OK] Shutdown sequence finished successfully with all endpoints completed", Color.GREEN)
+
+        with open(f"{DIR}/ssh.log") as f:
+            content = f.read()
+        log(f"  [ssh.log content]:\n{content.strip()}", Color.CYAN)
+        assert "REFUSED (simulated)" in content, "Simulated refused connection was not logged!"
+        assert "10.99.0.1: shutdown /s" in content, "ws-1 shutdown command was not executed after retries!"
+
+        # Check marker file manifest
+        state_file = f"{DIR}/shutdown_fired"
+        assert os.path.exists(state_file), "State marker file missing!"
+        with open(state_file) as f:
+            marker_content = f.read()
+        assert "dispatched: ws-1" in marker_content
+        assert "dispatched: ws-2" in marker_content
+        assert "dispatched: proxmox-a" in marker_content
+        assert "dispatched: proxmox-b" in marker_content
+        assert "completed" in marker_content
+
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.wait_for_bridge_log(r"state: ShutdownLatched -> RecoveryDebouncing")
+        self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
+        log("--> SCENARIO O: PASSED", Color.GREEN + Color.BOLD)
+
     def run(self, scenarios=None):
         all_map = {
             "a": ("Scenario A (Startup & Telemetry)", self.test_scenario_a),
@@ -914,6 +984,7 @@ class TestRunner:
             "n3": ("Scenario N3 (Proxmox systemctl refused fallback)", self.test_scenario_n3),
             "n4": ("Scenario N4 (Proxmox grid returns during VM shutdown)", self.test_scenario_n4),
             "n5": ("Scenario N5 (Proxmox one host unreachable)", self.test_scenario_n5),
+            "o": ("Scenario O (Host Booting on Wakeup / SSH Retry)", self.test_scenario_o),
         }
 
         if not scenarios:

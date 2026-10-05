@@ -198,6 +198,7 @@ mod tests {
             stagger_secs: 0,
             wol_resend_count: 0,
             wol_resend_interval_secs: 0,
+            ssh_connect_retry_secs: 0,
         }
     }
 

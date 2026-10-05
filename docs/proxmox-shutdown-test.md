@@ -8,6 +8,9 @@ the `[proxmox]` section of `bridge.toml`:
 | `poweroff` (default) | Sends `/sbin/poweroff` detached with `nohup` | Proxmox's systemd unit `pve-guests.service` to stop running VMs and containers cleanly with their configured timeout/ordering, then powers off the host |
 | `vms_then_poweroff` | Asks every running VM to shut down in parallel (`qm shutdown <id> --timeout <timeout>`, via QEMU guest agent / ACPI), waits up to `vm_shutdown_timeout_secs`, powers off hard any still running (`qm stop <id>`), then `systemctl poweroff --no-block` (`/sbin/poweroff` fallback if refused) | The bridge directly querying and managing each VM. Every VM's shutdown and status is explicitly logged by the bridge |
 
+> [!NOTE]
+> If a grid flap triggers a shutdown while a Proxmox host is still booting from a previous Wake-on-LAN round, the bridge automatically retries its initial SSH connection every 2 seconds for up to `ssh_connect_retry_secs` (default 90 s) until the host's `sshd` becomes available.
+
 This test settles which method works best for your Proxmox VE hosts on the real
 hardware, in about an hour, with one test VM:
 

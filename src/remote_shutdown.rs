@@ -14,6 +14,7 @@ const SSH_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone)]
 pub struct ShutdownOptions {
     pub stagger_secs: u64,
+    pub ssh_connect_retry_secs: u64,
     pub proxmox: ProxmoxConfig,
     pub known_hosts_file: Option<String>,
 }
@@ -22,25 +23,47 @@ impl ShutdownOptions {
     pub fn from_config(cfg: &Config) -> Self {
         Self {
             stagger_secs: cfg.thresholds.stagger_secs,
+            ssh_connect_retry_secs: cfg.thresholds.ssh_connect_retry_secs,
             proxmox: cfg.proxmox.clone(),
             known_hosts_file: cfg.ssh_known_hosts_file.clone(),
         }
     }
 }
 
+const SSH_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Determines whether an SSH failure is a transient connection failure (e.g. host
+/// is still booting from a recent wake-up, port 22 not yet open, or network establishing)
+/// as opposed to a permanent failure like authentication refusal or bad syntax.
+pub fn is_transient_connection_error(err: &anyhow::Error) -> bool {
+    let s = format!("{:#}", err).to_lowercase();
+    if s.contains("permission denied")
+        || s.contains("host key verification failed")
+        || s.contains("offending key")
+        || s.contains("identification has changed")
+    {
+        return false;
+    }
+    s.contains("connection refused")
+        || s.contains("timed out")
+        || s.contains("timeout")
+        || s.contains("no route to host")
+        || s.contains("network is unreachable")
+        || s.contains("connection reset")
+        || s.contains("exited some(255)")
+}
+
 /// Runs the full site shutdown sequence in the order `endpoints` are
 /// configured, starting one endpoint every `stagger_secs`.
 ///
-/// Windows workstations get a native `shutdown` call, which shows the
-/// logged-in user the usual countdown. Proxmox hosts are shut down by the
-/// configured `ProxmoxMethod`; with `vms_then_poweroff` that takes minutes, so
-/// each such host runs in its own task and the sequence moves on to the next
-/// endpoint meanwhile.
+/// Windows workstations and Proxmox `poweroff` endpoints get a single command
+/// each, with automatic retry for transient connection errors (up to
+/// `ssh_connect_retry_secs`, e.g. if still booting from a recent wake-up).
+/// Proxmox hosts configured with `vms_then_poweroff` run in their own tasks
+/// since their guest shutdowns take minutes.
 ///
 /// `stop` turns true when recovery is confirmed: no further endpoints are
-/// started, but hosts already shutting down are left to finish -- a host
-/// abandoned half way would keep running with its VMs off, while one that
-/// completes is brought back by the Wake-on-LAN rounds and its Autostart.
+/// started, and any ongoing retry attempts are cancelled immediately.
 pub async fn run_shutdown_sequence(
     endpoints: Vec<Endpoint>,
     opts: ShutdownOptions,
@@ -61,20 +84,30 @@ pub async fn run_shutdown_sequence(
             log::warn!("recovery confirmed -- not starting the remaining endpoints");
             break;
         }
-        if let Some(ref m) = marker {
-            m.record_dispatched(&ep.name);
-        }
+
         if ep.kind == EndpointKind::Proxmox && opts.proxmox.method == ProxmoxMethod::VmsThenPoweroff {
+            if let Some(ref m) = marker {
+                m.record_dispatched(&ep.name);
+            }
             let opts = opts.clone();
+            let mut stop_rx = stop.clone();
             hosts.spawn(async move {
-                if let Err(e) = proxmox_vms_then_poweroff(&ep, &opts).await {
+                if let Err(e) = proxmox_vms_then_poweroff(&ep, &opts, &mut stop_rx).await {
                     log::error!("failed to shut down {}: {:#}", ep.name, e);
                 }
             });
-        } else if let Err(e) = shutdown_one(&ep, &opts).await {
-            // Log and continue -- one unreachable endpoint shouldn't stop us
-            // from at least trying the rest.
-            log::error!("failed to shut down {}: {:#}", ep.name, e);
+        } else {
+            let res = shutdown_one(&ep, &opts, &mut stop).await;
+            if *stop.borrow() {
+                log::warn!("recovery confirmed -- not starting the remaining endpoints");
+                break;
+            }
+            if let Some(ref m) = marker {
+                m.record_dispatched(&ep.name);
+            }
+            if let Err(e) = res {
+                log::error!("failed to shut down {}: {:#}", ep.name, e);
+            }
         }
     }
 
@@ -96,10 +129,56 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
     }
 }
 
+/// Executes an SSH command on an endpoint with retry for transient connection
+/// errors up to `ssh_connect_retry_secs`.
+async fn ssh_exec_with_retry(
+    ep: &Endpoint,
+    opts: &ShutdownOptions,
+    remote_cmd: &str,
+    timeout: Duration,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<String> {
+    let start = tokio::time::Instant::now();
+    let retry_budget = Duration::from_secs(opts.ssh_connect_retry_secs);
+
+    loop {
+        if *stop.borrow() {
+            bail!("recovery confirmed -- cancelled shutdown on {}", ep.name);
+        }
+        match ssh_exec_timeout(ep, opts, remote_cmd, timeout).await {
+            Ok(out) => return Ok(out),
+            Err(e) => {
+                let elapsed = start.elapsed();
+                if !is_transient_connection_error(&e) || elapsed >= retry_budget || *stop.borrow() {
+                    return Err(e);
+                }
+                let remaining = retry_budget.saturating_sub(elapsed);
+                log::warn!(
+                    "{}: SSH connection failed ({}) -- host may still be booting; retrying in {:?} ({}s retry budget remaining)",
+                    ep.name,
+                    e,
+                    SSH_RETRY_INTERVAL,
+                    remaining.as_secs()
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(SSH_RETRY_INTERVAL) => {}
+                    _ = stopped(stop) => {
+                        bail!("recovery confirmed -- cancelled shutdown on {}", ep.name);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// One SSH command per endpoint: Windows, and Proxmox with `poweroff`.
-async fn shutdown_one(ep: &Endpoint, opts: &ShutdownOptions) -> Result<()> {
+async fn shutdown_one(
+    ep: &Endpoint,
+    opts: &ShutdownOptions,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<()> {
     log::warn!("shutting down {} ({}) via {:?}", ep.name, ep.host, ep.kind);
-    ssh_exec(ep, opts, &remote_command(ep)).await?;
+    ssh_exec_with_retry(ep, opts, &remote_command(ep), SSH_TIMEOUT, stop).await?;
     log::info!("{}: shutdown command accepted", ep.name);
     Ok(())
 }
@@ -135,7 +214,11 @@ pub struct Vm {
 /// host. Every step is logged, and nothing is left for a human: a VM that
 /// doesn't stop in time is powered off hard -- on battery, the alternative
 /// is the inverter cutting the whole host a little later.
-async fn proxmox_vms_then_poweroff(ep: &Endpoint, opts: &ShutdownOptions) -> Result<()> {
+async fn proxmox_vms_then_poweroff(
+    ep: &Endpoint,
+    opts: &ShutdownOptions,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<()> {
     log::warn!(
         "shutting down {} ({}) via Proxmox: VMs first, then poweroff",
         ep.name,
@@ -143,8 +226,9 @@ async fn proxmox_vms_then_poweroff(ep: &Endpoint, opts: &ShutdownOptions) -> Res
     );
 
     // 1. Which VMs exist, and which are running -- read from the host now,
-    //    not from a list that can go stale.
-    let listing = ssh_exec(ep, opts, "qm list")
+    //    not from a list that can go stale. If the host is still booting from a
+    //    recent wake-up, this initial query retries until sshd is up.
+    let listing = ssh_exec_with_retry(ep, opts, "qm list", SSH_TIMEOUT, stop)
         .await
         .context("listing VMs")?;
     let vms = parse_qmlist(&listing);
@@ -556,5 +640,32 @@ mod tests {
                 .is_err(),
             "a dropped sender must not end the stagger wait"
         );
+    }
+
+    #[test]
+    fn identifies_transient_connection_errors() {
+        let err_refused = anyhow!("ssh to 10.99.0.1 exited Some(255): stderr=ssh: connect to host 10.99.0.1 port 22: Connection refused");
+        assert!(is_transient_connection_error(&err_refused));
+
+        let err_timeout = anyhow!("ssh to 10.99.0.1 exited Some(255): stderr=ssh: connect to host 10.99.0.1 port 22: Connection timed out");
+        assert!(is_transient_connection_error(&err_timeout));
+
+        let err_wall_timeout = anyhow!("ssh to 10.99.0.1 timed out after 60s");
+        assert!(is_transient_connection_error(&err_wall_timeout));
+
+        let err_no_route = anyhow!("ssh to 10.99.0.1 exited Some(255): stderr=ssh: connect to host 10.99.0.1 port 22: No route to host");
+        assert!(is_transient_connection_error(&err_no_route));
+
+        let err_reset = anyhow!("ssh to 10.99.0.1 exited Some(255): stderr=Connection reset by peer");
+        assert!(is_transient_connection_error(&err_reset));
+
+        let err_perm = anyhow!("ssh to 10.99.0.1 exited Some(255): stderr=root@10.99.0.1: Permission denied (publickey).");
+        assert!(!is_transient_connection_error(&err_perm));
+
+        let err_hostkey = anyhow!("ssh to 10.99.0.1 exited Some(255): stderr=@ Host key verification failed.");
+        assert!(!is_transient_connection_error(&err_hostkey));
+
+        let err_cmd = anyhow!("ssh to 10.99.0.1 exited Some(1): stderr=bash: invalid command");
+        assert!(!is_transient_connection_error(&err_cmd));
     }
 }

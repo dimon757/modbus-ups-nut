@@ -282,6 +282,22 @@ wait for `OnBattery`; `soc 25`; about 6 s later `restore` and `soc 40`.
 - [ ] `failed to shut down proxmox-b: listing VMs: ssh to 10.99.0.4 exited Some(255): ...`
 - [ ] proxmox-a is shut down normally, as in N1
 
+---
+
+## O. Host booting on wakeup (SSH connection retry)
+
+Simulates an endpoint that is still booting up from a previous Wake-on-LAN round when a new outage fires. Its SSH daemon is not yet ready, returning `Connection refused`. The bridge retries every 2 s up to `ssh_connect_retry_secs`, then succeeds once sshd is available.
+
+**Do:** `./setup.sh reset`; `echo 2 > /tmp/mub-test/ssh-booting-10.99.0.1`; `outage`; wait for `OnBattery`; `soc 25`.
+
+**Expect:**
+- [ ] `ws-1: SSH connection failed ... -- host may still be booting; retrying in 2s (3s retry budget remaining)`
+- [ ] `ws-1` retries until the `ssh-booting` counter is exhausted
+- [ ] `ws-1: shutdown command accepted`
+- [ ] sequence proceeds with `ws-2`, `proxmox-a`, and `proxmox-b`
+- [ ] `shutdown sequence complete` with all endpoints recorded in marker file
+- [ ] `restore`, `soc 80`: Wake-on-LAN fires on recovery and clears marker
+
 ## What this does and doesn't prove
 
 **Proves:** the decision logic running on the real clock; the Modbus RTU

@@ -17,10 +17,10 @@ procedures: [docs/register-verification.md](docs/register-verification.md)
 (inverter registers) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)
 (Proxmox shutdown command).
 
-**Status (2026-10-05).** Level 1: 46 tests, all passing on Debian 13 (45 on
-Windows, where the one Linux-only test is skipped). Level 2: all 19 scenarios
-(A-M plus the 60 s SSH timeout, F2 for mid-sequence restart resumption, and N1-N5 for the Proxmox method
-`vms_then_poweroff` against simulated VMs) passing on Debian 13 under WSL2.
+**Status (2026-10-05).** Level 1: 48 tests, all passing on Debian 13 (47 on
+Windows, where the one Linux-only test is skipped). Level 2: all 20 scenarios
+(A-M plus the 60 s SSH timeout, F2 for mid-sequence restart resumption, N1-N5 for the Proxmox method
+`vms_then_poweroff` against simulated VMs, and O for host booting / SSH connection retries) passing on Debian 13 under WSL2.
 Earlier runs found and fixed a serial-port lock that stopped the bridge
 reconnecting, `setup.sh` hanging when its output was piped, misleading
 log lines, and SSH connection drop handling on Proxmox poweroff. Level 3
@@ -79,7 +79,7 @@ on immediately. A wait of **3600 s** can never pass during the test, so the
 state is guaranteed to stay put. That's also the main limit: the tests
 can't check exact timings ("fires at 60 s, not at 59 s").
 
-### The 46 tests
+### The 48 tests
 
 **State machine -- `src/state.rs`**
 
@@ -115,6 +115,7 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `proxmox_vms_then_poweroff_can_be_selected` | `method = "vms_then_poweroff"` is accepted |
 | `proxmox_bad_method_or_timeout_is_rejected` | An unknown method, or a VM timeout outside 10-1800 s, stops the bridge at startup |
 | `wol_window_shorter_than_vm_timeout_is_rejected` | For `vms_then_poweroff`, a WOL window shorter than `vm_shutdown_timeout_secs` is refused (marker must not be cleared before host powers off) |
+| `ssh_connect_retry_secs_beyond_limit_is_rejected` | An `ssh_connect_retry_secs` value > 600 s is refused |
 
 **Inverter settings check -- `src/modbus.rs`**
 
@@ -138,6 +139,7 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `remote_shutdown::recognises_qm_failure_text` | Failure text printed by `qm` (which may still exit 0) is recognised as a refused shutdown |
 | `remote_shutdown::qm_shutdown_command_includes_timeout` | The `qm shutdown` command format includes `--timeout` for Proxmox VE |
 | `remote_shutdown::distinguishes_timeout_from_guest_refusal` | Error classification accurately separates VM shutdown timeouts from guest agent refusals |
+| `remote_shutdown::identifies_transient_connection_errors` | Distinguishes transient connection errors (connection refused, timed out, 255) from permanent auth or command failures |
 | `remote_shutdown::stop_signal_resolves_on_true_but_not_on_a_dropped_sender` | Confirmed recovery stops the sequence from starting more endpoints, but a replaced sequence doesn't skip its stagger delays |
 | `persist::set_is_set_clear_roundtrip` | The marker file is created (with its folder), is seen by a fresh instance -- i.e. after a reboot -- and is deleted |
 | `persist::state_transitions_incomplete_and_completed` | Manifest states: Incomplete records dispatched endpoints in order, Completed marks finished sequence, NotSet when absent |
@@ -285,7 +287,7 @@ anything: the fake `ssh` never connects, Wake-on-LAN only goes to
 | `bridge-test-vms.toml` | The same, with Proxmox method `vms_then_poweroff` and a 15 s VM timeout -- for scenarios N (`./run-bridge.sh vms`) |
 | `run-bridge.sh` | Builds the bridge and starts it with the test config, the fake `ssh` first on `PATH`, and debug logging |
 | `requirements.txt` | pymodbus 3.15.0 and pyserial 3.5, pinned -- pymodbus changes its API between versions |
-| `CHECKLIST.md` | The 19 scenarios (A-M, F2, N1-N5), with the exact log lines to expect |
+| `CHECKLIST.md` | The 20 scenarios (A-M, F2, N1-N5, O), with the exact log lines to expect |
 
 ### How to run it
 
@@ -434,6 +436,7 @@ The simulator and bridge can keep running.
 | N3 | `systemctl poweroff` refused | `systemctl-refuse` file | Falls back to `/sbin/poweroff` |
 | N4 | Grid back mid-way | `restore` while a host waits for a hung VM | That host still completes; Wake-on-LAN brings it back |
 | N5 | Proxmox host unreachable | `ssh-fail` file | Logged; the other host still shut down |
+| O | Host booting on wakeup (SSH retry) | `ssh-booting-<host>` file | Initial attempts return connection refused; retried every 2 s up to `ssh_connect_retry_secs`, then succeeds; all endpoints complete |
 
 #### Step 8 -- finish
 
@@ -473,12 +476,13 @@ grid 230 V, SOC 80 %, cutoff 20 %, capacity mode.
 
 ### Simulating SSH problems
 
-The fake `ssh` reads two files in `/tmp/mub-test`, one host per line:
+The fake `ssh` reads files in `/tmp/mub-test`:
 
 | File | Effect for the listed host | Example |
 |---|---|---|
 | `ssh-fail` | Fails immediately, like a machine that's off or unreachable | `echo 10.99.0.3 >> /tmp/mub-test/ssh-fail` |
 | `ssh-hang` | Never answers, until the bridge's 60 s SSH timeout kills it | `echo 10.99.0.2 >> /tmp/mub-test/ssh-hang` |
+| `ssh-booting-<host>` | Returns simulated `Connection refused` for N attempts, then succeeds | `echo 2 > /tmp/mub-test/ssh-booting-10.99.0.1` |
 
 The test endpoints are `10.99.0.1` (ws-1), `10.99.0.2` (ws-2), `10.99.0.3`
 (proxmox-a) and `10.99.0.4` (proxmox-b). `./setup.sh reset` removes both files and

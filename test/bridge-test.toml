@@ -22,6 +22,7 @@ recovery_debounce_secs = 10      # real: 180
 stagger_secs = 2                 # real: 30
 wol_resend_count = 3             # real: 8
 wol_resend_interval_secs = 5     # real: 120
+ssh_connect_retry_secs = 4       # real: 90
 
 # Hosts are in a range nothing answers on; the fake ssh never connects anyway.
 [[endpoints]]

@@ -23,6 +23,18 @@ for arg in "$@"; do
 done
 host=${target#*@}
 
+if [ -f "$dir/ssh-booting-$host" ]; then
+    count=$(cat "$dir/ssh-booting-$host" 2>/dev/null || echo 0)
+    if [ "$count" -gt 0 ]; then
+        echo "$((count - 1))" > "$dir/ssh-booting-$host"
+        echo "$(date +%T) $target REFUSED (simulated): $remote_cmd (booting, $count attempt(s) remaining)" >> "$dir/ssh.log"
+        echo "ssh: connect to host $host port 22: Connection refused (simulated)" >&2
+        exit 255
+    else
+        rm -f "$dir/ssh-booting-$host"
+    fi
+fi
+
 if [ -f "$dir/ssh-fail" ] && grep -qxF "$host" "$dir/ssh-fail"; then
     echo "$(date +%T) $target FAILED (simulated): $remote_cmd" >> "$dir/ssh.log"
     echo "ssh: connect to host $host port 22: Connection timed out (simulated)" >&2
