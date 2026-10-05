@@ -528,6 +528,7 @@ class TestRunner:
         # Simulate grid flickers back momentarily (e.g. 230V, soc 25) right when bridge restarts
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 25")
+        time.sleep(0.5)
 
         self.start_bridge()
         line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 2 endpoint\(s\) already dispatched, 2 remaining", timeout=10)
@@ -661,6 +662,100 @@ class TestRunner:
         self.wait_for_bridge_log(r"state: ShutdownLatched -> RecoveryDebouncing", timeout=10)
         self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
         log("--> SCENARIO F4: PASSED", Color.GREEN + Color.BOLD)
+
+    def test_scenario_f5(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO F5: Failed endpoint retried after sequence finishes (completed withheld)", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+
+        # ws-2 will fail
+        with open(f"{DIR}/ssh-fail", "w") as f:
+            f.write("10.99.0.2\n")
+
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.start_bridge(CONFIG)
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
+
+        self.send_sim_cmd("outage")
+        self.wait_for_bridge_log(r"state: Idle -> GridLostDebouncing")
+        self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
+        self.send_sim_cmd("soc 25")
+        self.wait_for_bridge_log(r"firing shutdown sequence", timeout=5)
+
+        # ws-1 succeeds
+        line = self.wait_for_bridge_log(r"shutting down ws-1", timeout=8)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        # ws-2 fails initial connect and moves to background retry
+        line = self.wait_for_bridge_log(r"ws-2: initial connection failed .* continuing retries in background", timeout=10)
+        log(f"  [OK] Caught initial failure for ws-2: {line}", Color.GREEN)
+
+        # proxmox-a and proxmox-b succeed immediately
+        self.wait_for_bridge_log(r"shutting down proxmox-a", timeout=10)
+        self.wait_for_bridge_log(r"shutting down proxmox-b", timeout=10)
+
+        # ws-2 exhausts background retry budget and logs failure
+        line = self.wait_for_bridge_log(r"failed to shut down ws-2", timeout=15)
+        log(f"  [OK] ws-2 failed as expected: {line}", Color.GREEN)
+
+        # Bridge logs that marker is left incomplete
+        line = self.wait_for_bridge_log(r"shutdown sequence finished: 3/4 endpoint\(s\) succeeded; marker left incomplete for retry on restart", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        self.wait_for_bridge_log(r"shutdown sequence complete", timeout=10)
+
+        # Inspect marker file AFTER full sequence finished: completed must NOT be present!
+        with open(f"{DIR}/shutdown_fired") as f:
+            marker_content = f.read()
+        assert "dispatched: ws-1" in marker_content, "ws-1 must be marked dispatched"
+        assert "dispatched: proxmox-a" in marker_content, "proxmox-a must be marked dispatched"
+        assert "dispatched: proxmox-b" in marker_content, "proxmox-b must be marked dispatched"
+        assert "dispatched: ws-2" not in marker_content, "failed ws-2 must NOT be marked dispatched"
+        assert "completed" not in marker_content, "completed must NOT be written when an endpoint failed!"
+        log("  [OK] Marker correctly excludes failed ws-2 and withholds 'completed'", Color.GREEN)
+
+        # Now simulate a restart AFTER the sequence finished
+        self.stop_bridge()
+
+        # Fix ws-2 failure
+        if os.path.exists(f"{DIR}/ssh-fail"):
+            os.remove(f"{DIR}/ssh-fail")
+
+        # Restart bridge during ongoing outage
+        self.start_bridge(CONFIG)
+
+        # Bridge must recognize that ws-1, proxmox-a, proxmox-b were dispatched, but ws-2 remains!
+        line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 3 endpoint\(s\) already dispatched, 1 remaining: \[\"ws-2\"\]", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        line = self.wait_for_bridge_log(r"resuming shutdown sequence for 1 remaining endpoint\(s\)", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        # ws-2 is retried and accepted!
+        line = self.wait_for_bridge_log(r"shutting down ws-2", timeout=8)
+        log(f"  [OK] {line}", Color.GREEN)
+        self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=8)
+        log("  [OK] ws-2 was retried and succeeded", Color.GREEN)
+
+        # All endpoints succeeded on this run -> completed is now written!
+        line = self.wait_for_bridge_log(r"shutdown sequence complete: all 1 endpoint\(s\) succeeded", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        with open(f"{DIR}/shutdown_fired") as f:
+            final_marker = f.read()
+        assert "completed" in final_marker, "final marker must now have completed"
+        assert "dispatched: ws-2" in final_marker, "final marker must include ws-2"
+        log("  [OK] All endpoints recorded as dispatched and sequence marked completed", Color.GREEN)
+
+        # Recovery + WOL
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.wait_for_bridge_log(r"state: ShutdownLatched -> RecoveryDebouncing", timeout=10)
+        self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
+        log("--> SCENARIO F5: PASSED", Color.GREEN + Color.BOLD)
 
     def test_scenario_g(self):
         log("\n=======================================================", Color.BOLD)
@@ -1183,6 +1278,7 @@ class TestRunner:
             "f2": ("Scenario F2 (Process restart mid-sequence)", self.test_scenario_f2),
             "f3": ("Scenario F3 (Restart mid-sequence with grid flicker)", self.test_scenario_f3),
             "f4": ("Scenario F4 (Failed endpoint retried & Proxmox timing)", self.test_scenario_f4),
+            "f5": ("Scenario F5 (Failed endpoint retried after sequence finishes)", self.test_scenario_f5),
             "g": ("Scenario G (Silent inverter)", self.test_scenario_g),
             "h": ("Scenario H (Garbage SOC read)", self.test_scenario_h),
             "k": ("Scenario K (Outage during WoL)", self.test_scenario_k),

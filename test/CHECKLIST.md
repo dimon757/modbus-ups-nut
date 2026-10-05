@@ -166,6 +166,23 @@ Simulates an endpoint failing (or a bridge restart during long Proxmox VM shutdo
 - [ ] `proxmox-a` and `proxmox-b` complete VM shutdown and host poweroff
 - [ ] `shutdown sequence complete` and marker file marked `completed`
 
+## F5. Failed endpoint retried after sequence finishes (completed withheld)
+
+Simulates an endpoint that fails permanently or exhausts its retry budget while the rest of the sequence completes to the end. The bridge must withhold `completed` so that any subsequent restart (e.g. minutes or hours later during an ongoing outage) still identifies the failed endpoint as incomplete and retries it, rather than skipping it.
+
+**Do:** `./setup.sh reset`. Add failure for ws-2: `echo 10.99.0.2 > /tmp/mub-test/ssh-fail`. Start bridge: `./run-bridge.sh`. Trigger outage: `outage`, `soc 25`. Wait for the full shutdown sequence to finish (`shutdown sequence complete`). Inspect `/tmp/mub-test/shutdown_fired`: verify `completed` is absent and `ws-2` is not dispatched. Stop bridge (Ctrl+C). Remove failure: `rm /tmp/mub-test/ssh-fail`. Restart bridge: `./run-bridge.sh`.
+
+**Expect:**
+- [ ] during initial outage, ws-1, proxmox-a, proxmox-b succeed; ws-2 exhausts retry budget and fails
+- [ ] bridge logs: `shutdown sequence finished: 3/4 endpoint(s) succeeded; marker left incomplete for retry on restart`
+- [ ] `/tmp/mub-test/shutdown_fired` contains `dispatched` for ws-1, proxmox-a, proxmox-b, but NOT `completed`
+- [ ] on restart: `indicates incomplete shutdown: 3 endpoint(s) already dispatched, 1 remaining: ["ws-2"]`
+- [ ] `resuming shutdown sequence for 1 remaining endpoint(s)`
+- [ ] `ws-2` is retried and succeeds: `ws-2: shutdown command accepted`
+- [ ] bridge logs: `shutdown sequence complete: all 1 endpoint(s) succeeded`
+- [ ] `/tmp/mub-test/shutdown_fired` now contains `completed`
+- [ ] restore grid: Wake-on-LAN fires and marker file is removed
+
 ## G. Inverter goes silent -- no shutdown on missing data
 
 **Do:** stop the simulator (Ctrl+C) for ~15 s, then start it again.

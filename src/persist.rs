@@ -276,5 +276,32 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn marker_without_completed_remains_incomplete_for_restart() {
+        let dir = std::env::temp_dir().join(format!("mub-marker-restart-{}", std::process::id()));
+        let marker = ShutdownMarker::new(dir.join("shutdown_fired"));
+
+        marker.set();
+        marker.record_dispatched("ws-1");
+        marker.record_dispatched("proxmox-a");
+        marker.record_dispatched("proxmox-b");
+        // ws-2 failed, so mark_completed was NOT called
+
+        assert_eq!(
+            marker.state(),
+            ShutdownState::Incomplete {
+                dispatched: vec!["ws-1".into(), "proxmox-a".into(), "proxmox-b".into()]
+            }
+        );
+
+        // Later restart retries ws-2, which now succeeds and marks completed
+        marker.record_dispatched("ws-2");
+        marker.mark_completed();
+
+        assert_eq!(marker.state(), ShutdownState::Completed);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 

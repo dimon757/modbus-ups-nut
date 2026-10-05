@@ -71,7 +71,9 @@ pub async fn run_shutdown_sequence(
     mut stop: watch::Receiver<bool>,
 ) {
     log::warn!("shutdown sequence starting: {} endpoint(s)", endpoints.len());
-    let mut hosts = JoinSet::new();
+    let total = endpoints.len();
+    let mut foreground_successes: usize = 0;
+    let mut hosts: JoinSet<bool> = JoinSet::new();
     let mut need_stagger = false;
 
     for ep in endpoints.into_iter() {
@@ -102,10 +104,14 @@ pub async fn run_shutdown_sequence(
                             if let Some(ref m) = marker {
                                 m.record_dispatched(&ep.name);
                             }
+                            true
+                        } else {
+                            false
                         }
                     }
                     Err(e) => {
                         log::error!("failed to shut down {}: {:#}", ep.name, e);
+                        false
                     }
                 }
             });
@@ -119,6 +125,7 @@ pub async fn run_shutdown_sequence(
                     if let Some(ref m) = marker {
                         m.record_dispatched(&ep.name);
                     }
+                    foreground_successes += 1;
                     need_stagger = true;
                 }
                 Err(e) if is_transient_connection_error(&e) => {
@@ -139,7 +146,7 @@ pub async fn run_shutdown_sequence(
                                 _ = tokio::time::sleep(SSH_RETRY_INTERVAL) => {}
                                 _ = stopped(&mut stop_rx) => {
                                     log::warn!("recovery confirmed -- cancelled background shutdown retry for {}", ep.name);
-                                    return;
+                                    return false;
                                 }
                             }
                             match ssh_exec_with_retry(&ep, &opts, &cmd, SSH_TIMEOUT, &mut stop_rx).await {
@@ -149,10 +156,14 @@ pub async fn run_shutdown_sequence(
                                         if let Some(ref m) = marker {
                                             m.record_dispatched(&ep.name);
                                         }
+                                        true
+                                    } else {
+                                        false
                                     }
                                 }
                                 Err(e) => {
                                     log::error!("failed to shut down {}: {:#}", ep.name, e);
+                                    false
                                 }
                             }
                         });
@@ -170,11 +181,29 @@ pub async fn run_shutdown_sequence(
         }
     }
 
-    while hosts.join_next().await.is_some() {}
-    if !*stop.borrow() {
-        if let Some(ref m) = marker {
-            m.mark_completed();
+    let mut background_successes: usize = 0;
+    while let Some(res) = hosts.join_next().await {
+        if let Ok(true) = res {
+            background_successes += 1;
         }
+    }
+
+    let total_succeeded = foreground_successes + background_successes;
+    if !*stop.borrow() {
+        if total_succeeded == total {
+            if let Some(ref m) = marker {
+                m.mark_completed();
+            }
+            log::warn!("shutdown sequence complete: all {} endpoint(s) succeeded", total);
+        } else {
+            log::warn!(
+                "shutdown sequence finished: {}/{} endpoint(s) succeeded; marker left incomplete for retry on restart",
+                total_succeeded,
+                total
+            );
+        }
+    } else {
+        log::warn!("shutdown sequence stopped: recovery confirmed");
     }
     log::warn!("shutdown sequence complete");
 }

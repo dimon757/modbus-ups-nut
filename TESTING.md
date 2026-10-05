@@ -17,9 +17,9 @@ procedures: [docs/register-verification.md](docs/register-verification.md)
 (inverter registers) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)
 (Proxmox shutdown command).
 
-**Status (2026-10-05).** Level 1: 50 tests, all passing on Debian 13 (49 on
-Windows, where the one Linux-only test is skipped). Level 2: all 23 scenarios
-(A-M plus the 60 s SSH timeout, F2 for mid-sequence restart resumption, F3 for grid flicker during restart, F4 for failed endpoint retry & Proxmox timing, N1-N5 for the Proxmox method
+**Status (2026-10-05).** Level 1: 51 tests, all passing on Debian 13 (50 on
+Windows, where the one Linux-only test is skipped). Level 2: all 24 scenarios
+(A-M plus the 60 s SSH timeout, F2 for mid-sequence restart resumption, F3 for grid flicker during restart, F4 for failed endpoint retry & Proxmox timing, F5 for failed endpoint retry after sequence finishes, N1-N5 for the Proxmox method
 `vms_then_poweroff` against simulated VMs, O for host booting without head-of-line blocking, and P for server booting with per-endpoint retry budget) passing on Debian 13 under WSL2.
 Earlier runs found and fixed a serial-port lock that stopped the bridge
 reconnecting, `setup.sh` hanging when its output was piped, misleading
@@ -145,6 +145,7 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `persist::set_is_set_clear_roundtrip` | The marker file is created (with its folder), is seen by a fresh instance -- i.e. after a reboot -- and is deleted |
 | `persist::state_transitions_incomplete_and_completed` | Manifest states: Incomplete records dispatched endpoints in order, Completed marks finished sequence, NotSet when absent |
 | `persist::failed_endpoint_omitted_from_marker_is_not_marked_dispatched` | Failed endpoints omitted from the marker manifest remain in the incomplete state for retry on restart |
+| `persist::marker_without_completed_remains_incomplete_for_restart` | A sequence with failed endpoints withholds `completed`, leaving the marker incomplete so a later restart retries only the failed ones |
 | `persist::legacy_marker_parses_as_completed` | Backward compatibility with unformatted legacy marker files |
 | `watchdog::feeds_then_disarms_through_a_clone_with_magic_v` | Feeding writes a zero byte; a requested stop writes the magic `V` through the stop handler's second handle, so `systemctl stop` doesn't reboot the box |
 | `watchdog::without_a_watchdog_configured_everything_is_a_no_op` | With no `[watchdog]` section (e.g. the test config), feeding and disarming do nothing |
@@ -289,7 +290,7 @@ anything: the fake `ssh` never connects, Wake-on-LAN only goes to
 | `bridge-test-vms.toml` | The same, with Proxmox method `vms_then_poweroff` and a 15 s VM timeout -- for scenarios N (`./run-bridge.sh vms`) |
 | `run-bridge.sh` | Builds the bridge and starts it with the test config, the fake `ssh` first on `PATH`, and debug logging |
 | `requirements.txt` | pymodbus 3.15.0 and pyserial 3.5, pinned -- pymodbus changes its API between versions |
-| `CHECKLIST.md` | The 23 scenarios (A-M, F2, F3, F4, N1-N5, O, P), with the exact log lines to expect |
+| `CHECKLIST.md` | The 24 scenarios (A-M, F2, F3, F4, F5, N1-N5, O, P), with the exact log lines to expect |
 
 ### How to run it
 
@@ -429,6 +430,7 @@ The simulator and bridge can keep running.
 | F2 | Bridge restart mid-sequence | partial manifest in marker, restart bridge | Resumes remaining endpoints without re-calling dispatched ones; completes sequence |
 | F3 | Grid flicker during restart | restart during grid blip, outage resumes | Holds sequence while grid is temporarily up; resumes immediately when grid drops; completes cleanly |
 | F4 | Failed endpoint retry & Proxmox timing | endpoint fails, Proxmox VM delay, restart | Failed endpoints and mid-flight VMs omitted from marker; retried on restart; Proxmox host recorded only after poweroff |
+| F5 | Failed endpoint retry after sequence finishes | endpoint fails, sequence finishes, restart bridge | Sequence finishes with `completed` withheld; marker remains incomplete; restart retries failed endpoint, marks completed upon success |
 | G | Inverter silent | Ctrl+C the simulator for 15 s | Errors and retries, **no** shutdown |
 | H | Garbage SOC | `set 184 150` during an outage | Bad read, **no** shutdown |
 | I | Cutoff without margin | `set 217 30`, restart bridge | Error logged |

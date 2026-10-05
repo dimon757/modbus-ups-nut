@@ -205,8 +205,10 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
   - Proxmox hosts (`vms_then_poweroff`) are recorded **only** after guest VMs finish
     stopping and host power-off is scheduled, preventing premature skipping if the
     bridge restarts during long VM shutdowns.
-  - Endpoints that failed to shut down are **omitted** from the manifest so they are
-    retried on restart.
+  - Endpoints that failed to shut down are **omitted** from the manifest. If any endpoint
+    fails or exhausts its retry budget, `completed` is withheld from the marker; any subsequent
+    restart during the outage (even long after the sequence ended) sees the marker as incomplete
+    and retries only the failed machines.
   - If the bridge restarts mid-sequence and the grid flickers back for just one reading,
     remaining shutdowns are **not** discarded; they are held pending recovery confirmation.
     If the grid drops back down before `recovery_debounce_secs` (3 minutes), the remaining
