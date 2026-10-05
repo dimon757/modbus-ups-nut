@@ -22,7 +22,7 @@ recovery_debounce_secs = 10      # real: 180
 stagger_secs = 2                 # real: 30
 wol_resend_count = 3             # real: 8
 wol_resend_interval_secs = 5     # real: 120
-ssh_connect_retry_secs = 4       # real: 90
+ssh_connect_retry_secs = 6       # real: 300
 
 # Hosts are in a range nothing answers on; the fake ssh never connects anyway.
 [[endpoints]]
@@ -51,6 +51,7 @@ ssh_user = "root"
 ssh_key_path = "/tmp/mub-test/fake_key"   # dummy, made by setup.sh (0600)
 shutdown_delay_secs = 10
 mac_address = "AA:BB:CC:00:00:03"
+ssh_connect_retry_secs = 12
 
 [[endpoints]]
 name = "proxmox-b"

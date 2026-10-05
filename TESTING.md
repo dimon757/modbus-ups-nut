@@ -17,10 +17,10 @@ procedures: [docs/register-verification.md](docs/register-verification.md)
 (inverter registers) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)
 (Proxmox shutdown command).
 
-**Status (2026-10-05).** Level 1: 49 tests, all passing on Debian 13 (48 on
-Windows, where the one Linux-only test is skipped). Level 2: all 22 scenarios
+**Status (2026-10-05).** Level 1: 50 tests, all passing on Debian 13 (49 on
+Windows, where the one Linux-only test is skipped). Level 2: all 23 scenarios
 (A-M plus the 60 s SSH timeout, F2 for mid-sequence restart resumption, F3 for grid flicker during restart, F4 for failed endpoint retry & Proxmox timing, N1-N5 for the Proxmox method
-`vms_then_poweroff` against simulated VMs, and O for host booting / SSH connection retries) passing on Debian 13 under WSL2.
+`vms_then_poweroff` against simulated VMs, O for host booting without head-of-line blocking, and P for server booting with per-endpoint retry budget) passing on Debian 13 under WSL2.
 Earlier runs found and fixed a serial-port lock that stopped the bridge
 reconnecting, `setup.sh` hanging when its output was piped, misleading
 log lines, and SSH connection drop handling on Proxmox poweroff. Level 3
@@ -115,7 +115,8 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `proxmox_vms_then_poweroff_can_be_selected` | `method = "vms_then_poweroff"` is accepted |
 | `proxmox_bad_method_or_timeout_is_rejected` | An unknown method, or a VM timeout outside 10-1800 s, stops the bridge at startup |
 | `wol_window_shorter_than_vm_timeout_is_rejected` | For `vms_then_poweroff`, a WOL window shorter than `vm_shutdown_timeout_secs` is refused (marker must not be cleared before host powers off) |
-| `ssh_connect_retry_secs_beyond_limit_is_rejected` | An `ssh_connect_retry_secs` value > 600 s is refused |
+| `ssh_connect_retry_secs_beyond_limit_is_rejected` | An `ssh_connect_retry_secs` value > 1800 s (global or per-endpoint) is refused |
+| `endpoint_ssh_connect_retry_secs_can_override_global` | An endpoint can set its own `ssh_connect_retry_secs`, overriding the global thresholds default |
 
 **Inverter settings check -- `src/modbus.rs`**
 
@@ -288,7 +289,7 @@ anything: the fake `ssh` never connects, Wake-on-LAN only goes to
 | `bridge-test-vms.toml` | The same, with Proxmox method `vms_then_poweroff` and a 15 s VM timeout -- for scenarios N (`./run-bridge.sh vms`) |
 | `run-bridge.sh` | Builds the bridge and starts it with the test config, the fake `ssh` first on `PATH`, and debug logging |
 | `requirements.txt` | pymodbus 3.15.0 and pyserial 3.5, pinned -- pymodbus changes its API between versions |
-| `CHECKLIST.md` | The 20 scenarios (A-M, F2, N1-N5, O), with the exact log lines to expect |
+| `CHECKLIST.md` | The 23 scenarios (A-M, F2, F3, F4, N1-N5, O, P), with the exact log lines to expect |
 
 ### How to run it
 
@@ -440,7 +441,8 @@ The simulator and bridge can keep running.
 | N3 | `systemctl poweroff` refused | `systemctl-refuse` file | Falls back to `/sbin/poweroff` |
 | N4 | Grid back mid-way | `restore` while a host waits for a hung VM | That host still completes; Wake-on-LAN brings it back |
 | N5 | Proxmox host unreachable | `ssh-fail` file | Logged; the other host still shut down |
-| O | Host booting on wakeup (SSH retry) | `ssh-booting-<host>` file | Initial attempts return connection refused; retried every 2 s up to `ssh_connect_retry_secs`, then succeeds; all endpoints complete |
+| O | Host booting on wakeup (no head-of-line blocking) | `ssh-booting-<host>` file | Initial attempt returns connection refused; moved to background retry up to `ssh_connect_retry_secs`; subsequent machines dispatched immediately without delay; all endpoints complete |
+| P | Server booting (per-endpoint extended budget) | `ssh-booting-<host>` file on server | Server uses custom `ssh_connect_retry_secs` override while rest proceed; server succeeds within extended window |
 
 #### Step 8 -- finish
 

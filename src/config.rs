@@ -143,7 +143,7 @@ fn default_wol_resend_interval_secs() -> u64 {
 }
 
 fn default_ssh_connect_retry_secs() -> u64 {
-    90
+    300
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +171,16 @@ pub struct Endpoint {
     /// its NIC standby power (and so its WOL listener) survives a clean
     /// ACPI shutdown even though the machine looks fully off.
     pub mac_address: String,
+    /// Optional per-endpoint override for SSH connection retry budget (seconds).
+    /// If not specified, falls back to `thresholds.ssh_connect_retry_secs`.
+    #[serde(default)]
+    pub ssh_connect_retry_secs: Option<u64>,
+}
+
+impl Endpoint {
+    pub fn effective_ssh_connect_retry_secs(&self, default_secs: u64) -> u64 {
+        self.ssh_connect_retry_secs.unwrap_or(default_secs)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -221,9 +231,9 @@ impl Config {
                 t.stagger_secs
             );
         }
-        if t.ssh_connect_retry_secs > 600 {
+        if t.ssh_connect_retry_secs > 1800 {
             bail!(
-                "thresholds.ssh_connect_retry_secs is {} s -- must be <= 600",
+                "thresholds.ssh_connect_retry_secs is {} s -- must be <= 1800",
                 t.ssh_connect_retry_secs
             );
         }
@@ -269,6 +279,15 @@ impl Config {
         for ep in &self.endpoints {
             crate::wol::parse_mac(&ep.mac_address)
                 .with_context(|| format!("endpoint {:?}: mac_address", ep.name))?;
+            if let Some(r) = ep.ssh_connect_retry_secs {
+                if r > 1800 {
+                    bail!(
+                        "endpoint {:?}: ssh_connect_retry_secs is {} s -- must be <= 1800",
+                        ep.name,
+                        r
+                    );
+                }
+            }
             if !names.insert(ep.name.as_str()) {
                 bail!("two endpoints are named {:?} -- names must be unique", ep.name);
             }
@@ -433,10 +452,36 @@ mod tests {
     #[test]
     fn ssh_connect_retry_secs_beyond_limit_is_rejected() {
         let err = validate_err(&example_with(
-            "ssh_connect_retry_secs = 90",
-            "ssh_connect_retry_secs = 900",
+            "ssh_connect_retry_secs = 300",
+            "ssh_connect_retry_secs = 1900",
         ));
         assert!(err.contains("ssh_connect_retry_secs"), "{err}");
+
+        let err_ep = validate_err(&example_with(
+            "name = \"workstation-1\"",
+            "name = \"workstation-1\"\nssh_connect_retry_secs = 1900",
+        ));
+        assert!(err_ep.contains("ssh_connect_retry_secs"), "{err_ep}");
+    }
+
+    #[test]
+    fn endpoint_ssh_connect_retry_secs_can_override_global() {
+        let text = example_with(
+            "name = \"workstation-1\"",
+            "name = \"workstation-1\"\nssh_connect_retry_secs = 600",
+        );
+        let cfg: Config = toml::from_str(&text).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.thresholds.ssh_connect_retry_secs, 300);
+        assert_eq!(cfg.endpoints[0].ssh_connect_retry_secs, Some(600));
+        assert_eq!(
+            cfg.endpoints[0].effective_ssh_connect_retry_secs(cfg.thresholds.ssh_connect_retry_secs),
+            600
+        );
+        assert_eq!(
+            cfg.endpoints[1].effective_ssh_connect_retry_secs(cfg.thresholds.ssh_connect_retry_secs),
+            300
+        );
     }
 
     #[cfg(unix)]

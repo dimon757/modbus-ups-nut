@@ -72,17 +72,23 @@ pub async fn run_shutdown_sequence(
 ) {
     log::warn!("shutdown sequence starting: {} endpoint(s)", endpoints.len());
     let mut hosts = JoinSet::new();
+    let mut need_stagger = false;
 
-    for (i, ep) in endpoints.into_iter().enumerate() {
-        if i > 0 {
+    for ep in endpoints.into_iter() {
+        if *stop.borrow() {
+            log::warn!("recovery confirmed -- not starting the remaining endpoints");
+            break;
+        }
+
+        if need_stagger {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(opts.stagger_secs)) => {}
                 _ = stopped(&mut stop) => {}
             }
-        }
-        if *stop.borrow() {
-            log::warn!("recovery confirmed -- not starting the remaining endpoints");
-            break;
+            if *stop.borrow() {
+                log::warn!("recovery confirmed -- not starting the remaining endpoints");
+                break;
+            }
         }
 
         if ep.kind == EndpointKind::Proxmox && opts.proxmox.method == ProxmoxMethod::VmsThenPoweroff {
@@ -103,20 +109,62 @@ pub async fn run_shutdown_sequence(
                     }
                 }
             });
+            need_stagger = true;
         } else {
-            let res = shutdown_one(&ep, &opts, &mut stop).await;
-            if *stop.borrow() {
-                log::warn!("recovery confirmed -- not starting the remaining endpoints");
-                break;
-            }
-            match res {
-                Ok(()) => {
+            log::warn!("shutting down {} ({}) via {:?}", ep.name, ep.host, ep.kind);
+            let cmd = remote_command(&ep);
+            match ssh_exec_timeout(&ep, &opts, &cmd, SSH_TIMEOUT).await {
+                Ok(_) => {
+                    log::info!("{}: shutdown command accepted", ep.name);
                     if let Some(ref m) = marker {
                         m.record_dispatched(&ep.name);
+                    }
+                    need_stagger = true;
+                }
+                Err(e) if is_transient_connection_error(&e) => {
+                    let budget_secs = ep.effective_ssh_connect_retry_secs(opts.ssh_connect_retry_secs);
+                    if budget_secs > 0 && !*stop.borrow() {
+                        log::warn!(
+                            "{}: initial connection failed ({}) -- host appears to still be booting; continuing retries in background (up to {}s) without holding up remaining endpoints",
+                            ep.name,
+                            e,
+                            budget_secs
+                        );
+                        let ep = ep.clone();
+                        let opts = opts.clone();
+                        let marker = marker.clone();
+                        let mut stop_rx = stop.clone();
+                        hosts.spawn(async move {
+                            tokio::select! {
+                                _ = tokio::time::sleep(SSH_RETRY_INTERVAL) => {}
+                                _ = stopped(&mut stop_rx) => {
+                                    log::warn!("recovery confirmed -- cancelled background shutdown retry for {}", ep.name);
+                                    return;
+                                }
+                            }
+                            match ssh_exec_with_retry(&ep, &opts, &cmd, SSH_TIMEOUT, &mut stop_rx).await {
+                                Ok(_) => {
+                                    log::info!("{}: host finished booting; shutdown command accepted", ep.name);
+                                    if !*stop_rx.borrow() {
+                                        if let Some(ref m) = marker {
+                                            m.record_dispatched(&ep.name);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("failed to shut down {}: {:#}", ep.name, e);
+                                }
+                            }
+                        });
+                        need_stagger = false;
+                    } else {
+                        log::error!("failed to shut down {}: {:#}", ep.name, e);
+                        need_stagger = false;
                     }
                 }
                 Err(e) => {
                     log::error!("failed to shut down {}: {:#}", ep.name, e);
+                    need_stagger = false;
                 }
             }
         }
@@ -150,7 +198,7 @@ async fn ssh_exec_with_retry(
     stop: &mut watch::Receiver<bool>,
 ) -> Result<String> {
     let start = tokio::time::Instant::now();
-    let retry_budget = Duration::from_secs(opts.ssh_connect_retry_secs);
+    let retry_budget = Duration::from_secs(ep.effective_ssh_connect_retry_secs(opts.ssh_connect_retry_secs));
 
     loop {
         if *stop.borrow() {
@@ -180,18 +228,6 @@ async fn ssh_exec_with_retry(
             }
         }
     }
-}
-
-/// One SSH command per endpoint: Windows, and Proxmox with `poweroff`.
-async fn shutdown_one(
-    ep: &Endpoint,
-    opts: &ShutdownOptions,
-    stop: &mut watch::Receiver<bool>,
-) -> Result<()> {
-    log::warn!("shutting down {} ({}) via {:?}", ep.name, ep.host, ep.kind);
-    ssh_exec_with_retry(ep, opts, &remote_command(ep), SSH_TIMEOUT, stop).await?;
-    log::info!("{}: shutdown command accepted", ep.name);
-    Ok(())
 }
 
 fn remote_command(ep: &Endpoint) -> String {
@@ -561,6 +597,7 @@ mod tests {
             ssh_key_path: "/dev/null".into(),
             shutdown_delay_secs: 10,
             mac_address: "AA:BB:CC:DD:EE:FF".into(),
+            ssh_connect_retry_secs: None,
         }
     }
 

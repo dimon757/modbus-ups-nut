@@ -61,7 +61,7 @@ flowchart TD
     low -- "no" --> onbatt
     low -- "yes" --> write["Write + fsync<br/>shutdown marker"]
 
-    write --> seq["SSH shutdown sequence<br/>(cancels any previous in-flight task)<br/>record successfully dispatched endpoint in manifest<br/>(failed endpoints & mid-flight VMs omitted for retry)<br/>one endpoint every 30 s, in config order<br/><i>stagger_secs</i><br/>(retries transient connection errors up to 90 s<br/><i>ssh_connect_retry_secs</i>)"]
+    write --> seq["SSH shutdown sequence<br/>(cancels any previous in-flight task)<br/>record successfully dispatched endpoint in manifest<br/>(failed endpoints & mid-flight VMs omitted for retry)<br/>concurrent background retries for booting hosts<br/>immediate advance for subsequent endpoints (stagger_secs on success)<br/>(default 300 s retry budget, or per-endpoint override)"]
     seq --> win["Windows<br/>shutdown /s /t 60"]
     seq --> pve["Proxmox VE<br/>poweroff (pve-guests)<br/>or vms_then_poweroff<br/>(parallel qm shutdown --timeout)"]
     win --> done_seq
@@ -215,6 +215,10 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
   - The marker file is removed only after the final Wake-on-LAN round finishes.
   Delete the file by hand only if you've brought the endpoints back yourself and don't
   want the wake-up round.
+- **Booting hosts are retried in the background without delaying other endpoints (no head-of-line blocking).**
+  If a machine is still booting from a previous wake-up when shutdown is triggered, its initial SSH connection will fail (`Connection refused` / timeout). Rather than blocking the entire queue and delaying other endpoints, the bridge delegates the booting machine to an asynchronous background retry task (retrying every 2 s) and immediately advances to the next endpoints in the sequence. Ready machines shut down immediately to shed battery load without delay. Booting machines shut down as soon as their SSH daemon comes up.
+- **Extended, configurable retry budget for servers.**
+  `ssh_connect_retry_secs` defaults to **300 s (5 minutes)**, allowing slow enterprise servers (UEFI memory training, IPMI, ZFS pool imports) ample time to finish booting. Individual endpoints can override this with their own `ssh_connect_retry_secs` in `[[endpoints]]` (up to 1800 s / 30 minutes).
 - **If the inverter cuts output on its own hardware protection instead**
   (bridge missed the window, misconfiguration, whatever) -- there's no
   standby power on the endpoints' NICs, so WOL can't reach them. That path

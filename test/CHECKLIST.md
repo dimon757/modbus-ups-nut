@@ -316,19 +316,36 @@ wait for `OnBattery`; `soc 25`; about 6 s later `restore` and `soc 40`.
 
 ---
 
-## O. Host booting on wakeup (SSH connection retry)
+## O. Host booting on wakeup (SSH connection retry without head-of-line blocking)
 
-Simulates an endpoint that is still booting up from a previous Wake-on-LAN round when a new outage fires. Its SSH daemon is not yet ready, returning `Connection refused`. The bridge retries every 2 s up to `ssh_connect_retry_secs`, then succeeds once sshd is available.
+Simulates an endpoint that is still booting up from a previous Wake-on-LAN round when a new outage fires. Its SSH daemon is not yet ready, returning `Connection refused`. The bridge delegates it to a background retry task (retrying every 2 s up to `ssh_connect_retry_secs`) and immediately advances to the next endpoint without delaying it (`need_stagger = false`). Once sshd becomes available, the background retry succeeds.
 
 **Do:** `./setup.sh reset`; `echo 2 > /tmp/mub-test/ssh-booting-10.99.0.1`; `outage`; wait for `OnBattery`; `soc 25`.
 
 **Expect:**
-- [ ] `ws-1: SSH connection failed ... -- host may still be booting; retrying in 2s (3s retry budget remaining)`
-- [ ] `ws-1` retries until the `ssh-booting` counter is exhausted
-- [ ] `ws-1: shutdown command accepted`
-- [ ] sequence proceeds with `ws-2`, `proxmox-a`, and `proxmox-b`
+- [ ] `ws-1: SSH connection failed ... -- host may still be booting; continuing retries in background (5s retry budget remaining)`
+- [ ] `ws-2` is dispatched immediately without waiting for `ws-1`
+- [ ] `ws-1` background retries until the `ssh-booting` counter is exhausted, then logs `ws-1: shutdown command accepted (after background retry)`
+- [ ] sequence proceeds through `proxmox-a` and `proxmox-b`
 - [ ] `shutdown sequence complete` with all endpoints recorded in marker file
 - [ ] `restore`, `soc 80`: Wake-on-LAN fires on recovery and clears marker
+
+---
+
+## P. Server booting with extended per-endpoint retry budget
+
+Simulates a heavy server or Proxmox host that takes longer to boot than standard workstations. The host has an explicit per-endpoint `ssh_connect_retry_secs = 12` configured (overriding global 6 s). While it retries in the background, subsequent endpoints proceed immediately, and the server successfully shuts down once sshd finishes booting within its extended window.
+
+**Do:** `./setup.sh reset`; `echo 3 > /tmp/mub-test/ssh-booting-10.99.0.3`; `outage`; wait for `OnBattery`; `soc 25`.
+
+**Expect:**
+- [ ] `proxmox-a` initial connect returns transient failure; logs background retry with extended budget: `continuing retries in background (11s retry budget remaining)`
+- [ ] `proxmox-b` is dispatched immediately without delay
+- [ ] `proxmox-a` background task succeeds within its 12s budget: `proxmox-a: shutdown command accepted (after background retry)`
+- [ ] all 4 endpoints successfully complete and are recorded in the marker file
+- [ ] sequence finishes with `shutdown sequence complete`
+
+---
 
 ## What this does and doesn't prove
 

@@ -3,7 +3,7 @@
 
 Runs the real compiled bridge against the inverter simulator, fake ssh,
 and local Wake-on-LAN listener over a virtual serial cable (socat).
-Covers Scenarios A through O from CHECKLIST.md.
+Covers Scenarios A through P from CHECKLIST.md.
 """
 
 import os
@@ -601,9 +601,9 @@ class TestRunner:
         line = self.wait_for_bridge_log(r"shutting down ws-1", timeout=8)
         log(f"  [OK] {line}", Color.GREEN)
 
-        # ws-2 fails
-        line = self.wait_for_bridge_log(r"failed to shut down ws-2", timeout=10)
-        log(f"  [OK] Caught expected failure for ws-2: {line}", Color.GREEN)
+        # ws-2 fails initial connect and moves to background retry
+        line = self.wait_for_bridge_log(r"ws-2: initial connection failed .* continuing retries in background", timeout=10)
+        log(f"  [OK] Caught initial failure for ws-2: {line}", Color.GREEN)
 
         # proxmox-a starts shutting down VMs
         line = self.wait_for_bridge_log(r"shutting down proxmox-a \(10\.99\.0\.3\) via Proxmox: VMs first, then poweroff", timeout=10)
@@ -799,7 +799,7 @@ class TestRunner:
         self.send_sim_cmd("soc 25")
         self.wait_for_bridge_log(r"firing shutdown sequence", timeout=5)
 
-        line = self.wait_for_bridge_log(r"failed to shut down proxmox-a", timeout=10)
+        line = self.wait_for_bridge_log(r"failed to shut down proxmox-a", timeout=25)
         log(f"  [OK] Caught expected failure: {line}", Color.GREEN)
 
         line = self.wait_for_bridge_log(r"shutdown sequence complete", timeout=10)
@@ -1043,7 +1043,7 @@ class TestRunner:
         line = self.wait_for_bridge_log(r"failed to shut down proxmox-b: listing VMs: ssh to 10\.99\.0\.4 exited Some\(255\)", timeout=15)
         log(f"  [OK] {line}", Color.GREEN)
 
-        line = self.wait_for_bridge_log(r"proxmox-a: host power-off scheduled via systemctl poweroff", timeout=20)
+        line = self.wait_for_bridge_log(r"proxmox-a: host power-off scheduled via systemctl poweroff", timeout=20, from_start=True)
         log(f"  [OK] {line}", Color.GREEN)
 
         self.wait_for_bridge_log(r"shutdown sequence complete", timeout=10)
@@ -1073,18 +1073,18 @@ class TestRunner:
         self.send_sim_cmd("soc 25")
         self.wait_for_bridge_log(r"firing shutdown sequence", timeout=5)
 
-        # ws-1 fails initially and logs retry warning
-        line = self.wait_for_bridge_log(r"ws-1: SSH connection failed .* host may still be booting; retrying", timeout=8)
-        log(f"  [OK] Caught retry warning: {line}", Color.GREEN)
+        # ws-1 fails initially and is moved to background retry
+        line = self.wait_for_bridge_log(r"ws-1: initial connection failed .* continuing retries in background", timeout=8)
+        log(f"  [OK] ws-1 moved to background retry: {line}", Color.GREEN)
 
-        # ws-1 eventually succeeds after booting
-        line = self.wait_for_bridge_log(r"ws-1: shutdown command accepted", timeout=12)
-        log(f"  [OK] ws-1 recovered and succeeded: {line}", Color.GREEN)
+        # ws-2 is immediately dispatched and accepted WITHOUT being blocked by ws-1!
+        line = self.wait_for_bridge_log(r"shutting down ws-2", timeout=5)
+        log(f"  [OK] ws-2 dispatched immediately without head-of-line blocking: {line}", Color.GREEN)
+        self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=5)
 
-        # ws-2 is then dispatched on schedule and accepted
-        line = self.wait_for_bridge_log(r"shutting down ws-2", timeout=8)
-        log(f"  [OK] ws-2 dispatched: {line}", Color.GREEN)
-        self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=8)
+        # ws-1 eventually finishes booting in the background and succeeds
+        line = self.wait_for_bridge_log(r"ws-1: host finished booting; shutdown command accepted", timeout=12)
+        log(f"  [OK] ws-1 recovered in background and succeeded: {line}", Color.GREEN)
 
         # Full sequence finishes
         self.wait_for_bridge_log(r"shutdown sequence complete", timeout=15)
@@ -1113,6 +1113,65 @@ class TestRunner:
         self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
         log("--> SCENARIO O: PASSED", Color.GREEN + Color.BOLD)
 
+    def test_scenario_p(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO P: Server Slow to Boot -- Extended Per-Endpoint Retry Budget", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+
+        # Simulate proxmox-a (10.99.0.3) booting slowly: 4 connection refused attempts (8 seconds)
+        # Note: proxmox-a has per-endpoint ssh_connect_retry_secs = 12 in bridge-test.toml
+        with open(f"{DIR}/ssh-booting-10.99.0.3", "w") as f:
+            f.write("4\n")
+
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.start_bridge()
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
+
+        self.send_sim_cmd("outage")
+        self.wait_for_bridge_log(r"state: Idle -> GridLostDebouncing")
+        self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
+        self.send_sim_cmd("soc 25")
+        self.wait_for_bridge_log(r"firing shutdown sequence", timeout=5)
+
+        # ws-1 and ws-2 succeed normally
+        self.wait_for_bridge_log(r"ws-1: shutdown command accepted", timeout=8)
+        self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=8)
+
+        # proxmox-a fails initially and moves to background retry with up to 12s
+        line = self.wait_for_bridge_log(r"proxmox-a: initial connection failed .* continuing retries in background \(up to 12s\)", timeout=8)
+        log(f"  [OK] proxmox-a using per-endpoint 12s budget in background: {line}", Color.GREEN)
+
+        # proxmox-b is dispatched without waiting for proxmox-a to finish booting
+        line = self.wait_for_bridge_log(r"shutting down proxmox-b", timeout=5)
+        log(f"  [OK] proxmox-b dispatched without head-of-line blocking: {line}", Color.GREEN)
+        self.wait_for_bridge_log(r"proxmox-b: shutdown command accepted", timeout=5)
+
+        # proxmox-a eventually finishes booting and succeeds
+        line = self.wait_for_bridge_log(r"proxmox-a: host finished booting; shutdown command accepted", timeout=15)
+        log(f"  [OK] proxmox-a finished booting and accepted shutdown: {line}", Color.GREEN)
+
+        self.wait_for_bridge_log(r"shutdown sequence complete", timeout=15)
+
+        # Check marker file manifest
+        state_file = f"{DIR}/shutdown_fired"
+        assert os.path.exists(state_file)
+        with open(state_file) as f:
+            marker_content = f.read()
+        assert "dispatched: ws-1" in marker_content
+        assert "dispatched: ws-2" in marker_content
+        assert "dispatched: proxmox-a" in marker_content
+        assert "dispatched: proxmox-b" in marker_content
+        assert "completed" in marker_content
+
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.wait_for_bridge_log(r"state: ShutdownLatched -> RecoveryDebouncing")
+        self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
+        log("--> SCENARIO P: PASSED", Color.GREEN + Color.BOLD)
+
     def run(self, scenarios=None):
         all_map = {
             "a": ("Scenario A (Startup & Telemetry)", self.test_scenario_a),
@@ -1134,7 +1193,8 @@ class TestRunner:
             "n3": ("Scenario N3 (Proxmox systemctl refused fallback)", self.test_scenario_n3),
             "n4": ("Scenario N4 (Proxmox grid returns during VM shutdown)", self.test_scenario_n4),
             "n5": ("Scenario N5 (Proxmox one host unreachable)", self.test_scenario_n5),
-            "o": ("Scenario O (Host Booting on Wakeup / SSH Retry)", self.test_scenario_o),
+            "o": ("Scenario O (Host Booting on Wakeup / No Head-of-Line Blocking)", self.test_scenario_o),
+            "p": ("Scenario P (Server Booting / Extended Per-Endpoint Retry)", self.test_scenario_p),
         }
 
         if not scenarios:

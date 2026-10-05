@@ -96,6 +96,7 @@ mod tests {
             ssh_key_path: "/dev/null".into(),
             shutdown_delay_secs: 0,
             mac_address: mac.into(),
+            ssh_connect_retry_secs: None,
         }
     }
 

@@ -61,8 +61,9 @@ stagger_secs = 30                # delay between each endpoint in the sequence
 # shutdown is triggered, its initial SSH connection may fail (connection
 # refused / timeout). The bridge retries connecting concurrently in the
 # background for up to ssh_connect_retry_secs without stalling the shutdown
-# of other endpoints. Set to 0 to disable retries.
-ssh_connect_retry_secs = 90       # seconds; default 90 (0 to disable)
+# of other endpoints. Can also be configured per-endpoint under [[endpoints]].
+# Set to 0 to disable retries.
+ssh_connect_retry_secs = 300      # seconds; default 300 (0 to disable)
 
 # Wake-on-LAN is sent once on recovery, then resent this many times, this
 # far apart -- a machine still shutting down (e.g. Proxmox walking its VMs
