@@ -42,9 +42,12 @@ that controls each is named alongside it.
 
 ```mermaid
 flowchart TD
-    start(["Bridge starts"]) --> marker{"Shutdown marker<br/>on the SSD?"}
-    marker -- "no" --> poll
-    marker -- "yes: a previous run shut<br/>everything down and was cut off" --> latched
+    start(["Bridge starts"]) --> marker{"Shutdown marker<br/>state on SSD?"}
+    marker -- "not set" --> poll
+    marker -- "completed" --> latched
+    marker -- "incomplete manifest" --> m_grid{"Grid still down?"}
+    m_grid -- "yes: on battery" --> resume["Resume sequence for<br/>remaining endpoints"] --> done_seq["Mark completed"] --> latched
+    m_grid -- "no: grid returned" --> recover
 
     poll["Poll the inverter every 5 s<br/>SOC · grid voltage · load · battery power"] --> lost{"Grid voltage<br/>below 100 V?<br/><i>grid_lost_voltage</i>"}
     lost -- "no" --> poll
@@ -56,13 +59,13 @@ flowchart TD
     back1 -- "yes" --> recover
     back1 -- "no" --> low{"SOC at or below 30 % on<br/>2 of the last 3 readings?<br/><i>low_battery_soc</i>"}
     low -- "no" --> onbatt
-    low -- "yes" --> write["Write + fsync the<br/>shutdown marker"]
+    low -- "yes" --> write["Write + fsync<br/>shutdown marker"]
 
-    write --> seq["SSH shutdown sequence<br/>(cancels any previous in-flight task)<br/>one endpoint every 30 s, in config order<br/><i>stagger_secs</i>"]
+    write --> seq["SSH shutdown sequence<br/>(cancels any previous in-flight task)<br/>fsync dispatched endpoint before each call<br/>one endpoint every 30 s, in config order<br/><i>stagger_secs</i>"]
     seq --> win["Windows<br/>shutdown /s /t 60"]
-    seq --> pve["Proxmox VE<br/>poweroff (pve-guests)<br/>or vms_then_poweroff (--no-block)"]
-    win --> latched
-    pve --> latched
+    seq --> pve["Proxmox VE<br/>poweroff (pve-guests)<br/>or vms_then_poweroff<br/>(parallel qm shutdown --timeout)"]
+    win --> done_seq
+    pve --> done_seq
 
     latched["Latched<br/>never fires a second time"] --> healthy{"Grid back?<br/>(whatever the SOC)"}
     healthy -- "no" --> latched
@@ -84,7 +87,7 @@ flowchart TD
     classDef wake fill:#bfdbfe,stroke:#1d4ed8,color:#1e3a8a
     class poll,start ok
     class onbatt,deb warn
-    class write,seq,win,pve,latched bad
+    class write,seq,win,pve,resume,done_seq,latched bad
     class wol,clear wake
 ```
 
@@ -98,7 +101,7 @@ missing reading.
 ```mermaid
 stateDiagram-v2
     [*] --> Idle : no marker
-    [*] --> ShutdownLatched : marker found at startup
+    [*] --> ShutdownLatched : marker found at startup (resumes remaining if incomplete & on battery)
     Idle --> GridLostDebouncing : grid lost
     GridLostDebouncing --> Idle : grid back
     GridLostDebouncing --> OnBattery : still lost (debounce)
@@ -274,7 +277,9 @@ or readable by others are logged as errors (ssh refuses such keys).
   OnBattery / ShutdownLatched / RecoveryDebouncing). Fires the shutdown
   sequence exactly once per outage, and one Wake-on-LAN round (with its
   resends) per matching recovery.
-- `src/persist.rs` -- the on-disk shutdown marker that survives a reboot.
+- `src/persist.rs` -- the on-disk shutdown marker tracking dispatched endpoints
+  and sequence completion across reboots, enabling mid-sequence resumption
+  without duplicate commands.
 - `src/remote_shutdown.rs` -- SSH shutdown sequence, endpoints started in
   configured order, `stagger_secs` apart. Windows: native
   `shutdown /s /t ... /c "..."`. Proxmox VE, by `[proxmox] method`:
@@ -282,10 +287,10 @@ or readable by others are logged as errors (ssh refuses such keys).
   Debian/Proxmox's systemd unit `pve-guests.service` stops all running VMs
   and containers gracefully with their configured timeout/ordering, then powers
   off the host; `vms_then_poweroff` has the bridge shut every running VM down
-  itself (`qm shutdown`, QEMU guest agent / ACPI), wait, power off hard any VM
-  still running after `vm_shutdown_timeout_secs` (`qm stop`), then `systemctl poweroff --no-block`
-  (falls back to `/sbin/poweroff` if refused) -- each such host runs in parallel
-  with the rest of the sequence. Start at boot on each guest ensures VMs start
+  in parallel (`qm shutdown <id> --timeout <secs>`, QEMU guest agent / ACPI),
+  power off hard any VM still running after `vm_shutdown_timeout_secs` (`qm stop`),
+  then `systemctl poweroff --no-block` (falls back to `/sbin/poweroff` if refused)
+  -- each such host runs in parallel with the rest of the sequence. Start at boot on each guest ensures VMs start
   again at boot after WOL. Which method to use is decided on site:
   [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md).
   SSH host keys are pinned (`StrictHostKeyChecking=yes`); an endpoint whose
@@ -311,8 +316,8 @@ or readable by others are logged as errors (ssh refuses such keys).
 
 Full explanation and step-by-step instructions: [TESTING.md](TESTING.md).
 
-1. **Unit tests** -- `cargo test` (42 tests). The decision logic, config parsing, the
-   inverter-settings check, the Proxmox commands, the marker file and
+1. **Unit tests** -- `cargo test` (46 tests). The decision logic, config parsing, the
+   inverter-settings check, the Proxmox commands, the marker file manifest and
    Wake-on-LAN rounds, in under a second with no hardware.
 2. **Simulated site** -- `test/`: the real binary against an inverter
    simulator on a virtual serial cable, with a fake `ssh` and a local

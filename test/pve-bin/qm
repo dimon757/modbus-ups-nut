@@ -50,17 +50,54 @@ case $1 in
         fi
         ;;
     shutdown)
-        beh=$(grep "^$2|" "$d/vms" 2>/dev/null | cut -d'|' -f3)
+        if [ $# -lt 2 ]; then
+            echo "fake qm: shutdown requires VMID" >&2
+            exit 1
+        fi
+        vmid=$2
+        timeout=180
+        shift 2
+        while [ $# -gt 0 ]; do
+            case $1 in
+                --timeout)
+                    timeout=$2
+                    shift 2
+                    ;;
+                *)
+                    shift
+                    ;;
+            esac
+        done
+
+        beh=$(grep "^$vmid|" "$d/vms" 2>/dev/null | cut -d'|' -f3)
         case $beh in
             notools|noagent)
                 # Real qm prints error if QEMU guest agent is not running
-                echo "VM $2 qmp command 'guest-ping' failed - got timeout" >&2
+                echo "VM $vmid qmp command 'guest-ping' failed - got timeout" >&2
                 echo "QEMU guest agent is not running" >&2
                 exit 1
                 ;;
-            hang) echo "stopping 9999999999" > "$d/state_$2" ;;
-            ok:*) echo "stopping $((now + ${beh#ok:}))" > "$d/state_$2" ;;
-            *) echo "fake qm: no VM $2" >&2; exit 1 ;;
+            hang)
+                echo "stopping $((now + timeout + 999))" > "$d/state_$vmid"
+                sleep "$timeout"
+                echo "VM $vmid shutdown timed out" >&2
+                exit 1
+                ;;
+            ok:*)
+                dur=${beh#ok:}
+                if [ "$dur" -le "$timeout" ]; then
+                    echo "stopping $((now + dur))" > "$d/state_$vmid"
+                    sleep "$dur"
+                    echo off > "$d/state_$vmid"
+                    exit 0
+                else
+                    echo "stopping $((now + timeout + 999))" > "$d/state_$vmid"
+                    sleep "$timeout"
+                    echo "VM $vmid shutdown timed out" >&2
+                    exit 1
+                fi
+                ;;
+            *) echo "fake qm: no VM $vmid" >&2; exit 1 ;;
         esac
         ;;
     stop)

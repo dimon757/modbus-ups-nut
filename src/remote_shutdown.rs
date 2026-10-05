@@ -1,6 +1,7 @@
 use crate::config::{Config, Endpoint, EndpointKind, ProxmoxConfig, ProxmoxMethod};
+use crate::persist::ShutdownMarker;
 use anyhow::{anyhow, bail, Context, Result};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -8,9 +9,6 @@ use tokio::task::JoinSet;
 /// Hard ceiling on a single SSH call, on top of ssh's own ConnectTimeout and
 /// keepalives -- one wedged endpoint must not stall the rest of the sequence.
 const SSH_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// vms_then_poweroff: how often the VMs' power states are polled.
-const VM_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// What the shutdown sequence needs from the config.
 #[derive(Debug, Clone)]
@@ -46,6 +44,7 @@ impl ShutdownOptions {
 pub async fn run_shutdown_sequence(
     endpoints: Vec<Endpoint>,
     opts: ShutdownOptions,
+    marker: Option<ShutdownMarker>,
     mut stop: watch::Receiver<bool>,
 ) {
     log::warn!("shutdown sequence starting: {} endpoint(s)", endpoints.len());
@@ -62,6 +61,9 @@ pub async fn run_shutdown_sequence(
             log::warn!("recovery confirmed -- not starting the remaining endpoints");
             break;
         }
+        if let Some(ref m) = marker {
+            m.record_dispatched(&ep.name);
+        }
         if ep.kind == EndpointKind::Proxmox && opts.proxmox.method == ProxmoxMethod::VmsThenPoweroff {
             let opts = opts.clone();
             hosts.spawn(async move {
@@ -77,6 +79,11 @@ pub async fn run_shutdown_sequence(
     }
 
     while hosts.join_next().await.is_some() {}
+    if !*stop.borrow() {
+        if let Some(ref m) = marker {
+            m.mark_completed();
+        }
+    }
     log::warn!("shutdown sequence complete");
 }
 
@@ -154,57 +161,68 @@ async fn proxmox_vms_then_poweroff(ep: &Endpoint, opts: &ShutdownOptions) -> Res
         names_suffix(&running)
     );
 
-    // 2. Ask every running VM to shut down (QEMU guest agent / ACPI), all at once --
-    //    the battery doesn't leave time for one after the other.
-    let mut refused = Vec::new();
+    // 2. Ask every running VM to shut down in parallel (QEMU guest agent / ACPI)
+    //    with Proxmox's native --timeout.
+    //    On real Proxmox VE, `qm shutdown` blocks until the VM stops or times out;
+    //    running them concurrently via JoinSet ensures all VMs start shutting down
+    //    at once, rather than waiting one after the other on battery.
+    let timeout_secs = opts.proxmox.vm_shutdown_timeout_secs;
+    let ssh_timeout = Duration::from_secs(timeout_secs.saturating_add(15));
+    let mut tasks = JoinSet::new();
+
     for vm in &running {
-        match ssh_exec(ep, opts, &format!("qm shutdown {}", vm.id)).await {
-            Ok(out) if looks_like_failure(&out) => {
-                log::warn!(
-                    "{}: VM {} refused a guest shutdown ({}) -- will be powered off",
-                    ep.name,
-                    vm.name,
-                    out.trim()
-                );
-                refused.push(vm.clone());
-            }
-            Ok(_) => log::info!("{}: guest shutdown requested for VM {}", ep.name, vm.name),
-            Err(e) => {
-                log::warn!(
-                    "{}: guest shutdown of VM {} failed ({:#}) -- will be powered off",
-                    ep.name,
-                    vm.name,
-                    e
-                );
-                refused.push(vm.clone());
-            }
-        }
+        let vm = vm.clone();
+        let ep = ep.clone();
+        let opts = opts.clone();
+        log::info!("{}: guest shutdown requested for VM {}", ep.name, vm.name);
+        tasks.spawn(async move {
+            let cmd = qm_shutdown_command(vm.id, timeout_secs);
+            let res = ssh_exec_timeout(&ep, &opts, &cmd, ssh_timeout).await;
+            (vm, res)
+        });
     }
 
-    // 3. Wait for them, up to vm_shutdown_timeout_secs.
-    let mut pending: Vec<Vm> = running
-        .iter()
-        .filter(|vm| !refused.contains(vm))
-        .cloned()
-        .collect();
-    let deadline = Instant::now() + Duration::from_secs(opts.proxmox.vm_shutdown_timeout_secs);
-    while !pending.is_empty() && Instant::now() < deadline {
-        tokio::time::sleep(VM_POLL_INTERVAL).await;
-        match running_vms(ep, opts, &pending).await {
-            Ok(still_on) => {
-                for vm in pending.iter().filter(|vm| !still_on.contains(vm)) {
+    let mut refused = Vec::new();
+    let mut pending = Vec::new();
+
+    while let Some(res) = tasks.join_next().await {
+        match res {
+            Ok((vm, Ok(out))) => {
+                if looks_like_failure(&out) {
+                    log::warn!(
+                        "{}: VM {} refused a guest shutdown ({}) -- will be powered off",
+                        ep.name,
+                        vm.name,
+                        out.trim()
+                    );
+                    refused.push(vm);
+                } else {
                     log::info!("{}: VM {} is off", ep.name, vm.name);
                 }
-                pending = still_on;
             }
-            // Keep going: the host may just be slow to answer.
-            Err(e) => log::warn!("{}: could not poll VM states: {:#}", ep.name, e),
+            Ok((vm, Err(e))) => {
+                let err_str = format!("{:#}", e);
+                if is_timeout(&err_str) && !is_guest_refusal(&err_str) {
+                    pending.push(vm);
+                } else {
+                    log::warn!(
+                        "{}: guest shutdown of VM {} failed ({:#}) -- will be powered off",
+                        ep.name,
+                        vm.name,
+                        e
+                    );
+                    refused.push(vm);
+                }
+            }
+            Err(e) => {
+                log::error!("{}: VM shutdown task failed: {:#}", ep.name, e);
+            }
         }
     }
 
-    // 4. Whatever is still running now gets powered off hard: VMs that
-    //    didn't stop in time, and those that refused the guest shutdown
-    //    (no point waiting for those).
+    // 3. Whatever is still running now gets powered off hard: VMs that
+    //    didn't stop in time (timed out), and those that refused the guest
+    //    shutdown (no point waiting for those).
     for vm in &pending {
         log::error!(
             "{}: VM {} still running after {} s -- powering it off hard",
@@ -316,6 +334,23 @@ pub fn select_running(vms: &[Vm], out: &str) -> Vec<Vm> {
         .collect()
 }
 
+pub fn qm_shutdown_command(vmid: u32, timeout_secs: u64) -> String {
+    format!("qm shutdown {} --timeout {}", vmid, timeout_secs)
+}
+
+fn is_timeout(err_str: &str) -> bool {
+    let s = err_str.to_lowercase();
+    s.contains("timed out") || s.contains("timeout")
+}
+
+fn is_guest_refusal(err_str: &str) -> bool {
+    let s = err_str.to_lowercase();
+    s.contains("agent")
+        || s.contains("not running")
+        || s.contains("not supported")
+        || s.contains("refused")
+}
+
 /// qm doesn't always use its exit code for failures; it prints them.
 fn looks_like_failure(out: &str) -> bool {
     let o = out.to_lowercase();
@@ -342,6 +377,15 @@ fn names_suffix(vms: &[Vm]) -> String {
 /// (`StrictHostKeyChecking=yes`): an unknown or changed key fails the call
 /// rather than being trusted.
 async fn ssh_exec(ep: &Endpoint, opts: &ShutdownOptions, remote_cmd: &str) -> Result<String> {
+    ssh_exec_timeout(ep, opts, remote_cmd, SSH_TIMEOUT).await
+}
+
+async fn ssh_exec_timeout(
+    ep: &Endpoint,
+    opts: &ShutdownOptions,
+    remote_cmd: &str,
+    timeout: Duration,
+) -> Result<String> {
     let mut cmd = Command::new("ssh");
     cmd.args([
         "-i",
@@ -364,9 +408,9 @@ async fn ssh_exec(ep: &Endpoint, opts: &ShutdownOptions, remote_cmd: &str) -> Re
         .arg(remote_cmd)
         .kill_on_drop(true);
 
-    let output = tokio::time::timeout(SSH_TIMEOUT, cmd.output())
+    let output = tokio::time::timeout(timeout, cmd.output())
         .await
-        .map_err(|_| anyhow!("ssh to {} timed out after {:?}", ep.host, SSH_TIMEOUT))?
+        .map_err(|_| anyhow!("ssh to {} timed out after {:?}", ep.host, timeout))?
         .context("spawning ssh")?;
 
     if !output.status.success() {
@@ -478,6 +522,22 @@ mod tests {
         assert!(looks_like_failure("VM 100 not running"));
         assert!(looks_like_failure("command 'qm shutdown 100' failed: exit code 1"));
         assert!(!looks_like_failure(""));
+    }
+
+    #[test]
+    fn qm_shutdown_command_includes_timeout() {
+        assert_eq!(qm_shutdown_command(100, 180), "qm shutdown 100 --timeout 180");
+        assert_eq!(qm_shutdown_command(101, 15), "qm shutdown 101 --timeout 15");
+    }
+
+    #[test]
+    fn distinguishes_timeout_from_guest_refusal() {
+        assert!(is_guest_refusal("QEMU guest agent is not running"));
+        assert!(is_guest_refusal("VM 108 qmp command 'guest-ping' failed - got timeout\nQEMU guest agent is not running"));
+        assert!(!is_guest_refusal("VM 109 shutdown timed out"));
+        assert!(is_timeout("VM 109 shutdown timed out"));
+        assert!(is_timeout("ssh to 10.99.0.3 timed out after 30s"));
+        assert!(!is_timeout("QEMU guest agent is not running"));
     }
 
     #[tokio::test]

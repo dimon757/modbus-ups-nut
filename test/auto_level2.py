@@ -456,6 +456,57 @@ class TestRunner:
         log("  [OK] Marker file deleted after WOL completed", Color.GREEN)
         log("--> SCENARIO F: PASSED", Color.GREEN + Color.BOLD)
 
+    def test_scenario_f2(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO F2: Bridge restarts mid-sequence -- resumes remaining endpoints", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+        self.send_sim_cmd("outage")
+        self.send_sim_cmd("soc 25")
+
+        # Simulate marker created when first two endpoints were dispatched,
+        # but bridge restarted before the last two (proxmox-a, proxmox-b)
+        with open(f"{DIR}/shutdown_fired", "w") as f:
+            f.write("# shutdown sequence in progress\ndispatched: ws-1\ndispatched: ws-2\n")
+
+        # Start bridge during outage
+        self.start_bridge()
+        line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 2 endpoint\(s\) already dispatched, 2 remaining", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        line = self.wait_for_bridge_log(r"resuming shutdown sequence for 2 remaining endpoint\(s\)", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        self.wait_for_bridge_log(r"shutdown sequence complete", timeout=15)
+        log("  [OK] Remaining shutdown sequence completed", Color.GREEN)
+
+        # Verify ssh.log: only proxmox-a (10.99.0.3) and proxmox-b (10.99.0.4) were called!
+        with open(f"{DIR}/ssh.log") as f:
+            ssh_content = f.read()
+        assert "10.99.0.3" in ssh_content, "proxmox-a should have been dispatched"
+        assert "10.99.0.4" in ssh_content, "proxmox-b should have been dispatched"
+        assert "10.99.0.1" not in ssh_content, "ws-1 was already dispatched and should not be re-called"
+        assert "10.99.0.2" not in ssh_content, "ws-2 was already dispatched and should not be re-called"
+        log("  [OK] Only remaining endpoints were dispatched; no re-dispatches of ws-1/ws-2", Color.GREEN)
+
+        # Check marker file now contains completed
+        with open(f"{DIR}/shutdown_fired") as f:
+            marker_content = f.read()
+        assert "completed" in marker_content, "Marker file must record completion"
+        log("  [OK] Marker file marked completed", Color.GREEN)
+
+        # Recovery + WOL
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 40")
+        self.wait_for_bridge_log(r"state: ShutdownLatched -> RecoveryDebouncing", timeout=8)
+        self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
+        self.wait_for_bridge_log(r"Wake-on-LAN round 4/4", timeout=25)
+        time.sleep(1)
+        assert not os.path.exists(f"{DIR}/shutdown_fired"), "Marker file should be deleted after WOL"
+        log("  [OK] Marker file deleted after WOL completed", Color.GREEN)
+        log("--> SCENARIO F2: PASSED", Color.GREEN + Color.BOLD)
+
     def test_scenario_g(self):
         log("\n=======================================================", Color.BOLD)
         log("RUNNING SCENARIO G: Inverter goes silent -- no shutdown on missing data", Color.BOLD)
@@ -852,6 +903,7 @@ class TestRunner:
             "d": ("Scenario D (Full Outage & WoL)", self.test_scenario_d),
             "e": ("Scenario E (Regression: Grid flicker low SOC)", self.test_scenario_e),
             "f": ("Scenario F (Process restart mid-outage)", self.test_scenario_f),
+            "f2": ("Scenario F2 (Process restart mid-sequence)", self.test_scenario_f2),
             "g": ("Scenario G (Silent inverter)", self.test_scenario_g),
             "h": ("Scenario H (Garbage SOC read)", self.test_scenario_h),
             "k": ("Scenario K (Outage during WoL)", self.test_scenario_k),

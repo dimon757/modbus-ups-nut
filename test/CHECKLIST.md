@@ -117,6 +117,23 @@ This is the bug found in the original code: the shutdown used to be skipped here
 - [ ] **no** new ssh.log lines (no second shutdown)
 - [ ] then `restore` + `soc 40`: after 10 s, 4 Wake-on-LAN rounds and the marker is removed
 
+## F2. Bridge restarts mid-sequence -- resumes remaining endpoints
+
+Simulates a bridge reboot, crash, or watchdog reset after the first two endpoints were dispatched.
+
+**Do:** `./setup.sh reset`. Write an incomplete manifest:
+```bash
+printf '# shutdown sequence in progress\ndispatched: ws-1\ndispatched: ws-2\n' > /tmp/mub-test/shutdown_fired
+```
+Set simulator to outage (`outage`, `soc 25`), then start the bridge (`./run-bridge.sh`).
+
+**Expect:**
+- [ ] `/tmp/mub-test/shutdown_fired indicates incomplete shutdown: 2 endpoint(s) already dispatched, 2 remaining: ["proxmox-a", "proxmox-b"]`
+- [ ] `grid still down: resuming shutdown sequence for 2 remaining endpoint(s)`
+- [ ] `ssh.log` gets shutdown calls **only** for `proxmox-a` (10.99.0.3) and `proxmox-b` (10.99.0.4) -- no re-dispatching `ws-1` or `ws-2`
+- [ ] `shutdown sequence complete` and `/tmp/mub-test/shutdown_fired` is updated with `completed`
+- [ ] then `restore` + `soc 40`: after 10 s, 4 Wake-on-LAN rounds wake all endpoints and the marker is deleted
+
 ## G. Inverter goes silent -- no shutdown on missing data
 
 **Do:** stop the simulator (Ctrl+C) for ~15 s, then start it again.

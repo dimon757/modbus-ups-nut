@@ -17,9 +17,9 @@ procedures: [docs/register-verification.md](docs/register-verification.md)
 (inverter registers) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)
 (Proxmox shutdown command).
 
-**Status (2026-10-04).** Level 1: 42 tests, all passing on Debian 13 (41 on
-Windows, where the one Linux-only test is skipped). Level 2: all 18 scenarios
-(A-M plus the 60 s SSH timeout, and N1-N5 for the Proxmox method
+**Status (2026-10-05).** Level 1: 46 tests, all passing on Debian 13 (45 on
+Windows, where the one Linux-only test is skipped). Level 2: all 19 scenarios
+(A-M plus the 60 s SSH timeout, F2 for mid-sequence restart resumption, and N1-N5 for the Proxmox method
 `vms_then_poweroff` against simulated VMs) passing on Debian 13 under WSL2.
 Earlier runs found and fixed a serial-port lock that stopped the bridge
 reconnecting, `setup.sh` hanging when its output was piped, misleading
@@ -79,7 +79,7 @@ on immediately. A wait of **3600 s** can never pass during the test, so the
 state is guaranteed to stay put. That's also the main limit: the tests
 can't check exact timings ("fires at 60 s, not at 59 s").
 
-### The 42 tests
+### The 46 tests
 
 **State machine -- `src/state.rs`**
 
@@ -136,8 +136,12 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `remote_shutdown::power_states_command_covers_every_vm` | The exact power-state command sent for a list of VMs (`qm status`) |
 | `remote_shutdown::selects_running_vms_and_treats_unknown_as_running` | VMs with status other than "stopped" count as running -- and a VM missing from the answer counts as running, so it's powered off rather than left behind |
 | `remote_shutdown::recognises_qm_failure_text` | Failure text printed by `qm` (which may still exit 0) is recognised as a refused shutdown |
+| `remote_shutdown::qm_shutdown_command_includes_timeout` | The `qm shutdown` command format includes `--timeout` for Proxmox VE |
+| `remote_shutdown::distinguishes_timeout_from_guest_refusal` | Error classification accurately separates VM shutdown timeouts from guest agent refusals |
 | `remote_shutdown::stop_signal_resolves_on_true_but_not_on_a_dropped_sender` | Confirmed recovery stops the sequence from starting more endpoints, but a replaced sequence doesn't skip its stagger delays |
 | `persist::set_is_set_clear_roundtrip` | The marker file is created (with its folder), is seen by a fresh instance -- i.e. after a reboot -- and is deleted |
+| `persist::state_transitions_incomplete_and_completed` | Manifest states: Incomplete records dispatched endpoints in order, Completed marks finished sequence, NotSet when absent |
+| `persist::legacy_marker_parses_as_completed` | Backward compatibility with unformatted legacy marker files |
 | `watchdog::feeds_then_disarms_through_a_clone_with_magic_v` | Feeding writes a zero byte; a requested stop writes the magic `V` through the stop handler's second handle, so `systemctl stop` doesn't reboot the box |
 | `watchdog::without_a_watchdog_configured_everything_is_a_no_op` | With no `[watchdog]` section (e.g. the test config), feeding and disarming do nothing |
 | `wol::parse_mac_handles_whitespace_and_separators` | MAC address parsing handles leading/trailing whitespace, dash or colon separators, and rejects invalid octets |
@@ -275,13 +279,13 @@ anything: the fake `ssh` never connects, Wake-on-LAN only goes to
 | `inverter_sim.py` | The fake Sunsynk: Modbus RTU slave 1 at 9600 8N1, with the real register addresses; values editable while it runs |
 | `self_check.py` | Reads every simulator register back with a real Modbus client, to catch an address shifted by one before it confuses a test |
 | `bin/ssh` | The fake `ssh`: logs what would have been run; can pretend an endpoint is unreachable or hanging; for the fake Proxmox hosts, executes the bridge's `qm`/`systemctl` commands |
-| `pve-bin/qm`, `pve-bin/systemctl` | The fake Proxmox tools: simulated VMs that shut down after a few seconds, hang, or have no QEMU guest agent; a `systemctl` that can refuse poweroff to test the `/sbin/poweroff` fallback |
+| `pve-bin/qm`, `pve-bin/systemctl` | The fake Proxmox tools: simulated VMs that shut down after a few seconds, hang, or have no QEMU guest agent, supporting `--timeout` and accurately simulating blocking Proxmox shutdown semantics; a `systemctl` that can refuse poweroff to test the `/sbin/poweroff` fallback |
 | `wol_listen.py` | Prints each Wake-on-LAN packet and the MAC it targets, grouped into rounds |
 | `bridge-test.toml` | The test config (short waits, local addresses, own marker and `known_hosts`, no watchdog), Proxmox method `poweroff` |
 | `bridge-test-vms.toml` | The same, with Proxmox method `vms_then_poweroff` and a 15 s VM timeout -- for scenarios N (`./run-bridge.sh vms`) |
 | `run-bridge.sh` | Builds the bridge and starts it with the test config, the fake `ssh` first on `PATH`, and debug logging |
 | `requirements.txt` | pymodbus 3.15.0 and pyserial 3.5, pinned -- pymodbus changes its API between versions |
-| `CHECKLIST.md` | The 18 scenarios (A-M, N1-N5), with the exact log lines to expect |
+| `CHECKLIST.md` | The 19 scenarios (A-M, F2, N1-N5), with the exact log lines to expect |
 
 ### How to run it
 
@@ -425,8 +429,8 @@ The simulator and bridge can keep running.
 | K | New outage during wake-up | outage while Wake-on-LAN rounds run | Rounds cancelled, new shutdown |
 | L | Endpoint unreachable | `ssh-fail` file | That one fails, the rest still shut down |
 | M | Endpoint hangs, grid returns | `ssh-hang` file, then `restore` | Bridge keeps polling; rest of sequence stopped; wake-up follows |
-| N1 | Proxmox `vms_then_poweroff` (`./run-bridge.sh vms`) | `outage`, `soc 25` | Every VM shut down and confirmed off, then `systemctl poweroff`; the two hosts in parallel |
-| N2 | Hung VM, VM without guest agent | extra lines in the fake host's `vms` file | Both powered off hard after 15 s -- the hosts are still powered off |
+| N1 | Proxmox `vms_then_poweroff` (`./run-bridge.sh vms`) | `outage`, `soc 25` | Every VM shut down in parallel with native `--timeout` and confirmed off, then `systemctl poweroff`; the two hosts in parallel |
+| N2 | Hung VM, VM without guest agent | extra lines in the fake host's `vms` file | Missing guest agent detected immediately; hung VM hard-stopped after 15 s timeout -- both hosts still powered off |
 | N3 | `systemctl poweroff` refused | `systemctl-refuse` file | Falls back to `/sbin/poweroff` |
 | N4 | Grid back mid-way | `restore` while a host waits for a hung VM | That host still completes; Wake-on-LAN brings it back |
 | N5 | Proxmox host unreachable | `ssh-fail` file | Logged; the other host still shut down |

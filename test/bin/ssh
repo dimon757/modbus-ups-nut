@@ -37,11 +37,13 @@ proxmox="$dir/proxmox/$host"
 if [ -d "$proxmox" ]; then
     case $remote_cmd in
         *qm*|*systemctl*)
-            out=$(PATH="$here/../pve-bin:$PATH" FAKE_PROXMOX_DIR="$proxmox" sh -c "$remote_cmd" 2>"$proxmox/stderr")
+            errfile="$proxmox/stderr.$$.$RANDOM"
+            out=$(PATH="$here/../pve-bin:$PATH" FAKE_PROXMOX_DIR="$proxmox" sh -c "$remote_cmd" 2>"$errfile")
             rc=$?
             printf '%s\n' "$(date +%T) $target: $remote_cmd  -> exit $rc" >> "$dir/ssh.log"
             [ -n "$out" ] && printf '%s\n' "$out"
-            cat "$proxmox/stderr" >&2
+            cat "$errfile" >&2
+            rm -f "$errfile"
             exit $rc
             ;;
         */sbin/poweroff*)

@@ -46,8 +46,8 @@ pub enum ProxmoxMethod {
     /// gracefully with their configured timeout/ordering, then the host
     /// powers off. One SSH call. (default)
     Poweroff,
-    /// The bridge shuts every running VM down itself (`qm shutdown`),
-    /// waits for them, hard-stops any still running after
+    /// The bridge shuts every running VM down in parallel (`qm shutdown <id> --timeout <secs>`),
+    /// waits for them concurrently, hard-stops any still running after
     /// `vm_shutdown_timeout_secs` (`qm stop`), then schedules host poweroff.
     VmsThenPoweroff,
 }

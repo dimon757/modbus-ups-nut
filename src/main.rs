@@ -8,7 +8,7 @@ mod wol;
 
 use anyhow::Result;
 use config::Config;
-use persist::ShutdownMarker;
+use persist::{ShutdownMarker, ShutdownState};
 use state::{Action, StateMachine};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -55,14 +55,35 @@ async fn main() -> Result<()> {
 /// The bridge itself: poll, decide, act. Runs until the process is stopped.
 async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
     let marker = ShutdownMarker::new(&cfg.state_file);
-    let resume = marker.is_set();
-    if resume {
-        log::warn!(
-            "{} exists: a previous run shut the endpoints down and never finished \
-             waking them -- resuming latched, Wake-on-LAN will follow recovery",
-            cfg.state_file
-        );
-    }
+    let marker_state = marker.state();
+    let resume = marker_state != ShutdownState::NotSet;
+    let mut pending_resume_endpoints = match &marker_state {
+        ShutdownState::Incomplete { dispatched } => {
+            let remaining: Vec<_> = cfg
+                .endpoints
+                .iter()
+                .filter(|ep| !dispatched.contains(&ep.name))
+                .cloned()
+                .collect();
+            log::warn!(
+                "{} indicates incomplete shutdown: {} endpoint(s) already dispatched, {} remaining: {:?}",
+                cfg.state_file,
+                dispatched.len(),
+                remaining.len(),
+                remaining.iter().map(|ep| &ep.name).collect::<Vec<_>>()
+            );
+            Some(remaining)
+        }
+        ShutdownState::Completed => {
+            log::warn!(
+                "{} exists: a previous run shut the endpoints down and never finished \
+                 waking them -- resuming latched, Wake-on-LAN will follow recovery",
+                cfg.state_file
+            );
+            None
+        }
+        ShutdownState::NotSet => None,
+    };
     let mut sm = StateMachine::new(cfg.thresholds.clone(), resume);
 
     // At most one of each in flight. A new shutdown cancels leftover WOL
@@ -104,6 +125,34 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
             status.low_battery
         );
 
+        if let Some(remaining) = pending_resume_endpoints.take() {
+            let grid_down = reading.grid_voltage < cfg.thresholds.grid_lost_voltage;
+            if grid_down {
+                if !remaining.is_empty() {
+                    log::warn!(
+                        "grid still down: resuming shutdown sequence for {} remaining endpoint(s)",
+                        remaining.len()
+                    );
+                    let opts = remote_shutdown::ShutdownOptions::from_config(&cfg);
+                    let (stop_tx, stop_rx) = watch::channel(false);
+                    let task = tokio::spawn(remote_shutdown::run_shutdown_sequence(
+                        remaining,
+                        opts,
+                        Some(marker.clone()),
+                        stop_rx,
+                    ));
+                    shutdown_task = Some((task, stop_tx));
+                } else {
+                    log::info!("all endpoints were already dispatched; marking shutdown complete");
+                    marker.mark_completed();
+                }
+            } else {
+                log::warn!(
+                    "grid recovered before resuming remaining shutdowns; leaving them online"
+                );
+            }
+        }
+
         match action {
             Action::TriggerShutdownSequence => {
                 if let Some(t) = wake_task.take() {
@@ -128,7 +177,10 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
                 // Spawned so the poll loop (and watchdog feed) keeps running
                 // while the sequence executes.
                 let task = tokio::spawn(remote_shutdown::run_shutdown_sequence(
-                    endpoints, opts, stop_rx,
+                    endpoints,
+                    opts,
+                    Some(marker.clone()),
+                    stop_rx,
                 ));
                 shutdown_task = Some((task, stop_tx));
             }

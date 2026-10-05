@@ -6,7 +6,7 @@ the `[proxmox]` section of `bridge.toml`:
 | `method` | What the bridge does | Relies on |
 |---|---|---|
 | `poweroff` (default) | Sends `/sbin/poweroff` detached with `nohup` | Proxmox's systemd unit `pve-guests.service` to stop running VMs and containers cleanly with their configured timeout/ordering, then powers off the host |
-| `vms_then_poweroff` | Asks every running VM to shut down (`qm shutdown <id>`, via QEMU guest agent / ACPI), waits for them, powers off hard any still running after `vm_shutdown_timeout_secs` (`qm stop <id>`), then `systemctl poweroff --no-block` (`/sbin/poweroff` fallback if refused) | The bridge directly querying and managing each VM. Every VM's shutdown and status is explicitly logged by the bridge |
+| `vms_then_poweroff` | Asks every running VM to shut down in parallel (`qm shutdown <id> --timeout <timeout>`, via QEMU guest agent / ACPI), waits up to `vm_shutdown_timeout_secs`, powers off hard any still running (`qm stop <id>`), then `systemctl poweroff --no-block` (`/sbin/poweroff` fallback if refused) | The bridge directly querying and managing each VM. Every VM's shutdown and status is explicitly logged by the bridge |
 
 This test settles which method works best for your Proxmox VE hosts on the real
 hardware, in about an hour, with one test VM:
@@ -123,6 +123,32 @@ Sends exactly what the bridge sends, from the bridge box with the bridge's key:
 
 ## Test B -- `vms_then_poweroff`, the bridge's explicit method
 
+```mermaid
+flowchart TD
+    start(["Start vms_then_poweroff on Proxmox host"]) --> list["List VMs: qm list"]
+    list --> states["Query power states in batch: qm status"]
+    states --> running{"Any VMs running?"}
+    running -- "no" --> pwr["Host power-off: systemctl poweroff --no-block"]
+    running -- "yes" --> spawn["Spawn parallel shutdown tasks (Tokio JoinSet)"]
+
+    subgraph parallel ["Parallel Execution per Running VM"]
+        direction TB
+        vm_call["qm shutdown ID --timeout vm_shutdown_timeout_secs<br/>(blocks until VM stops or timeout expires)"]
+        vm_call --> vm_eval{"qm shutdown result"}
+        vm_eval -- "Clean exit (code 0)" --> vm_done["VM stopped gracefully"]
+        vm_eval -- "Guest agent missing / refused" --> vm_hard["Hard stop: qm stop ID"]
+        vm_eval -- "Timeout expired" --> vm_hard
+        vm_hard --> vm_done
+    end
+
+    spawn --> parallel
+    parallel --> join["JoinSet: wait for all parallel VM tasks to complete"]
+    join --> pwr
+    pwr --> pwr_res{"systemctl poweroff accepted?"}
+    pwr_res -- "yes" --> host_off(["Host powers off"])
+    pwr_res -- "no (refused)" --> fallback["Fallback: nohup /sbin/poweroff &"] --> host_off
+```
+
 Run the individual steps by hand from the bridge box to verify each command:
 
 1. **List the VMs** as the bridge does:
@@ -137,10 +163,11 @@ Run the individual steps by hand from the bridge box to verify each command:
    Expect `<vmid> status: running`.
 3. **Request guest shutdown**:
    ```bash
-   sudo ssh -i /etc/modbus-ups-bridge/proxmox_key -o BatchMode=yes root@<proxmox-host> "qm shutdown <vmid>"
+   sudo ssh -i /etc/modbus-ups-bridge/proxmox_key -o BatchMode=yes root@<proxmox-host> "qm shutdown <vmid> --timeout 180"
    ```
-   Returns immediately while the guest agent processes the shutdown.
-4. **Poll power state** (step 2) every few seconds until `status: stopped`.
+   On Proxmox VE, `qm shutdown <vmid>` blocks until the VM stops or `--timeout` expires.
+   The bridge runs shutdowns for all running VMs concurrently in parallel via Tokio tasks, passing `--timeout <vm_shutdown_timeout_secs>` and relaxing the per-call SSH timeout ceiling accordingly. If a guest agent is missing, `qm shutdown` fails quickly; if a guest takes longer than `--timeout`, it exits with an error and the bridge hard-powers it off with `qm stop <vmid>`.
+4. **Verify power state** after shutdown finishes (or check via step 2).
    Note how long the VM took to shut down. (The setting `vm_shutdown_timeout_secs` must exceed this duration).
 5. **Power off the host**:
    ```bash
