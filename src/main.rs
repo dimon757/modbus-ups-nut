@@ -125,9 +125,9 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
             status.low_battery
         );
 
-        if let Some(remaining) = pending_resume_endpoints.take() {
-            let grid_down = reading.grid_voltage < cfg.thresholds.grid_lost_voltage;
-            if grid_down {
+        let grid_down = status.grid_voltage < cfg.thresholds.grid_lost_voltage;
+        if grid_down {
+            if let Some(remaining) = pending_resume_endpoints.take() {
                 if !remaining.is_empty() {
                     log::warn!(
                         "grid still down: resuming shutdown sequence for {} remaining endpoint(s)",
@@ -146,15 +146,19 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
                     log::info!("all endpoints were already dispatched; marking shutdown complete");
                     marker.mark_completed();
                 }
-            } else {
-                log::warn!(
-                    "grid recovered before resuming remaining shutdowns; leaving them online"
+            }
+        } else if let Some(ref remaining) = pending_resume_endpoints {
+            if !remaining.is_empty() {
+                log::debug!(
+                    "grid currently up; holding {} remaining shutdown(s) pending recovery confirmation",
+                    remaining.len()
                 );
             }
         }
 
         match action {
             Action::TriggerShutdownSequence => {
+                pending_resume_endpoints.take();
                 if let Some(t) = wake_task.take() {
                     if !t.is_finished() {
                         log::warn!("cancelling pending Wake-on-LAN resends");
@@ -185,6 +189,14 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
                 shutdown_task = Some((task, stop_tx));
             }
             Action::TriggerWakeOnLan => {
+                if let Some(remaining) = pending_resume_endpoints.take() {
+                    if !remaining.is_empty() {
+                        log::warn!(
+                            "recovery confirmed: {} remaining endpoint(s) were spared from shutdown",
+                            remaining.len()
+                        );
+                    }
+                }
                 if let Some((task, stop)) = shutdown_task.take() {
                     if !task.is_finished() {
                         log::warn!("recovery confirmed -- stopping the rest of the shutdown sequence");

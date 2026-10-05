@@ -86,14 +86,21 @@ pub async fn run_shutdown_sequence(
         }
 
         if ep.kind == EndpointKind::Proxmox && opts.proxmox.method == ProxmoxMethod::VmsThenPoweroff {
-            if let Some(ref m) = marker {
-                m.record_dispatched(&ep.name);
-            }
             let opts = opts.clone();
+            let marker = marker.clone();
             let mut stop_rx = stop.clone();
             hosts.spawn(async move {
-                if let Err(e) = proxmox_vms_then_poweroff(&ep, &opts, &mut stop_rx).await {
-                    log::error!("failed to shut down {}: {:#}", ep.name, e);
+                match proxmox_vms_then_poweroff(&ep, &opts, &mut stop_rx).await {
+                    Ok(()) => {
+                        if !*stop_rx.borrow() {
+                            if let Some(ref m) = marker {
+                                m.record_dispatched(&ep.name);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("failed to shut down {}: {:#}", ep.name, e);
+                    }
                 }
             });
         } else {
@@ -102,11 +109,15 @@ pub async fn run_shutdown_sequence(
                 log::warn!("recovery confirmed -- not starting the remaining endpoints");
                 break;
             }
-            if let Some(ref m) = marker {
-                m.record_dispatched(&ep.name);
-            }
-            if let Err(e) = res {
-                log::error!("failed to shut down {}: {:#}", ep.name, e);
+            match res {
+                Ok(()) => {
+                    if let Some(ref m) = marker {
+                        m.record_dispatched(&ep.name);
+                    }
+                }
+                Err(e) => {
+                    log::error!("failed to shut down {}: {:#}", ep.name, e);
+                }
             }
         }
     }

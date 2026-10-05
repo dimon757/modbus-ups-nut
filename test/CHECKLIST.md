@@ -134,6 +134,38 @@ Set simulator to outage (`outage`, `soc 25`), then start the bridge (`./run-brid
 - [ ] `shutdown sequence complete` and `/tmp/mub-test/shutdown_fired` is updated with `completed`
 - [ ] then `restore` + `soc 40`: after 10 s, 4 Wake-on-LAN rounds wake all endpoints and the marker is deleted
 
+## F3. Bridge restarts mid-sequence during grid voltage flicker
+
+Simulates a restart when the grid flickers back for just one reading during an outage. The bridge must not discard the remaining sequence.
+
+**Do:** `./setup.sh reset`. Write an incomplete manifest:
+```bash
+printf '# shutdown sequence in progress\ndispatched: ws-1\ndispatched: ws-2\n' > /tmp/mub-test/shutdown_fired
+```
+Set simulator to grid restored (`restore`, `soc 25`), then start the bridge (`./run-bridge.sh`). After 2 seconds, simulate outage returning (`outage`).
+
+**Expect:**
+- [ ] `/tmp/mub-test/shutdown_fired indicates incomplete shutdown: 2 endpoint(s) already dispatched, 2 remaining: ["proxmox-a", "proxmox-b"]`
+- [ ] `grid currently up; holding 2 remaining shutdown(s) pending recovery confirmation`
+- [ ] on `outage`: `grid still down: resuming shutdown sequence for 2 remaining endpoint(s)`
+- [ ] `ssh.log` receives shutdown commands only for `proxmox-a` and `proxmox-b`
+- [ ] `shutdown sequence complete` and marker file marked `completed`
+- [ ] then `restore` + `soc 40`: after 10 s, Wake-on-LAN rounds sent and marker deleted
+
+## F4. Failed endpoint retried & Proxmox timing
+
+Simulates an endpoint failing (or a bridge restart during long Proxmox VM shutdowns): failed endpoints and mid-flight VMs must not be ticked off in the manifest.
+
+**Do:** `./setup.sh reset`. Add failure for ws-2: `echo 10.99.0.2 > /tmp/mub-test/ssh-fail`. Start bridge with VM method: `./run-bridge.sh vms`. Trigger outage: `outage`, `soc 25`. While Proxmox VMs are stopping, inspect `/tmp/mub-test/shutdown_fired`. Stop bridge (Ctrl+C). Remove failure: `rm /tmp/mub-test/ssh-fail`. Restart bridge: `./run-bridge.sh vms`.
+
+**Expect:**
+- [ ] `shutting down ws-1` succeeds; `failed to shut down ws-2` logged
+- [ ] during Proxmox VM shutdown, `/tmp/mub-test/shutdown_fired` contains `dispatched: ws-1`, but neither `ws-2` nor `proxmox-a`
+- [ ] on restart: `indicates incomplete shutdown: 1 endpoint(s) already dispatched, 3 remaining: ["ws-2", "proxmox-a", "proxmox-b"]`
+- [ ] `ws-2` is retried and accepted
+- [ ] `proxmox-a` and `proxmox-b` complete VM shutdown and host poweroff
+- [ ] `shutdown sequence complete` and marker file marked `completed`
+
 ## G. Inverter goes silent -- no shutdown on missing data
 
 **Do:** stop the simulator (Ctrl+C) for ~15 s, then start it again.

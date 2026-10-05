@@ -47,7 +47,7 @@ flowchart TD
     marker -- "completed" --> latched
     marker -- "incomplete manifest" --> m_grid{"Grid still down?"}
     m_grid -- "yes: on battery" --> resume["Resume sequence for<br/>remaining endpoints"] --> done_seq["Mark completed"] --> latched
-    m_grid -- "no: grid returned" --> recover
+    m_grid -- "no: grid flickered back" --> hold_wait["Hold remaining sequence<br/>pending recovery confirmation"] --> recover
 
     poll["Poll the inverter every 5 s<br/>SOC · grid voltage · load · battery power"] --> lost{"Grid voltage<br/>below 100 V?<br/><i>grid_lost_voltage</i>"}
     lost -- "no" --> poll
@@ -61,7 +61,7 @@ flowchart TD
     low -- "no" --> onbatt
     low -- "yes" --> write["Write + fsync<br/>shutdown marker"]
 
-    write --> seq["SSH shutdown sequence<br/>(cancels any previous in-flight task)<br/>record dispatched endpoint in manifest<br/>one endpoint every 30 s, in config order<br/><i>stagger_secs</i><br/>(retries transient connection errors up to 90 s<br/><i>ssh_connect_retry_secs</i>)"]
+    write --> seq["SSH shutdown sequence<br/>(cancels any previous in-flight task)<br/>record successfully dispatched endpoint in manifest<br/>(failed endpoints & mid-flight VMs omitted for retry)<br/>one endpoint every 30 s, in config order<br/><i>stagger_secs</i><br/>(retries transient connection errors up to 90 s<br/><i>ssh_connect_retry_secs</i>)"]
     seq --> win["Windows<br/>shutdown /s /t 60"]
     seq --> pve["Proxmox VE<br/>poweroff (pve-guests)<br/>or vms_then_poweroff<br/>(parallel qm shutdown --timeout)"]
     win --> done_seq
@@ -72,12 +72,13 @@ flowchart TD
     healthy -- "yes" --> recover
 
     recover{"Grid stays up for 180 s?<br/><i>recovery_debounce_secs</i>"}
-    recover -- "no, lost again" --> sent{"Shutdown<br/>already sent?"}
-    sent -- "yes" --> latched
+    recover -- "no, lost again" --> sent{"Shutdown already sent<br/>or held pending?"}
+    sent -- "yes, held sequence pending" --> resume
+    sent -- "yes, fully dispatched" --> latched
     sent -- "no" --> onbatt
     recover -- "yes" --> fired{"Did this outage<br/>shut anything down?"}
     fired -- "no, just a blip" --> poll
-    fired -- "yes" --> wol["Wake-on-LAN to every endpoint<br/>(stops in-flight shutdown sequence)<br/>now, then 8 more rounds 2 min apart<br/><i>wol_resend_count · wol_resend_interval_secs</i>"]
+    fired -- "yes" --> wol["Wake-on-LAN to every endpoint<br/>(stops in-flight shutdown sequence<br/>& spares held endpoints)<br/>now, then 8 more rounds 2 min apart<br/><i>wol_resend_count · wol_resend_interval_secs</i>"]
     wol --> clear["Delete the<br/>shutdown marker"]
     clear --> poll
 
@@ -86,7 +87,7 @@ flowchart TD
     classDef bad fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
     classDef wake fill:#bfdbfe,stroke:#1d4ed8,color:#1e3a8a
     class poll,start ok
-    class onbatt,deb warn
+    class onbatt,deb,hold_wait warn
     class write,seq,win,pve,resume,done_seq,latched bad
     class wol,clear wake
 ```
@@ -197,14 +198,23 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
   times, `wol_resend_interval_secs` apart, so a machine that was still
   shutting down when the first round went out is woken once it's off.
   Machines already running ignore the extra packets.
-- **The shutdown is remembered across reboots of the bridge.** Before the
-  sequence starts, the bridge writes
-  `/var/lib/modbus-ups-bridge/shutdown_fired` to the SSD; it removes it only
-  after the last Wake-on-LAN round. If the bridge restarts in between (the
-  inverter cut its power too, a watchdog reset, a crash), it finds the file,
-  starts latched -- no second shutdown -- and still wakes everything on
-  recovery. Delete the file by hand only if you've brought the endpoints
-  back yourself and don't want the wake-up round.
+- **The shutdown and progress are remembered across reboots of the bridge.**
+  Before the sequence starts, the bridge creates `/var/lib/modbus-ups-bridge/shutdown_fired`
+  on the SSD. As each endpoint successfully completes shutdown, its name is recorded
+  to the manifest (`dispatched: <name>`).
+  - Proxmox hosts (`vms_then_poweroff`) are recorded **only** after guest VMs finish
+    stopping and host power-off is scheduled, preventing premature skipping if the
+    bridge restarts during long VM shutdowns.
+  - Endpoints that failed to shut down are **omitted** from the manifest so they are
+    retried on restart.
+  - If the bridge restarts mid-sequence and the grid flickers back for just one reading,
+    remaining shutdowns are **not** discarded; they are held pending recovery confirmation.
+    If the grid drops back down before `recovery_debounce_secs` (3 minutes), the remaining
+    sequence resumes immediately. If the grid stays healthy, remaining endpoints are
+    spared and Wake-on-LAN follows.
+  - The marker file is removed only after the final Wake-on-LAN round finishes.
+  Delete the file by hand only if you've brought the endpoints back yourself and don't
+  want the wake-up round.
 - **If the inverter cuts output on its own hardware protection instead**
   (bridge missed the window, misconfiguration, whatever) -- there's no
   standby power on the endpoints' NICs, so WOL can't reach them. That path

@@ -17,9 +17,9 @@ procedures: [docs/register-verification.md](docs/register-verification.md)
 (inverter registers) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)
 (Proxmox shutdown command).
 
-**Status (2026-10-05).** Level 1: 48 tests, all passing on Debian 13 (47 on
-Windows, where the one Linux-only test is skipped). Level 2: all 20 scenarios
-(A-M plus the 60 s SSH timeout, F2 for mid-sequence restart resumption, N1-N5 for the Proxmox method
+**Status (2026-10-05).** Level 1: 49 tests, all passing on Debian 13 (48 on
+Windows, where the one Linux-only test is skipped). Level 2: all 22 scenarios
+(A-M plus the 60 s SSH timeout, F2 for mid-sequence restart resumption, F3 for grid flicker during restart, F4 for failed endpoint retry & Proxmox timing, N1-N5 for the Proxmox method
 `vms_then_poweroff` against simulated VMs, and O for host booting / SSH connection retries) passing on Debian 13 under WSL2.
 Earlier runs found and fixed a serial-port lock that stopped the bridge
 reconnecting, `setup.sh` hanging when its output was piped, misleading
@@ -79,7 +79,7 @@ on immediately. A wait of **3600 s** can never pass during the test, so the
 state is guaranteed to stay put. That's also the main limit: the tests
 can't check exact timings ("fires at 60 s, not at 59 s").
 
-### The 48 tests
+### The 49 tests
 
 **State machine -- `src/state.rs`**
 
@@ -143,6 +143,7 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `remote_shutdown::stop_signal_resolves_on_true_but_not_on_a_dropped_sender` | Confirmed recovery stops the sequence from starting more endpoints, but a replaced sequence doesn't skip its stagger delays |
 | `persist::set_is_set_clear_roundtrip` | The marker file is created (with its folder), is seen by a fresh instance -- i.e. after a reboot -- and is deleted |
 | `persist::state_transitions_incomplete_and_completed` | Manifest states: Incomplete records dispatched endpoints in order, Completed marks finished sequence, NotSet when absent |
+| `persist::failed_endpoint_omitted_from_marker_is_not_marked_dispatched` | Failed endpoints omitted from the marker manifest remain in the incomplete state for retry on restart |
 | `persist::legacy_marker_parses_as_completed` | Backward compatibility with unformatted legacy marker files |
 | `watchdog::feeds_then_disarms_through_a_clone_with_magic_v` | Feeding writes a zero byte; a requested stop writes the magic `V` through the stop handler's second handle, so `systemctl stop` doesn't reboot the box |
 | `watchdog::without_a_watchdog_configured_everything_is_a_no_op` | With no `[watchdog]` section (e.g. the test config), feeding and disarming do nothing |
@@ -424,6 +425,9 @@ The simulator and bridge can keep running.
 | D | Full outage | `outage`, `soc 25` … `restore` | Fires on the 2nd low reading; 4 SSH commands 2 s apart; latched; wake-up 10 s after the grid is back, even with the battery still low; 4 Wake-on-LAN rounds; marker removed |
 | E | Flicker with low battery | `soc 35`, `outage`, `restore`, `soc 30`, `outage` | Shutdown fires (regression test) |
 | F | Bridge restart mid-outage | run D, Ctrl+C the bridge, restart | Resumes latched, no second shutdown, wakes on recovery |
+| F2 | Bridge restart mid-sequence | partial manifest in marker, restart bridge | Resumes remaining endpoints without re-calling dispatched ones; completes sequence |
+| F3 | Grid flicker during restart | restart during grid blip, outage resumes | Holds sequence while grid is temporarily up; resumes immediately when grid drops; completes cleanly |
+| F4 | Failed endpoint retry & Proxmox timing | endpoint fails, Proxmox VM delay, restart | Failed endpoints and mid-flight VMs omitted from marker; retried on restart; Proxmox host recorded only after poweroff |
 | G | Inverter silent | Ctrl+C the simulator for 15 s | Errors and retries, **no** shutdown |
 | H | Garbage SOC | `set 184 150` during an outage | Bad read, **no** shutdown |
 | I | Cutoff without margin | `set 217 30`, restart bridge | Error logged |

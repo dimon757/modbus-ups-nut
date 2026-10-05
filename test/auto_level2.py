@@ -3,7 +3,7 @@
 
 Runs the real compiled bridge against the inverter simulator, fake ssh,
 and local Wake-on-LAN listener over a virtual serial cable (socat).
-Covers Scenarios A through N5 from CHECKLIST.md.
+Covers Scenarios A through O from CHECKLIST.md.
 """
 
 import os
@@ -514,6 +514,154 @@ class TestRunner:
         log("  [OK] Marker file deleted after WOL completed", Color.GREEN)
         log("--> SCENARIO F2: PASSED", Color.GREEN + Color.BOLD)
 
+    def test_scenario_f3(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO F3: Bridge restarts mid-sequence during grid voltage flicker", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+
+        # Marker has ws-1 and ws-2 dispatched
+        with open(f"{DIR}/shutdown_fired", "w") as f:
+            f.write("# shutdown sequence in progress\ndispatched: ws-1\ndispatched: ws-2\n")
+
+        # Simulate grid flickers back momentarily (e.g. 230V, soc 25) right when bridge restarts
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 25")
+
+        self.start_bridge()
+        line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 2 endpoint\(s\) already dispatched, 2 remaining", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        # Bridge sees grid up initially, holds remaining shutdowns pending recovery confirmation
+        line = self.wait_for_bridge_log(r"grid currently up; holding 2 remaining shutdown\(s\) pending recovery confirmation", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        # Verify no SSH commands have fired yet while grid is temporarily up
+        time.sleep(2)
+        with open(f"{DIR}/ssh.log") as f:
+            assert len(f.read().strip()) == 0, "No endpoints should be dispatched while grid is up"
+
+        # Now grid drops again (flicker ends, outage resumes)
+        self.send_sim_cmd("outage")
+
+        # Bridge notices grid down and immediately resumes remaining endpoints!
+        line = self.wait_for_bridge_log(r"grid still down: resuming shutdown sequence for 2 remaining endpoint\(s\)", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        self.wait_for_bridge_log(r"shutdown sequence complete", timeout=15)
+        log("  [OK] Remaining shutdown sequence completed", Color.GREEN)
+
+        with open(f"{DIR}/ssh.log") as f:
+            ssh_content = f.read()
+        assert "10.99.0.3" in ssh_content, "proxmox-a should have been dispatched"
+        assert "10.99.0.4" in ssh_content, "proxmox-b should have been dispatched"
+        assert "10.99.0.1" not in ssh_content, "ws-1 was already dispatched and should not be re-called"
+        assert "10.99.0.2" not in ssh_content, "ws-2 was already dispatched and should not be re-called"
+        log("  [OK] Remaining endpoints dispatched cleanly after grid drop", Color.GREEN)
+
+        with open(f"{DIR}/shutdown_fired") as f:
+            marker_content = f.read()
+        assert "completed" in marker_content, "Marker file must record completion"
+
+        # Recovery + WOL
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 40")
+        self.wait_for_bridge_log(r"state: ShutdownLatched -> RecoveryDebouncing", timeout=8)
+        self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
+        self.wait_for_bridge_log(r"Wake-on-LAN round 4/4", timeout=25)
+        time.sleep(1)
+        assert not os.path.exists(f"{DIR}/shutdown_fired"), "Marker file should be deleted after WOL"
+        log("  [OK] Marker file deleted after WOL completed", Color.GREEN)
+        log("--> SCENARIO F3: PASSED", Color.GREEN + Color.BOLD)
+
+    def test_scenario_f4(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO F4: Failed endpoint omitted from marker & retried; Proxmox timing", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+
+        # In this scenario, we use CONFIG_VMS so Proxmox uses vms_then_poweroff
+        # Simulate ws-2 fails
+        with open(f"{DIR}/ssh-fail", "w") as f:
+            f.write("10.99.0.2\n")
+
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.start_bridge(CONFIG_VMS)
+        self.wait_for_bridge_log(r"loaded config from .*bridge-test-vms\.toml")
+
+        self.send_sim_cmd("outage")
+        self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
+        self.send_sim_cmd("soc 25")
+        self.wait_for_bridge_log(r"firing shutdown sequence", timeout=5)
+
+        # ws-1 succeeds
+        line = self.wait_for_bridge_log(r"shutting down ws-1", timeout=8)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        # ws-2 fails
+        line = self.wait_for_bridge_log(r"failed to shut down ws-2", timeout=10)
+        log(f"  [OK] Caught expected failure for ws-2: {line}", Color.GREEN)
+
+        # proxmox-a starts shutting down VMs
+        line = self.wait_for_bridge_log(r"shutting down proxmox-a \(10\.99\.0\.3\) via Proxmox: VMs first, then poweroff", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        # While VMs are shutting down on proxmox-a, check marker:
+        # ws-1 MUST be dispatched.
+        # ws-2 MUST NOT be dispatched (it failed).
+        # proxmox-a MUST NOT be dispatched yet (VMs still shutting down, host poweroff not scheduled yet).
+        with open(f"{DIR}/shutdown_fired") as f:
+            marker_content = f.read()
+        assert "dispatched: ws-1" in marker_content, "ws-1 succeeded so it must be marked dispatched"
+        assert "dispatched: ws-2" not in marker_content, "ws-2 failed so it must NOT be marked dispatched"
+        assert "dispatched: proxmox-a" not in marker_content, "proxmox-a is mid-VM shutdown so it must NOT be marked dispatched yet"
+        log("  [OK] Marker correctly excludes failed ws-2 and mid-flight proxmox-a", Color.GREEN)
+
+        # Stop bridge mid-sequence to simulate a restart while ws-2 failed and proxmox-a was mid-flight
+        self.stop_bridge()
+
+        # Fix ws-2 failure
+        if os.path.exists(f"{DIR}/ssh-fail"):
+            os.remove(f"{DIR}/ssh-fail")
+
+        # Restart bridge during the outage
+        self.start_bridge(CONFIG_VMS)
+
+        # Bridge must recognize that ws-1 was dispatched, but ws-2, proxmox-a, and proxmox-b remain!
+        line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 1 endpoint\(s\) already dispatched, 3 remaining", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        line = self.wait_for_bridge_log(r"resuming shutdown sequence for 3 remaining endpoint\(s\)", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        # ws-2 is retried and accepted this time!
+        line = self.wait_for_bridge_log(r"shutting down ws-2", timeout=8)
+        log(f"  [OK] {line}", Color.GREEN)
+        self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=8)
+        log("  [OK] ws-2 was retried and succeeded", Color.GREEN)
+
+        # proxmox-a and proxmox-b complete
+        self.wait_for_bridge_log(r"shutdown sequence complete", timeout=30)
+        log("  [OK] Shutdown sequence finished successfully", Color.GREEN)
+
+        with open(f"{DIR}/shutdown_fired") as f:
+            final_marker = f.read()
+        assert "completed" in final_marker
+        assert "dispatched: ws-2" in final_marker
+        assert "dispatched: proxmox-a" in final_marker
+        assert "dispatched: proxmox-b" in final_marker
+        log("  [OK] All endpoints recorded as dispatched and completed", Color.GREEN)
+
+        # Recovery + WOL
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.wait_for_bridge_log(r"state: ShutdownLatched -> RecoveryDebouncing", timeout=10)
+        self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
+        log("--> SCENARIO F4: PASSED", Color.GREEN + Color.BOLD)
+
     def test_scenario_g(self):
         log("\n=======================================================", Color.BOLD)
         log("RUNNING SCENARIO G: Inverter goes silent -- no shutdown on missing data", Color.BOLD)
@@ -974,6 +1122,8 @@ class TestRunner:
             "e": ("Scenario E (Regression: Grid flicker low SOC)", self.test_scenario_e),
             "f": ("Scenario F (Process restart mid-outage)", self.test_scenario_f),
             "f2": ("Scenario F2 (Process restart mid-sequence)", self.test_scenario_f2),
+            "f3": ("Scenario F3 (Restart mid-sequence with grid flicker)", self.test_scenario_f3),
+            "f4": ("Scenario F4 (Failed endpoint retried & Proxmox timing)", self.test_scenario_f4),
             "g": ("Scenario G (Silent inverter)", self.test_scenario_g),
             "h": ("Scenario H (Garbage SOC read)", self.test_scenario_h),
             "k": ("Scenario K (Outage during WoL)", self.test_scenario_k),

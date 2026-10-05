@@ -251,5 +251,30 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn failed_endpoint_omitted_from_marker_is_not_marked_dispatched() {
+        let dir = std::env::temp_dir().join(format!("mub-marker-failed-{}", std::process::id()));
+        let marker = ShutdownMarker::new(dir.join("sub").join("shutdown_fired"));
+
+        marker.set();
+        // ep1 succeeds
+        marker.record_dispatched("ep1");
+        // ep2 fails -> record_dispatched is NOT called
+        // ep3 succeeds
+        marker.record_dispatched("ep3");
+
+        let state = marker.state();
+        match state {
+            ShutdownState::Incomplete { dispatched } => {
+                assert!(dispatched.contains(&"ep1".to_string()));
+                assert!(!dispatched.contains(&"ep2".to_string()));
+                assert!(dispatched.contains(&"ep3".to_string()));
+            }
+            _ => panic!("expected Incomplete state"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
