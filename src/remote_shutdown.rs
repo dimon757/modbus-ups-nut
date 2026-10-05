@@ -41,6 +41,10 @@ pub fn is_transient_connection_error(err: &anyhow::Error) -> bool {
         || s.contains("host key verification failed")
         || s.contains("offending key")
         || s.contains("identification has changed")
+        || s.contains("could not resolve hostname")
+        || s.contains("name or service not known")
+        || s.contains("no such file or directory")
+        || s.contains("bad configuration option")
     {
         return false;
     }
@@ -744,5 +748,14 @@ mod tests {
 
         let err_cmd = anyhow!("ssh to 10.99.0.1 exited Some(1): stderr=bash: invalid command");
         assert!(!is_transient_connection_error(&err_cmd));
+
+        let err_dns = anyhow!("ssh to invalid-host exited Some(255): stderr=ssh: Could not resolve hostname invalid-host: Name or service not known");
+        assert!(!is_transient_connection_error(&err_dns));
+
+        let err_key_missing = anyhow!("ssh to 10.99.0.1 exited Some(255): stderr=Identity file /missing/key not accessible: No such file or directory");
+        assert!(!is_transient_connection_error(&err_key_missing));
+
+        let err_bad_opt = anyhow!("ssh to 10.99.0.1 exited Some(255): stderr=Bad configuration option: invalidoption");
+        assert!(!is_transient_connection_error(&err_bad_opt));
     }
 }

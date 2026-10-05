@@ -107,6 +107,9 @@ ssh_user = "root"
 ssh_key_path = "/etc/modbus-ups-bridge/proxmox_key"
 shutdown_delay_secs = 10
 mac_address = "AA:BB:CC:DD:EE:03"
+# Servers with RAID controllers / memory training can take 5-8 minutes to boot.
+# An extended budget (e.g. 900s / 15 min) ensures retries won't give up prematurely.
+ssh_connect_retry_secs = 900
 
 [[endpoints]]
 name = "proxmox-b"
@@ -116,6 +119,7 @@ ssh_user = "root"
 ssh_key_path = "/etc/modbus-ups-bridge/proxmox_key"
 shutdown_delay_secs = 10
 mac_address = "AA:BB:CC:DD:EE:04"
+ssh_connect_retry_secs = 900
 
 # Omit this whole section if the board has no watchdog device.
 [watchdog]
