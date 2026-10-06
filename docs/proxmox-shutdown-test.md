@@ -130,8 +130,10 @@ Sends exactly what the bridge sends, from the bridge box with the bridge's key:
 flowchart TD
     start(["Start vms_then_poweroff on Proxmox host"]) --> list["List VMs: qm list"]
     list --> states["Query power states in batch: qm status"]
-    states --> running{"Any VMs running?"}
-    running -- "no" --> pwr["Host power-off: systemctl poweroff --no-block"]
+    states --> chk_rec0{"Recovery confirmed?<br/>(stop channel)"}
+    chk_rec0 -- "yes" --> cancel_exit(["Cancel Proxmox shutdown<br/>(no destructive steps)"])
+    chk_rec0 -- "no" --> running{"Any VMs running?"}
+    running -- "no" --> chk_delay
     running -- "yes" --> spawn["Spawn parallel shutdown tasks (Tokio JoinSet)"]
 
     subgraph parallel ["Parallel Execution per Running VM"]
@@ -139,17 +141,26 @@ flowchart TD
         vm_call["qm shutdown ID --timeout vm_shutdown_timeout_secs<br/>(blocks until VM stops or timeout expires)"]
         vm_call --> vm_eval{"qm shutdown result"}
         vm_eval -- "Clean exit (code 0)" --> vm_done["VM stopped gracefully"]
-        vm_eval -- "Guest agent missing / refused" --> vm_hard["Hard stop: qm stop ID"]
+        vm_eval -- "Guest agent missing / refused" --> vm_hard["Hard stop: qm stop ID<br/>(checked against recovery)"]
         vm_eval -- "Timeout expired" --> vm_hard
         vm_hard --> vm_done
     end
 
     spawn --> parallel
-    parallel --> join["JoinSet: wait for all parallel VM tasks to complete"]
-    join --> pwr
+    parallel --> join{"All VM tasks done<br/>or recovery confirmed?"}
+    join -- "recovery confirmed" --> abort_tasks["Abort local waits & skip hard stops / host poweroff"] --> cancel_exit
+    join -- "completed" --> chk_rec1{"Recovery confirmed<br/>after VM tasks?"}
+    chk_rec1 -- "yes" --> cancel_exit
+    chk_rec1 -- "no" --> hard_stops["Execute hard stops for pending/refused VMs<br/>(suppressed if recovery confirmed)"]
+    hard_stops --> chk_delay["Local shutdown delay: shutdown_delay_secs<br/>(cancellable on recovery)"]
+    chk_delay --> chk_rec2{"Recovery confirmed<br/>during delay?"}
+    chk_rec2 -- "yes" --> cancel_exit
+    chk_rec2 -- "no" --> pwr["Host power-off: systemctl poweroff --no-block"]
     pwr --> pwr_res{"systemctl poweroff accepted?"}
     pwr_res -- "yes" --> host_off(["Host powers off"])
-    pwr_res -- "no (refused)" --> fallback["Fallback: nohup /sbin/poweroff &"] --> host_off
+    pwr_res -- "no (refused)" --> chk_rec3{"Recovery confirmed?"}
+    chk_rec3 -- "yes" --> cancel_exit
+    chk_rec3 -- "no" --> fallback["Fallback: nohup /sbin/poweroff &"] --> host_off
 ```
 
 Run the individual steps by hand from the bridge box to verify each command:
@@ -169,7 +180,7 @@ Run the individual steps by hand from the bridge box to verify each command:
    sudo ssh -i /etc/modbus-ups-bridge/proxmox_key -o BatchMode=yes root@<proxmox-host> "qm shutdown <vmid> --timeout 180"
    ```
    On Proxmox VE, `qm shutdown <vmid>` blocks until the VM stops or `--timeout` expires.
-   The bridge runs shutdowns for all running VMs concurrently in parallel via Tokio tasks, passing `--timeout <vm_shutdown_timeout_secs>` and relaxing the per-call SSH timeout ceiling accordingly. If a guest agent is missing, `qm shutdown` fails quickly; if a guest takes longer than `--timeout`, it exits with an error and the bridge hard-powers it off with `qm stop <vmid>`.
+   The bridge runs shutdowns for all running VMs concurrently in parallel via Tokio tasks, passing `--timeout <vm_shutdown_timeout_secs>` and relaxing the per-call SSH timeout ceiling accordingly. If a guest agent is missing, `qm shutdown` fails quickly; if a guest takes longer than `--timeout`, it exits with an error and the bridge hard-powers it off with `qm stop <vmid>`. If confirmed recovery occurs at any point while VM shutdowns are in progress, remaining local waits are aborted, destructive hard stops (`qm stop`) are strictly suppressed, and the host power-off is cancelled.
 4. **Verify power state** after shutdown finishes (or check via step 2).
    Note how long the VM took to shut down. (The setting `vm_shutdown_timeout_secs` must exceed this duration).
 5. **Power off the host**:

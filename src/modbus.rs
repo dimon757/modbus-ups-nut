@@ -219,7 +219,7 @@ impl InverterSettings {
 
         if self.device_type != DEVICE_TYPE_SINGLE_PHASE_STORAGE {
             out.push((
-                Warn,
+                Error,
                 format!(
                     "device type {:#06x}, expected {:#06x} (single-phase storage inverter) -- \
                      check the serial port and slave id point at the Sunsynk",
@@ -253,7 +253,7 @@ impl InverterSettings {
                 }
                 if self.shutdown_soc_pct != configured_cutoff_soc {
                     out.push((
-                        Warn,
+                        Error,
                         format!(
                             "config inverter_cutoff_soc is {:.0}% but the inverter is set to \
                              {:.0}% -- update the config to match",
@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn capacity_mode_without_margin_is_an_error() {
         let f = settings(1, 30.0).findings(30.0, 20.0);
-        assert_eq!(levels(&f), [log::Level::Error, log::Level::Warn]);
+        assert_eq!(levels(&f), [log::Level::Error, log::Level::Error]);
     }
 
     #[test]
@@ -322,11 +322,11 @@ mod tests {
     }
 
     #[test]
-    fn wrong_device_type_warns() {
+    fn wrong_device_type_is_an_error() {
         let mut s = settings(1, 20.0);
         s.device_type = 0x0500;
         let f = s.findings(30.0, 20.0);
-        assert_eq!(f[0].0, log::Level::Warn);
+        assert_eq!(f[0].0, log::Level::Error);
         assert!(f[0].1.contains("0x0500"));
     }
 

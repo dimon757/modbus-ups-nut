@@ -87,10 +87,9 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
     let mut sm = StateMachine::new(cfg.thresholds.clone(), resume);
 
     // At most one of each in flight. A new shutdown cancels leftover WOL
-    // resends. Confirmed recovery stops the shutdown sequence from starting
-    // further endpoints -- but hosts already shutting down are left to
-    // finish (see remote_shutdown::run_shutdown_sequence), so the stop is a
-    // signal, not an abort.
+    // resends. Confirmed recovery stops the shutdown sequence and prevents
+    // any not-yet-executed destructive Proxmox step (hard VM stop or host
+    // poweroff). An already-issued guest shutdown may still finish remotely.
     let mut shutdown_task: Option<(JoinHandle<()>, watch::Sender<bool>)> = None;
     let mut wake_task: Option<JoinHandle<()>> = None;
 
@@ -256,8 +255,14 @@ async fn connect_with_retry(cfg: &Config, wdt: &mut watchdog::Watchdog) -> modbu
         wdt.feed();
         match modbus::ModbusClient::connect(&cfg.modbus) {
             Ok(mut c) => {
-                check_inverter_settings(&mut c, cfg).await;
-                return c;
+                if check_inverter_settings(&mut c, cfg).await {
+                    return c;
+                }
+                log::error!(
+                    "inverter safety checks failed -- retrying in 5s without entering the shutdown state machine"
+                );
+                drop(c);
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
             Err(e) => {
                 log::error!("modbus connect failed: {:#} -- retrying in 5s", e);
@@ -267,9 +272,10 @@ async fn connect_with_retry(cfg: &Config, wdt: &mut watchdog::Watchdog) -> modbu
     }
 }
 
-/// Logs only -- never refuses to run. If the inverter cuts output too early,
-/// a late graceful shutdown still beats none at all.
-async fn check_inverter_settings(client: &mut modbus::ModbusClient, cfg: &Config) {
+/// Returns false on any unreadable or unsafe inverter setting. The shutdown
+/// controller must fail closed: unknown device/register semantics must never
+/// be allowed to drive the shutdown state machine.
+async fn check_inverter_settings(client: &mut modbus::ModbusClient, cfg: &Config) -> bool {
     match client.read_settings().await {
         Ok(s) => {
             log::info!(
@@ -280,13 +286,21 @@ async fn check_inverter_settings(client: &mut modbus::ModbusClient, cfg: &Config
                 s.shutdown_voltage
             );
             log::info!("inverter: {}", s.protocol_summary());
-            for (level, msg) in s.findings(
+            let findings = s.findings(
                 cfg.thresholds.low_battery_soc,
                 cfg.thresholds.inverter_cutoff_soc,
-            ) {
-                log::log!(level, "inverter settings: {}", msg);
+            );
+            for (level, msg) in &findings {
+                log::log!(*level, "inverter settings: {}", msg);
             }
+            !findings.iter().any(|(level, _)| *level == log::Level::Error)
         }
-        Err(e) => log::warn!("could not read inverter settings: {:#}", e),
+        Err(e) => {
+            log::error!(
+                "could not read required inverter settings: {:#} -- refusing to operate",
+                e
+            );
+            false
+        }
     }
 }

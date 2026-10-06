@@ -78,7 +78,7 @@ flowchart TD
     sent -- "no" --> onbatt
     recover -- "yes" --> fired{"Did this outage<br/>shut anything down?"}
     fired -- "no, just a blip" --> poll
-    fired -- "yes" --> wol["Wake-on-LAN to every endpoint<br/>(stops in-flight shutdown sequence<br/>& spares held endpoints)<br/>now, then 8 more rounds 2 min apart<br/><i>wol_resend_count · wol_resend_interval_secs</i>"]
+    fired -- "yes" --> wol["Wake-on-LAN to every endpoint<br/>(stops in-flight shutdown sequence,<br/>suppresses qm stop & host poweroff,<br/>& spares held endpoints)<br/>now, then 8 more rounds 2 min apart<br/><i>wol_resend_count · wol_resend_interval_secs</i>"]
     wol --> clear["Delete the<br/>shutdown marker"]
     clear --> poll
 
@@ -122,7 +122,7 @@ stateDiagram-v2
 | RecoveryDebouncing → ShutdownLatched | grid lost and the shutdown was already sent | -- (no second shutdown) |
 | RecoveryDebouncing → ShutdownLatched | grid lost, not yet sent, SOC low on 2 of the last 3 readings | **fire** the shutdown sequence (aborts any previous in-flight task) |
 | RecoveryDebouncing → OnBattery | grid lost, not yet sent, SOC not (yet) confirmed low | -- |
-| RecoveryDebouncing → Idle | grid back for `recovery_debounce_secs` (3 min) | **Wake-on-LAN** (stops in-flight shutdown, with resends), only if a shutdown was sent |
+| RecoveryDebouncing → Idle | grid back for `recovery_debounce_secs` (3 min) | **Wake-on-LAN** (stops in-flight shutdown, suppresses VM hard stops & host poweroff, with resends), only if a shutdown was sent |
 
 ## Target platform
 

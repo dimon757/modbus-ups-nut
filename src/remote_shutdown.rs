@@ -317,6 +317,9 @@ async fn proxmox_vms_then_poweroff(
     } else {
         running_vms(ep, opts, &vms).await.context("reading VM power states")?
     };
+    if *stop.borrow() {
+        bail!("recovery confirmed -- cancelled Proxmox shutdown on {}", ep.name);
+    }
     log::info!(
         "{}: {} VM(s) registered, {} running{}",
         ep.name,
@@ -349,39 +352,60 @@ async fn proxmox_vms_then_poweroff(
     let mut refused = Vec::new();
     let mut pending = Vec::new();
 
-    while let Some(res) = tasks.join_next().await {
-        match res {
-            Ok((vm, Ok(out))) => {
-                if looks_like_failure(&out) {
-                    log::warn!(
-                        "{}: VM {} refused a guest shutdown ({}) -- will be powered off",
-                        ep.name,
-                        vm.name,
-                        out.trim()
-                    );
-                    refused.push(vm);
-                } else {
-                    log::info!("{}: VM {} is off", ep.name, vm.name);
-                }
+    loop {
+        tokio::select! {
+            _ = stopped(stop) => {
+                log::warn!(
+                    "{}: recovery confirmed while VM shutdowns were in progress -- \
+                     aborting local waits; no hard stop or host poweroff will be issued",
+                    ep.name
+                );
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                bail!("recovery confirmed -- cancelled remaining Proxmox shutdown on {}", ep.name);
             }
-            Ok((vm, Err(e))) => {
-                let err_str = format!("{:#}", e);
-                if is_timeout(&err_str) && !is_guest_refusal(&err_str) {
-                    pending.push(vm);
-                } else {
-                    log::warn!(
-                        "{}: guest shutdown of VM {} failed ({:#}) -- will be powered off",
-                        ep.name,
-                        vm.name,
-                        e
-                    );
-                    refused.push(vm);
+            res = tasks.join_next() => {
+                let Some(res) = res else { break; };
+                match res {
+                    Ok((vm, Ok(out))) => {
+                        if looks_like_failure(&out) {
+                            log::warn!(
+                                "{}: VM {} refused a guest shutdown ({}) -- will be powered off",
+                                ep.name,
+                                vm.name,
+                                out.trim()
+                            );
+                            refused.push(vm);
+                        } else {
+                            log::info!("{}: VM {} is off", ep.name, vm.name);
+                        }
+                    }
+                    Ok((vm, Err(e))) => {
+                        let err_str = format!("{:#}", e);
+                        if is_timeout(&err_str) && !is_guest_refusal(&err_str) {
+                            pending.push(vm);
+                        } else {
+                            log::warn!(
+                                "{}: guest shutdown of VM {} failed ({:#}) -- will be powered off",
+                                ep.name,
+                                vm.name,
+                                e
+                            );
+                            refused.push(vm);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("{}: VM shutdown task failed: {:#}", ep.name, e);
+                    }
                 }
-            }
-            Err(e) => {
-                log::error!("{}: VM shutdown task failed: {:#}", ep.name, e);
             }
         }
+    }
+
+    // Recovery may have happened just after the last VM task completed.
+    // Never cross this boundary without checking again.
+    if *stop.borrow() {
+        bail!("recovery confirmed -- skipping hard VM stops and host poweroff on {}", ep.name);
     }
 
     // 3. Whatever is still running now gets powered off hard: VMs that
@@ -394,7 +418,7 @@ async fn proxmox_vms_then_poweroff(
             vm.name,
             opts.proxmox.vm_shutdown_timeout_secs
         );
-        power_off_hard(ep, opts, vm).await;
+        power_off_hard(ep, opts, vm, stop).await;
     }
     for vm in &refused {
         log::error!(
@@ -402,7 +426,7 @@ async fn proxmox_vms_then_poweroff(
             ep.name,
             vm.name
         );
-        power_off_hard(ep, opts, vm).await;
+        power_off_hard(ep, opts, vm, stop).await;
     }
 
     // 5. The host. `systemctl poweroff --no-block` is the standard systemd command;
@@ -410,29 +434,61 @@ async fn proxmox_vms_then_poweroff(
     //    until network termination cuts it off abruptly (exiting 255).
     //    If it's refused (e.g. systemctl fails or permission issue), the VMs are down by now, so
     //    a plain /sbin/poweroff is the safe fallback.
-    let delay = ep.shutdown_delay_secs.max(10);
+    // Apply the configured delay locally so recovery can cancel it. Do not
+    // dispatch a detached remote `sleep; poweroff`: once dispatched it cannot
+    // be recalled when the grid returns.
+    let delay = u64::from(ep.shutdown_delay_secs);
+    if delay > 0 {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(delay)) => {}
+            _ = stopped(stop) => {
+                bail!(
+                    "recovery confirmed -- cancelled delayed Proxmox host poweroff on {}",
+                    ep.name
+                );
+            }
+        }
+    }
+    if *stop.borrow() {
+        bail!("recovery confirmed -- skipping Proxmox host poweroff on {}", ep.name);
+    }
     match ssh_exec(ep, opts, "systemctl poweroff --no-block").await {
         Ok(_) => log::warn!("{}: host power-off scheduled via systemctl poweroff", ep.name),
         Err(e) => {
+            if *stop.borrow() {
+                bail!(
+                    "recovery confirmed -- skipping Proxmox poweroff fallback on {}",
+                    ep.name
+                );
+            }
             log::error!(
                 "{}: systemctl poweroff refused ({:#}) -- falling back to /sbin/poweroff",
                 ep.name,
                 e
             );
-            let fallback = format!(
-                "nohup sh -c 'sleep {}; /sbin/poweroff' > /dev/null 2>&1 < /dev/null &",
-                delay
-            );
-            ssh_exec(ep, opts, &fallback)
+            let fallback = "nohup /sbin/poweroff > /dev/null 2>&1 < /dev/null &";
+            ssh_exec(ep, opts, fallback)
                 .await
                 .context("fallback /sbin/poweroff")?;
-            log::warn!("{}: host power-off scheduled via /sbin/poweroff ({} s)", ep.name, delay);
+            log::warn!("{}: host power-off scheduled via /sbin/poweroff", ep.name);
         }
     }
     Ok(())
 }
 
-async fn power_off_hard(ep: &Endpoint, opts: &ShutdownOptions, vm: &Vm) {
+async fn power_off_hard(
+    ep: &Endpoint,
+    opts: &ShutdownOptions,
+    vm: &Vm,
+    stop: &watch::Receiver<bool>,
+) {
+    if *stop.borrow() {
+        log::warn!(
+            "{}: recovery confirmed -- skipping hard power-off of VM {}",
+            ep.name, vm.name
+        );
+        return;
+    }
     if let Err(e) = ssh_exec(ep, opts, &format!("qm stop {}", vm.id)).await {
         log::error!("{}: hard power-off of VM {} failed: {:#}", ep.name, vm.name, e);
     }

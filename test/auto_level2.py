@@ -1067,10 +1067,10 @@ class TestRunner:
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
         self.send_sim_cmd("soc 25")
 
-        line = self.wait_for_bridge_log(r"proxmox-b: systemctl poweroff refused .* falling back to /sbin/poweroff", timeout=20)
+        line = self.wait_for_bridge_log(r"proxmox-b: systemctl poweroff refused .* falling back to /sbin/poweroff", timeout=30)
         log(f"  [OK] {line}", Color.GREEN)
 
-        self.wait_for_bridge_log(r"shutdown sequence complete", timeout=15)
+        self.wait_for_bridge_log(r"shutdown sequence complete", timeout=20)
 
         with open(f"{DIR}/proxmox/10.99.0.4/host") as f:
             h_b = f.read()
@@ -1080,7 +1080,7 @@ class TestRunner:
 
     def test_scenario_n4(self):
         log("\n=======================================================", Color.BOLD)
-        log("RUNNING SCENARIO N4: Grid back while host is shutting down VMs", Color.BOLD)
+        log("RUNNING SCENARIO N4: Grid back while host is shutting down VMs (Safety Verification)", Color.BOLD)
         log("=======================================================", Color.BOLD)
         self.stop_bridge()
         self.reset_env()
@@ -1100,20 +1100,52 @@ class TestRunner:
         self.send_sim_cmd("soc 25")
         self.wait_for_bridge_log(r"firing shutdown sequence", timeout=5)
 
-        time.sleep(6)
+        line = self.wait_for_bridge_log(r"shutting down proxmox-a \(10\.99\.0\.3\) via Proxmox: VMs first, then poweroff", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+        line = self.wait_for_bridge_log(r"proxmox-a: guest shutdown requested for VM stuck-vm", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        # Grid returns while VM shutdown is in progress
+        time.sleep(2)
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 40")
 
-        line = self.wait_for_bridge_log(r"recovery confirmed -- stopping the rest of the shutdown sequence", timeout=20)
+        self.wait_for_bridge_log(r"state: ShutdownLatched -> RecoveryDebouncing", timeout=10)
+        self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
+
+        line = self.wait_for_bridge_log(r"recovery confirmed -- stopping the rest of the shutdown sequence", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        line = self.wait_for_bridge_log(
+            r"proxmox-a: recovery confirmed while VM shutdowns were in progress -- aborting local waits; no hard stop or host poweroff will be issued",
+            timeout=10
+        )
         log(f"  [OK] {line}", Color.GREEN)
 
         line = self.wait_for_bridge_log(r"Wake-on-LAN round 1/4", timeout=10)
         log(f"  [OK] {line}", Color.GREEN)
 
-        line = self.wait_for_bridge_log(r"proxmox-a: VM stuck-vm still running after 15 s -- powering it off hard", timeout=25)
-        log(f"  [OK] {line}", Color.GREEN)
-        line = self.wait_for_bridge_log(r"proxmox-a: host power-off scheduled", timeout=15)
-        log(f"  [OK] {line}", Color.GREEN)
+        log("    Waiting 18s past VM shutdown timeout to verify qm stop and host poweroff are never executed...", Color.CYAN)
+        time.sleep(18)
+
+        # Verify bridge logs: no hard VM stops, no host poweroff
+        for log_line in self.bridge_logs:
+            assert "powering it off hard" not in log_line, f"Unexpected hard power-off log: {log_line}"
+            assert "host power-off scheduled" not in log_line, f"Unexpected host poweroff log: {log_line}"
+            assert "qm stop" not in log_line, f"Unexpected qm stop log: {log_line}"
+        log("  [OK] Bridge logs confirm no hard stops or host poweroff were scheduled", Color.GREEN)
+
+        # Verify ssh.log: qm stop and poweroff never executed
+        with open(f"{DIR}/ssh.log") as f:
+            ssh_content = f.read()
+        assert "qm stop" not in ssh_content, f"qm stop was executed in ssh.log: {ssh_content}"
+        assert "poweroff" not in ssh_content, f"poweroff was executed in ssh.log: {ssh_content}"
+        log("  [OK] ssh.log confirms qm stop and host poweroff commands were never executed", Color.GREEN)
+
+        # Verify host files
+        assert not os.path.exists(f"{DIR}/proxmox/10.99.0.3/host"), "proxmox-a host was powered off!"
+        assert not os.path.exists(f"{DIR}/proxmox/10.99.0.4/host"), "proxmox-b host was powered off!"
+        log("  [OK] Simulated host files confirm neither Proxmox host was powered off", Color.GREEN)
         log("--> SCENARIO N4: PASSED", Color.GREEN + Color.BOLD)
 
     def test_scenario_n5(self):
@@ -1287,7 +1319,7 @@ class TestRunner:
             "n1": ("Scenario N1 (Proxmox VMs then poweroff)", self.test_scenario_n1),
             "n2": ("Scenario N2 (Proxmox hung VM & missing agent)", self.test_scenario_n2),
             "n3": ("Scenario N3 (Proxmox systemctl refused fallback)", self.test_scenario_n3),
-            "n4": ("Scenario N4 (Proxmox grid returns during VM shutdown)", self.test_scenario_n4),
+            "n4": ("Scenario N4 (Proxmox grid returns during VM shutdown -- qm stop and poweroff suppressed)", self.test_scenario_n4),
             "n5": ("Scenario N5 (Proxmox one host unreachable)", self.test_scenario_n5),
             "o": ("Scenario O (Host Booting on Wakeup / No Head-of-Line Blocking)", self.test_scenario_o),
             "p": ("Scenario P (Server Booting / Extended Per-Endpoint Retry)", self.test_scenario_p),

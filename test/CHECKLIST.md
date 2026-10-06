@@ -313,16 +313,16 @@ then `outage`, wait for `OnBattery`, `soc 25`.
 - [ ] `proxmox-b: host power-off scheduled via /sbin/poweroff (10 s)`; proxmox-a uses systemctl poweroff as in N1
 - [ ] `cat /tmp/mub-test/proxmox/10.99.0.4/host` shows `poweroff via /sbin/poweroff`
 
-### N4. Grid back while a host is still shutting its VMs down
+### N4. Grid back while a host is still shutting its VMs down (Safety Verification)
 
 **Do:** `./setup.sh reset`; add the hung VM to proxmox-a as in N2 (first line only); `outage`;
-wait for `OnBattery`; `soc 25`; about 6 s later `restore` and `soc 40`.
+wait for `OnBattery`; `soc 25`; about 2 s later `restore` and `soc 40`.
 
 - [ ] ~10 s after `restore`: `recovery confirmed -- stopping the rest of the shutdown sequence`
-      and the Wake-on-LAN rounds start
-- [ ] proxmox-a **still completes**: `stuck-vm ... powering it off hard`, then `host power-off scheduled`
-      -- a host left half-done would keep running with its VMs off; completed, it is woken by the
-      remaining Wake-on-LAN rounds and its Autostart restarts the VMs
+      and `recovery confirmed while VM shutdowns were in progress -- aborting local waits; no hard stop or host poweroff will be issued`
+- [ ] Wake-on-LAN rounds start (`Wake-on-LAN round 1/4`)
+- [ ] proxmox-a **aborts destructive steps**: `qm stop` (hard VM power-off) is **never** executed
+- [ ] host power-off (`systemctl poweroff` or `/sbin/poweroff`) is **never** executed -- the host stays running and running guests are not killed on power restoration
 
 ### N5. One Proxmox host unreachable
 

@@ -125,7 +125,7 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `capacity_mode_with_margin_is_ok` | Inverter cutoff 20 %, bridge acts at 30 % -- reported as OK |
 | `capacity_mode_without_margin_is_an_error` | Inverter cutoff 30 %, bridge also at 30 % -- logged as an error |
 | `voltage_mode_warns` | Inverter managing the battery by voltage -- logged as a warning |
-| `wrong_device_type_warns` | Device isn't a single-phase storage inverter -- warning |
+| `wrong_device_type_is_an_error` | Device isn't a single-phase storage inverter -- logged as an error |
 | `protocol_summary_decodes_version_and_shows_reg_54` | Register 2 is logged raw and decoded (0x0102 -> 1.2), with register 54 |
 | `protocol_summary_survives_unreadable_registers` | Firmware that doesn't answer for register 2 or 54 gives `unreadable`, not an error |
 
