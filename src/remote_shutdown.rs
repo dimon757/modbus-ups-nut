@@ -362,6 +362,7 @@ async fn proxmox_vms_then_poweroff(
                 );
                 tasks.abort_all();
                 while tasks.join_next().await.is_some() {}
+                restart_stopped_vms(ep, opts, &running).await;
                 bail!("recovery confirmed -- cancelled remaining Proxmox shutdown on {}", ep.name);
             }
             res = tasks.join_next() => {
@@ -405,6 +406,7 @@ async fn proxmox_vms_then_poweroff(
     // Recovery may have happened just after the last VM task completed.
     // Never cross this boundary without checking again.
     if *stop.borrow() {
+        restart_stopped_vms(ep, opts, &running).await;
         bail!("recovery confirmed -- skipping hard VM stops and host poweroff on {}", ep.name);
     }
 
@@ -429,6 +431,11 @@ async fn proxmox_vms_then_poweroff(
         power_off_hard(ep, opts, vm, stop).await;
     }
 
+    if *stop.borrow() {
+        restart_stopped_vms(ep, opts, &running).await;
+        bail!("recovery confirmed -- skipping Proxmox host poweroff on {}", ep.name);
+    }
+
     // 5. The host. `systemctl poweroff --no-block` is the standard systemd command;
     //    --no-block ensures systemctl returns immediately and doesn't hold the SSH session
     //    until network termination cuts it off abruptly (exiting 255).
@@ -442,6 +449,7 @@ async fn proxmox_vms_then_poweroff(
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(delay)) => {}
             _ = stopped(stop) => {
+                restart_stopped_vms(ep, opts, &running).await;
                 bail!(
                     "recovery confirmed -- cancelled delayed Proxmox host poweroff on {}",
                     ep.name
@@ -450,12 +458,14 @@ async fn proxmox_vms_then_poweroff(
         }
     }
     if *stop.borrow() {
+        restart_stopped_vms(ep, opts, &running).await;
         bail!("recovery confirmed -- skipping Proxmox host poweroff on {}", ep.name);
     }
     match ssh_exec(ep, opts, "systemctl poweroff --no-block").await {
         Ok(_) => log::warn!("{}: host power-off scheduled via systemctl poweroff", ep.name),
         Err(e) => {
             if *stop.borrow() {
+                restart_stopped_vms(ep, opts, &running).await;
                 bail!(
                     "recovery confirmed -- skipping Proxmox poweroff fallback on {}",
                     ep.name
@@ -474,6 +484,92 @@ async fn proxmox_vms_then_poweroff(
         }
     }
     Ok(())
+}
+
+/// When Proxmox host shutdown is cancelled due to recovery, the host is not powered off
+/// and will not reboot -- meaning Wake-on-LAN will not trigger Proxmox autostart.
+/// Any VM that was running when the shutdown began and has since stopped must be restarted.
+async fn restart_stopped_vms(
+    ep: &Endpoint,
+    opts: &ShutdownOptions,
+    running: &[Vm],
+) {
+    if running.is_empty() {
+        return;
+    }
+
+    log::info!(
+        "{}: checking VM power states to restart any guests stopped before recovery",
+        ep.name
+    );
+
+    let cmd = power_states_command(running);
+    let out = match ssh_exec(ep, opts, &cmd).await {
+        Ok(out) => out,
+        Err(e) => {
+            log::error!("{}: failed to query VM power states for restart: {:#}", ep.name, e);
+            return;
+        }
+    };
+
+    let stopped = select_stopped(running, &out);
+    if stopped.is_empty() {
+        log::info!(
+            "{}: all {} previously running VM(s) are still running; no restart needed",
+            ep.name,
+            running.len()
+        );
+        return;
+    }
+
+    log::warn!(
+        "{}: restarting {} stopped VM(s){}",
+        ep.name,
+        stopped.len(),
+        names_suffix(&stopped)
+    );
+
+    let mut tasks = JoinSet::new();
+    for vm in stopped {
+        let ep = ep.clone();
+        let opts = opts.clone();
+        tasks.spawn(async move {
+            let start_cmd = qm_start_command(vm.id);
+            let mut last_err = None;
+            for attempt in 1..=3 {
+                match ssh_exec(&ep, &opts, &start_cmd).await {
+                    Ok(_) => {
+                        log::info!("{}: VM {} (id {}) restarted", ep.name, vm.name, vm.id);
+                        return;
+                    }
+                    Err(e) => {
+                        if attempt < 3 {
+                            log::warn!(
+                                "{}: qm start {} failed ({:#}) -- retrying in 1s (attempt {}/3)",
+                                ep.name,
+                                vm.id,
+                                e,
+                                attempt
+                            );
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                        last_err = Some(e);
+                    }
+                }
+            }
+            if let Some(e) = last_err {
+                log::error!(
+                    "{}: failed to restart VM {} (id {}): {:#}",
+                    ep.name,
+                    vm.name,
+                    vm.id,
+                    e
+                );
+            }
+        });
+    }
+
+    while tasks.join_next().await.is_some() {}
 }
 
 async fn power_off_hard(
@@ -554,8 +650,30 @@ pub fn select_running(vms: &[Vm], out: &str) -> Vec<Vm> {
         .collect()
 }
 
+/// From `power_states_command` output (`<id> status: stopped` per line), the VMs
+/// that are stopped.
+pub fn select_stopped(vms: &[Vm], out: &str) -> Vec<Vm> {
+    vms.iter()
+        .filter(|vm| {
+            let state = out.lines().find_map(|line| {
+                let (id, state) = line.trim().split_once(' ')?;
+                (id == vm.id.to_string()).then(|| state.trim())
+            });
+            match state {
+                Some(s) if s.contains("stopped") => true,
+                _ => false,
+            }
+        })
+        .cloned()
+        .collect()
+}
+
 pub fn qm_shutdown_command(vmid: u32, timeout_secs: u64) -> String {
     format!("qm shutdown {} --timeout {}", vmid, timeout_secs)
+}
+
+pub fn qm_start_command(vmid: u32) -> String {
+    format!("qm start {}", vmid)
 }
 
 fn is_timeout(err_str: &str) -> bool {
@@ -749,6 +867,20 @@ mod tests {
     fn qm_shutdown_command_includes_timeout() {
         assert_eq!(qm_shutdown_command(100, 180), "qm shutdown 100 --timeout 180");
         assert_eq!(qm_shutdown_command(101, 15), "qm shutdown 101 --timeout 15");
+    }
+
+    #[test]
+    fn qm_start_command_formats_correctly() {
+        assert_eq!(qm_start_command(100), "qm start 100");
+    }
+
+    #[test]
+    fn selects_stopped_vms() {
+        let vms = [vm(100, "a"), vm(101, "b"), vm(102, "c"), vm(103, "d")];
+        let out = "100 status: running\n101 status: stopped\n102 status: paused\n";
+        // 101 stopped -> selected.
+        // 100 running, 102 paused, 103 missing -> not stopped.
+        assert_eq!(select_stopped(&vms, out), vec![vm(101, "b")]);
     }
 
     #[test]

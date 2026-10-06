@@ -78,7 +78,7 @@ flowchart TD
     sent -- "no" --> onbatt
     recover -- "yes" --> fired{"Did this outage<br/>shut anything down?"}
     fired -- "no, just a blip" --> poll
-    fired -- "yes" --> wol["Wake-on-LAN to every endpoint<br/>(stops in-flight shutdown sequence,<br/>suppresses qm stop & host poweroff,<br/>& spares held endpoints)<br/>now, then 8 more rounds 2 min apart<br/><i>wol_resend_count · wol_resend_interval_secs</i>"]
+    fired -- "yes" --> wol["Wake-on-LAN to every endpoint<br/>(stops in-flight shutdown sequence,<br/>suppresses qm stop & host poweroff,<br/>restarts stopped VMs via qm start,<br/>& spares held endpoints)<br/>now, then 8 more rounds 2 min apart<br/><i>wol_resend_count · wol_resend_interval_secs</i>"]
     wol --> clear["Delete the<br/>shutdown marker"]
     clear --> poll
 
@@ -122,7 +122,7 @@ stateDiagram-v2
 | RecoveryDebouncing → ShutdownLatched | grid lost and the shutdown was already sent | -- (no second shutdown) |
 | RecoveryDebouncing → ShutdownLatched | grid lost, not yet sent, SOC low on 2 of the last 3 readings | **fire** the shutdown sequence (aborts any previous in-flight task) |
 | RecoveryDebouncing → OnBattery | grid lost, not yet sent, SOC not (yet) confirmed low | -- |
-| RecoveryDebouncing → Idle | grid back for `recovery_debounce_secs` (3 min) | **Wake-on-LAN** (stops in-flight shutdown, suppresses VM hard stops & host poweroff, with resends), only if a shutdown was sent |
+| RecoveryDebouncing → Idle | grid back for `recovery_debounce_secs` (3 min) | **Wake-on-LAN** (stops in-flight shutdown, suppresses VM hard stops & host poweroff, restarts stopped VMs via `qm start`, with resends), only if a shutdown was sent |
 
 ## Target platform
 
@@ -308,7 +308,10 @@ or readable by others are logged as errors (ssh refuses such keys).
   in parallel (`qm shutdown <id> --timeout <secs>`, QEMU guest agent / ACPI),
   power off hard any VM still running after `vm_shutdown_timeout_secs` (`qm stop`),
   then `systemctl poweroff --no-block` (falls back to `/sbin/poweroff` if refused)
-  -- each such host runs in parallel with the rest of the sequence. Start at boot on each guest ensures VMs start
+  -- each such host runs in parallel with the rest of the sequence. If recovery is confirmed
+  while VM shutdowns are in progress or during the power-off delay, the bridge aborts destructive
+  hard stops, cancels host power-off, and automatically restarts any VMs that already completed
+  shutdown via `qm start`. Start at boot on each guest ensures VMs start
   again at boot after WOL. Which method to use is decided on site:
   [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md).
   SSH host keys are pinned (`StrictHostKeyChecking=yes`); an endpoint whose
@@ -334,7 +337,7 @@ or readable by others are logged as errors (ssh refuses such keys).
 
 Full explanation and step-by-step instructions: [TESTING.md](TESTING.md).
 
-1. **Unit tests** -- `cargo test` (48 tests). The decision logic, config parsing, the
+1. **Unit tests** -- `cargo test` (53 tests). The decision logic, config parsing, the
    inverter-settings check, the Proxmox commands, the marker file manifest, SSH connection
    retries for booting hosts, and Wake-on-LAN rounds, in under a second with no hardware.
 2. **Simulated site** -- `test/`: the real binary against an inverter
@@ -446,8 +449,8 @@ keys, watchdog, logs, starting, updating -- is
 - Telemetry/heartbeat back to Neuenhof over WireGuard -- worth adding once
   the core path is proven; not stubbed in to avoid guessing at your
   collector's protocol.
-- Retry-with-backoff on individual SSH calls -- currently one attempt,
-  logged on failure, sequence continues to the next endpoint. Worth adding
-  if a single flaky endpoint turns out to matter in practice.
+- Retry-with-backoff for executed commands -- commands that return non-zero exit codes
+  once connected are logged on failure and the sequence continues to the next endpoint
+  (transient SSH connection errors are already retried up to `ssh_connect_retry_secs`).
 - systemd's own `sd_notify` watchdog integration -- only the hardware
   `/dev/watchdog` feed is implemented.

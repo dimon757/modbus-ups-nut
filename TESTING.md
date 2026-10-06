@@ -17,7 +17,7 @@ procedures: [docs/register-verification.md](docs/register-verification.md)
 (inverter registers) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)
 (Proxmox shutdown command).
 
-**Status (2026-10-05).** Level 1: 51 tests, all passing on Debian 13 (50 on
+**Status (2026-10-06).** Level 1: 53 tests, all passing on Debian 13 (52 on
 Windows, where the one Linux-only test is skipped). Level 2: all 24 scenarios
 (A-M plus the 60 s SSH timeout, F2 for mid-sequence restart resumption, F3 for grid flicker during restart, F4 for failed endpoint retry & Proxmox timing, F5 for failed endpoint retry after sequence finishes, N1-N5 for the Proxmox method
 `vms_then_poweroff` against simulated VMs, O for host booting without head-of-line blocking, and P for server booting with per-endpoint retry budget) passing on Debian 13 under WSL2.
@@ -79,7 +79,7 @@ on immediately. A wait of **3600 s** can never pass during the test, so the
 state is guaranteed to stay put. That's also the main limit: the tests
 can't check exact timings ("fires at 60 s, not at 59 s").
 
-### The 49 tests
+### The 53 tests
 
 **State machine -- `src/state.rs`**
 
@@ -137,8 +137,10 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `remote_shutdown::parses_qmlist_including_names_with_spaces` | `qm list` output is read correctly: IDs, names with spaces, header, and VM statuses |
 | `remote_shutdown::power_states_command_covers_every_vm` | The exact power-state command sent for a list of VMs (`qm status`) |
 | `remote_shutdown::selects_running_vms_and_treats_unknown_as_running` | VMs with status other than "stopped" count as running -- and a VM missing from the answer counts as running, so it's powered off rather than left behind |
+| `remote_shutdown::selects_stopped_vms` | Filters VMs from the running list whose power state in `qm status` is "stopped" |
 | `remote_shutdown::recognises_qm_failure_text` | Failure text printed by `qm` (which may still exit 0) is recognised as a refused shutdown |
 | `remote_shutdown::qm_shutdown_command_includes_timeout` | The `qm shutdown` command format includes `--timeout` for Proxmox VE |
+| `remote_shutdown::qm_start_command_formats_correctly` | Formats `qm start <id>` command correctly for VM restart upon recovery |
 | `remote_shutdown::distinguishes_timeout_from_guest_refusal` | Error classification accurately separates VM shutdown timeouts from guest agent refusals |
 | `remote_shutdown::identifies_transient_connection_errors` | Distinguishes transient connection errors (connection refused, timed out, 255) from permanent auth or command failures |
 | `remote_shutdown::stop_signal_resolves_on_true_but_not_on_a_dropped_sender` | Confirmed recovery stops the sequence from starting more endpoints, but a replaced sequence doesn't skip its stagger delays |
@@ -189,7 +191,7 @@ after that it takes seconds.
 
 | Command | Runs |
 |---|---|
-| `cargo test` | All tests (42 on Linux, 41 on Windows) |
+| `cargo test` | All tests (53 on Linux, 52 on Windows) |
 | `cargo test state::` | Only tests whose name contains `state::` (the state machine) |
 | `cargo test grid_flap` | Only tests with `grid_flap` in the name |
 | `cargo test -- --nocapture` | All tests, also showing the bridge's log messages |
@@ -200,7 +202,7 @@ after that it takes seconds.
 A good run ends with:
 
 ```
-test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
 ```
 
 A failing test is named, followed by the line where the check failed --
@@ -441,7 +443,7 @@ The simulator and bridge can keep running.
 | N1 | Proxmox `vms_then_poweroff` (`./run-bridge.sh vms`) | `outage`, `soc 25` | Every VM shut down in parallel with native `--timeout` and confirmed off, then `systemctl poweroff`; the two hosts in parallel |
 | N2 | Hung VM, VM without guest agent | extra lines in the fake host's `vms` file | Missing guest agent detected immediately; hung VM hard-stopped after 15 s timeout -- both hosts still powered off |
 | N3 | `systemctl poweroff` refused | `systemctl-refuse` file | Falls back to `/sbin/poweroff` |
-| N4 | Grid back mid-way | `restore` while a host waits for a hung VM | That host still completes; Wake-on-LAN brings it back |
+| N4 | Grid back mid-way | `restore` while a host waits for a hung VM | Host aborts hard stops and poweroff, stays running; stopped VMs restarted via `qm start`; Wake-on-LAN follows |
 | N5 | Proxmox host unreachable | `ssh-fail` file | Logged; the other host still shut down |
 | O | Host booting on wakeup (no head-of-line blocking) | `ssh-booting-<host>` file | Initial attempt returns connection refused; moved to background retry up to `ssh_connect_retry_secs`; subsequent machines dispatched immediately without delay; all endpoints complete |
 | P | Server booting (per-endpoint extended budget) | `ssh-booting-<host>` file on server | Server uses custom `ssh_connect_retry_secs` override while rest proceed; server succeeds within extended window |

@@ -103,6 +103,18 @@ case $1 in
     stop)
         echo off > "$d/state_$2"
         ;;
+    start)
+        if [ $# -lt 2 ]; then
+            echo "fake qm: start requires VMID" >&2
+            exit 1
+        fi
+        vmid=$2
+        if ! grep -q "^$vmid|" "$d/vms" 2>/dev/null; then
+            echo "fake qm: no VM $vmid" >&2
+            exit 1
+        fi
+        echo on > "$d/state_$vmid"
+        ;;
     *)
         echo "fake qm: unsupported: $*" >&2
         exit 1

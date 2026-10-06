@@ -1,11 +1,7 @@
-# Level-2 test config: the real bridge against the inverter simulator, fake
-# ssh and a local Wake-on-LAN listener. Waits are cut from minutes to
-# seconds; everything lives in /tmp/mub-test (made by setup.sh). See
-# CHECKLIST.md.
-
+# bridge.toml: 2 Windows 11 endpoints, 1 Proxmox endpoint (vms_then_poweroff)
 wol_broadcast_addr = "127.0.0.1:40009"      # wol_listen.py, not the LAN
-state_file = "/tmp/mub-test/shutdown_fired" # never the real service's marker
-ssh_known_hosts_file = "/tmp/mub-test/known_hosts"  # made by setup.sh
+state_file = "/tmp/mub-test/shutdown_fired" # test run marker
+ssh_known_hosts_file = "/tmp/mub-test/known_hosts"
 
 [modbus]
 device = "/tmp/mub-test/ttyBR"   # bridge end of the socat virtual cable
@@ -15,51 +11,46 @@ poll_interval_secs = 1
 
 [thresholds]
 grid_lost_voltage = 100.0
-on_battery_debounce_secs = 5     # real: 60
+on_battery_debounce_secs = 5     # test timing: 5s
 low_battery_soc = 30.0
 inverter_cutoff_soc = 20.0
-recovery_debounce_secs = 10      # real: 180
-stagger_secs = 2                 # real: 30
-wol_resend_count = 3             # real: 8
-wol_resend_interval_secs = 5     # real: 120
-ssh_connect_retry_secs = 6       # real: 300
+recovery_debounce_secs = 10      # test timing: 10s
+stagger_secs = 2                 # test timing: 2s
+wol_resend_count = 3             # 4 rounds total (1 initial + 3 resends)
+wol_resend_interval_secs = 5     # 5s interval
+ssh_connect_retry_secs = 6
 
-# Hosts are in a range nothing answers on; the fake ssh never connects anyway.
+# Endpoint 1: Windows 11
 [[endpoints]]
 name = "ws-1"
 kind = "windows"
 host = "10.99.0.1"
 ssh_user = "ups-shutdown"
-ssh_key_path = "/tmp/mub-test/fake_key"   # dummy, made by setup.sh (0600)
+ssh_key_path = "/tmp/mub-test/fake_key"
 shutdown_delay_secs = 60
 mac_address = "AA:BB:CC:00:00:01"
 
+# Endpoint 2: Windows 11
 [[endpoints]]
 name = "ws-2"
 kind = "windows"
 host = "10.99.0.2"
 ssh_user = "ups-shutdown"
-ssh_key_path = "/tmp/mub-test/fake_key"   # dummy, made by setup.sh (0600)
+ssh_key_path = "/tmp/mub-test/fake_key"
 shutdown_delay_secs = 60
 mac_address = "AA:BB:CC:00:00:02"
 
+# Endpoint 3: Proxmox
 [[endpoints]]
-name = "proxmox-a"
+name = "proxmox"
 kind = "proxmox"
 host = "10.99.0.3"
 ssh_user = "root"
-ssh_key_path = "/tmp/mub-test/fake_key"   # dummy, made by setup.sh (0600)
+ssh_key_path = "/tmp/mub-test/fake_key"
 shutdown_delay_secs = 10
 mac_address = "AA:BB:CC:00:00:03"
 ssh_connect_retry_secs = 12
 
-[[endpoints]]
-name = "proxmox-b"
-kind = "proxmox"
-host = "10.99.0.4"
-ssh_user = "root"
-ssh_key_path = "/tmp/mub-test/fake_key"   # dummy, made by setup.sh (0600)
-shutdown_delay_secs = 10
-mac_address = "AA:BB:CC:00:00:04"
+[proxmox]
+method = "poweroff"
 
-# No [watchdog]: a test run must never be able to reboot the machine.
