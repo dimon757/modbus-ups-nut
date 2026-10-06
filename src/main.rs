@@ -272,10 +272,35 @@ async fn connect_with_retry(cfg: &Config, wdt: &mut watchdog::Watchdog) -> modbu
     }
 }
 
-/// Returns false on any unreadable or unsafe inverter setting. The shutdown
-/// controller must fail closed: unknown device/register semantics must never
-/// be allowed to drive the shutdown state machine.
+/// Evaluates whether the bridge should accept inverter settings and proceed to normal operation.
+///
+/// Refuses only when the data can't be trusted, which means the wrong device type (reg 0 != 0x0300).
+/// For everything else (e.g. cutoff SOC mismatch, low battery margin errors, or battery mode issues),
+/// findings are logged at Error level and the bridge continues running.
+/// If `strict` is true (opt-in via `strict_inverter_checks`), any Error finding causes the bridge to refuse.
+pub fn should_accept_inverter_settings(
+    settings: &modbus::InverterSettings,
+    findings: &[(log::Level, String)],
+    strict: bool,
+) -> bool {
+    if !settings.is_trusted_device_type() {
+        return false;
+    }
+    if strict {
+        let has_errors = findings.iter().any(|(level, _)| *level == log::Level::Error);
+        if has_errors {
+            return false;
+        }
+    }
+    true
+}
+
+/// Checks inverter identity and battery-protection settings against config.
+/// Refuses only when data cannot be trusted (wrong device type) or if strict_inverter_checks
+/// is enabled and there are Error-level findings. For everything else, logs at Error level
+/// and keeps running.
 async fn check_inverter_settings(client: &mut modbus::ModbusClient, cfg: &Config) -> bool {
+    let strict = cfg.strict_inverter_checks();
     match client.read_settings().await {
         Ok(s) => {
             log::info!(
@@ -293,14 +318,93 @@ async fn check_inverter_settings(client: &mut modbus::ModbusClient, cfg: &Config
             for (level, msg) in &findings {
                 log::log!(*level, "inverter settings: {}", msg);
             }
-            !findings.iter().any(|(level, _)| *level == log::Level::Error)
+
+            if !s.is_trusted_device_type() {
+                log::error!(
+                    "inverter data cannot be trusted (wrong device type {:#06x}, expected {:#06x}) -- refusing to operate",
+                    s.device_type,
+                    modbus::DEVICE_TYPE_SINGLE_PHASE_STORAGE
+                );
+                return false;
+            }
+
+            if strict {
+                let has_errors = findings.iter().any(|(level, _)| *level == log::Level::Error);
+                if has_errors {
+                    log::error!(
+                        "strict_inverter_checks is enabled and inverter settings have errors -- refusing to operate"
+                    );
+                    return false;
+                }
+            }
+
+            true
         }
         Err(e) => {
             log::error!(
-                "could not read required inverter settings: {:#} -- refusing to operate",
+                "could not read required inverter settings: {:#} -- retrying",
                 e
             );
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_settings(device_type: u16, battery_mode: u16, cutoff: f64) -> modbus::InverterSettings {
+        modbus::InverterSettings {
+            protocol_version: Some(0x0102),
+            ac_power_ratio: Some(0),
+            device_type,
+            battery_mode,
+            shutdown_soc_pct: cutoff,
+            shutdown_voltage: 46.0,
+        }
+    }
+
+    #[test]
+    fn accepts_valid_settings_in_default_and_strict_modes() {
+        let s = sample_settings(modbus::DEVICE_TYPE_SINGLE_PHASE_STORAGE, 1, 20.0);
+        let findings = s.findings(30.0, 20.0);
+        assert!(should_accept_inverter_settings(&s, &findings, false));
+        assert!(should_accept_inverter_settings(&s, &findings, true));
+    }
+
+    #[test]
+    fn refuses_wrong_device_type_even_in_non_strict_mode() {
+        let s = sample_settings(0x0500, 1, 20.0);
+        let findings = s.findings(30.0, 20.0);
+        assert!(!should_accept_inverter_settings(&s, &findings, false));
+        assert!(!should_accept_inverter_settings(&s, &findings, true));
+    }
+
+    #[test]
+    fn non_strict_mode_keeps_running_on_cutoff_mismatch_or_margin_errors() {
+        // Cutoff is 30% while low_battery_soc is 30% -> margin error & cutoff mismatch error
+        let s = sample_settings(modbus::DEVICE_TYPE_SINGLE_PHASE_STORAGE, 1, 30.0);
+        let findings = s.findings(30.0, 20.0);
+        assert!(findings.iter().any(|(l, _)| *l == log::Level::Error));
+
+        // In default (non-strict) mode, keeps running
+        assert!(should_accept_inverter_settings(&s, &findings, false));
+
+        // In strict mode, refuses
+        assert!(!should_accept_inverter_settings(&s, &findings, true));
+    }
+
+    #[test]
+    fn non_strict_mode_keeps_running_on_no_battery_mode() {
+        let s = sample_settings(modbus::DEVICE_TYPE_SINGLE_PHASE_STORAGE, 2, 20.0);
+        let findings = s.findings(30.0, 20.0);
+        assert!(findings.iter().any(|(l, _)| *l == log::Level::Error));
+
+        // In default (non-strict) mode, keeps running
+        assert!(should_accept_inverter_settings(&s, &findings, false));
+
+        // In strict mode, refuses
+        assert!(!should_accept_inverter_settings(&s, &findings, true));
     }
 }

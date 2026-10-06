@@ -27,7 +27,7 @@ const READ_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Device type. 0x0300 = single-phase (low-voltage) storage inverter.
 const REG_DEVICE_TYPE: u16 = 0;
-const DEVICE_TYPE_SINGLE_PHASE_STORAGE: u16 = 0x0300;
+pub const DEVICE_TYPE_SINGLE_PHASE_STORAGE: u16 = 0x0300;
 
 /// "Communication protocol version" the firmware follows, e.g. 0x0102 =
 /// 1.2. Logged only, to tell which protocol document applies (see
@@ -204,6 +204,12 @@ impl InverterSettings {
             "protocol version (reg 2) {}, reg 54 {} -- see docs/protocol-versions.md",
             version, ratio
         )
+    }
+
+    /// Checks whether the device type (register 0) matches the expected
+    /// single-phase storage inverter (0x0300). If false, the data cannot be trusted.
+    pub fn is_trusted_device_type(&self) -> bool {
+        self.device_type == DEVICE_TYPE_SINGLE_PHASE_STORAGE
     }
 
     /// Compares the inverter's live cutoff settings with the bridge's

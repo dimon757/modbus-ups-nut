@@ -282,7 +282,7 @@ class AllLevel2Runner:
 
     def test_scenario_d(self):
         log("\n=======================================================", Color.BOLD)
-        log("RUNNING SCENARIO D: Full Outage -> Shutdown (2 Win11 + Proxmox VMs/poweroff) -> Latch -> WoL", Color.BOLD)
+        log("RUNNING SCENARIO D: Full Outage -> Shutdown (2 Win11 + Proxmox vms_then_poweroff) -> Latch -> WoL", Color.BOLD)
         log("=======================================================", Color.BOLD)
         self.stop_bridge()
         self.reset_env()

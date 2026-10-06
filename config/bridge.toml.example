@@ -48,7 +48,12 @@ on_battery_debounce_secs = 60
 # hardware protection cuts output. On every connect the bridge also reads
 # registers 213/217/220 from the inverter itself and logs an error if the
 # live cutoff leaves no margin, or a warning if the inverter manages the
-# battery by voltage instead of SOC.
+# battery by voltage instead of SOC. By default (strict_inverter_checks = false),
+# the bridge refuses to operate ONLY if the inverter data cannot be trusted
+# (wrong device type in register 0); other discrepancies are logged at Error
+# level while the bridge keeps running. Set strict_inverter_checks = true to
+# refuse on any Error-level discrepancy.
+# strict_inverter_checks = false
 low_battery_soc = 30.0           # percent; triggers the shutdown sequence
                                   # once 2 of the last 3 readings are at/below it
 inverter_cutoff_soc = 20.0       # percent; the inverter's OWN cutoff setting

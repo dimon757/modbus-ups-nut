@@ -116,8 +116,8 @@ Open four terminals in $HERE:
   1. inverter:  $DIR/venv/bin/python inverter_sim.py --serial $DIR/ttyINV
   2. WOL:       python3 wol_listen.py
   3. ssh log:   tail -f $DIR/ssh.log
-  4. bridge:    ./run-bridge.sh           (Proxmox method poweroff)
-            or ./run-bridge.sh vms    (Proxmox method vms_then_poweroff, scenarios N)
+  4. bridge:    ./run-bridge.sh           (Proxmox method vms_then_poweroff)
+            or ./run-bridge.sh poweroff (Proxmox method poweroff)
 
 Then work through CHECKLIST.md. Between scenarios: ./setup.sh reset
 EOF

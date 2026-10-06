@@ -31,6 +31,12 @@ pub struct Config {
     /// How Proxmox VE hosts are shut down. Optional section; defaults below.
     #[serde(default)]
     pub proxmox: ProxmoxConfig,
+    /// When true, refuse to operate if any inverter setting check yields an Error
+    /// (e.g. cutoff SOC mismatch, low battery margin violation, no-battery mode).
+    /// When false (default), only refuse if the device type does not match (data cannot be trusted).
+    /// All other setting problems are logged at Error level while continuing operation.
+    #[serde(default)]
+    pub strict_inverter_checks: bool,
 }
 
 fn default_state_file() -> String {
@@ -89,6 +95,8 @@ pub struct ModbusConfig {
     pub baud_rate: u32,
     pub slave_id: u8,
     pub poll_interval_secs: u64,
+    #[serde(default)]
+    pub strict_inverter_checks: bool,
     // The register map is not configurable: it belongs to the inverter
     // model, not the site. It is defined once, in src/modbus.rs.
 }
@@ -196,6 +204,10 @@ impl Config {
         let cfg: Config = toml::from_str(&raw).context("parsing config TOML")?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    pub fn strict_inverter_checks(&self) -> bool {
+        self.strict_inverter_checks || self.modbus.strict_inverter_checks
     }
 
     fn validate(&self) -> Result<()> {
@@ -553,4 +565,29 @@ mod tests {
         let err = format!("{:#}", cfg.validate().unwrap_err());
         assert!(err.contains("WOL window"), "{err}");
     }
+
+    #[test]
+    fn strict_inverter_checks_defaults_to_false() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config/bridge.toml.example");
+        let cfg = Config::load(path).unwrap();
+        assert!(!cfg.strict_inverter_checks());
+    }
+
+    #[test]
+    fn strict_inverter_checks_can_be_enabled_at_top_level_or_in_modbus() {
+        let toml_top = example_with(
+            "wol_broadcast_addr = \"192.168.1.255:9\"",
+            "wol_broadcast_addr = \"192.168.1.255:9\"\nstrict_inverter_checks = true",
+        );
+        let cfg: Config = toml::from_str(&toml_top).unwrap();
+        assert!(cfg.strict_inverter_checks());
+
+        let toml_modbus = example_with(
+            "[modbus]\ndevice = \"/dev/ttyS0\"",
+            "[modbus]\ndevice = \"/dev/ttyS0\"\nstrict_inverter_checks = true",
+        );
+        let cfg2: Config = toml::from_str(&toml_modbus).unwrap();
+        assert!(cfg2.strict_inverter_checks());
+    }
 }
+

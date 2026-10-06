@@ -269,7 +269,10 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
    voltage mode.
 3. **`inverter_cutoff_soc`** matches the inverter's register 217 and
    **`low_battery_soc`** has real margin above it. The bridge checks the
-   live value on every connect and logs an error if there's no margin.
+   live values on every connect and logs an error if there is a discrepancy or
+   no margin. The bridge refuses to operate only if data cannot be trusted (wrong device
+   type in register 0); for other discrepancies it logs at Error level and continues running
+   (unless `strict_inverter_checks = true` is configured).
 4. **`wol_broadcast_addr`** matches your site's actual subnet, and that
    your switch doesn't filter broadcast traffic between the bridge and the
    endpoints.
