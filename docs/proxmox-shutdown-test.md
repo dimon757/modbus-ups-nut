@@ -134,33 +134,43 @@ flowchart TD
     chk_rec0 -- "yes" --> cancel_exit(["Cancel Proxmox shutdown<br/>(no destructive steps)"])
     chk_rec0 -- "no" --> running{"Any VMs running?"}
     running -- "no" --> chk_delay
-    running -- "yes" --> spawn["Spawn parallel shutdown tasks (Tokio JoinSet)"]
+    running -- "yes" --> spawn["Spawn parallel shutdown tasks<br/>(250 ms apart, up to 10 s spread)"]
 
     subgraph parallel ["Parallel Execution per Running VM"]
         direction TB
-        vm_call["qm shutdown ID --timeout vm_shutdown_timeout_secs<br/>(blocks until VM stops or timeout expires)"]
-        vm_call --> vm_eval{"qm shutdown result"}
+        vm_call["qm shutdown ID --timeout vm_shutdown_timeout_secs"] --> vm_eval{"SSH / qm result"}
+        vm_eval -- "SSH handshake failed" --> ssh_retry{"Retry budget<br/>remaining?"}
+        ssh_retry -- "yes" --> vm_retry_sleep["Wait 2 s"] --> vm_call
+        ssh_retry -- "exhausted" --> vm_unreached["Unreachable: skip hard stop<br/>(host poweroff stops it)"]
         vm_eval -- "Clean exit (code 0)" --> vm_done["VM stopped gracefully"]
-        vm_eval -- "Guest agent missing / refused" --> vm_hard["Hard stop: qm stop ID<br/>(checked against recovery)"]
-        vm_eval -- "Timeout expired" --> vm_hard
-        vm_hard --> vm_done
+        vm_eval -- "Guest agent missing / timeout" --> vm_pending["Mark pending for hard stop"]
     end
 
     spawn --> parallel
     parallel --> join{"All VM tasks done<br/>or recovery confirmed?"}
-    join -- "recovery confirmed" --> abort_tasks["Abort local waits & skip hard stops / host poweroff"] --> restart_vms["Restart stopped VMs: qm start"] --> cancel_exit(["Cancel Proxmox shutdown<br/>(host & VMs restored)"])
+    join -- "recovery confirmed" --> abort_tasks["Abort local waits & skip hard stops / host poweroff"] --> restart_watch
     join -- "completed" --> chk_rec1{"Recovery confirmed<br/>after VM tasks?"}
-    chk_rec1 -- "yes" --> restart_vms
-    chk_rec1 -- "no" --> hard_stops["Execute hard stops for pending/refused VMs<br/>(suppressed if recovery confirmed)"]
+    chk_rec1 -- "yes" --> restart_watch
+    chk_rec1 -- "no" --> hard_stops["Execute hard stops for pending/refused VMs<br/>(qm stop ID)"]
     hard_stops --> chk_delay["Local shutdown delay: shutdown_delay_secs<br/>(cancellable on recovery)"]
     chk_delay --> chk_rec2{"Recovery confirmed<br/>during delay?"}
-    chk_rec2 -- "yes" --> restart_vms
+    chk_rec2 -- "yes" --> restart_watch
     chk_rec2 -- "no" --> pwr["Host power-off: systemctl poweroff --no-block"]
     pwr --> pwr_res{"systemctl poweroff accepted?"}
     pwr_res -- "yes" --> host_off(["Host powers off"])
     pwr_res -- "no (refused)" --> chk_rec3{"Recovery confirmed?"}
-    chk_rec3 -- "yes" --> restart_vms
+    chk_rec3 -- "yes" --> restart_watch
     chk_rec3 -- "no" --> fallback["Fallback: nohup /sbin/poweroff &"] --> host_off
+
+    subgraph watch_loop ["Persistent VM Restart Watch on Recovery"]
+        direction TB
+        restart_watch["Query power states every 5 s<br/>(up to vm_shutdown_timeout_secs + 15 s)"]
+        restart_watch --> check_stopped{"Any VM stopped?"}
+        check_stopped -- "yes" --> start_vms["Restart via qm start"] --> check_done{"All running or<br/>deadline reached?"}
+        check_stopped -- "no" --> check_done
+        check_done -- "no" --> restart_watch
+        check_done -- "yes" --> cancel_exit
+    end
 ```
 
 Run the individual steps by hand from the bridge box to verify each command:

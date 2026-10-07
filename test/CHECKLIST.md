@@ -7,7 +7,7 @@ world is simulated:
 | Real thing | Replaced by |
 |---|---|
 | Sunsynk inverter on RS485 | `inverter_sim.py` on a `socat` virtual serial cable |
-| SSH to the 4 machines | `bin/ssh`, which writes to `/tmp/mub-test/ssh.log` -- and, for the two Proxmox hosts, runs the bridge's `qm`/`systemctl` commands against simulated VMs (scenarios N) |
+| SSH to the 3 machines | `bin/ssh`, which writes to `/tmp/mub-test/ssh.log` -- and, for the Proxmox host, runs the bridge's `qm`/`systemctl` commands against simulated VMs (scenarios N) |
 | Wake-on-LAN on the site LAN | packets to `127.0.0.1:40009`, shown by `wol_listen.py` |
 | Real waits (60 s / 180 s / 30 s / 2 min) | 5 s / 10 s / 2 s / 5 s (`bridge-test.toml`) |
 | `/var/lib/modbus-ups-bridge/shutdown_fired` | `/tmp/mub-test/shutdown_fired` |
@@ -50,7 +50,7 @@ Timings below assume the test config: grid-lost wait **5 s**, recovery wait
 **Do:** start the simulator, then the bridge. Change nothing.
 
 **Expect** in the bridge log:
-- [ ] `loaded config from .../bridge-test.toml (4 endpoint(s))`
+- [ ] `loaded config from .../bridge-test.toml (3 endpoint(s))`
 - [ ] `inverter: device type 0x0300, battery mode 1, cutoff 20% / 46.00 V`
 - [ ] `inverter: protocol version (reg 2) 0x0102 (1.2), reg 54 0 -- see docs/protocol-versions.md`
 - [ ] `inverter settings: inverter cutoff 20% SOC, shutdown sequence at 30% -- 10 points of margin`
@@ -80,12 +80,11 @@ Timings below assume the test config: grid-lost wait **5 s**, recovery wait
 - [ ] about 1 s after `soc 25` (the second low reading -- one alone is never enough):
       `SOC 25.0% <= threshold 30.0% (2 of the last 3 readings) while on battery -- firing shutdown sequence`
 - [ ] `/tmp/mub-test/shutdown_fired` exists (it is written before any ssh call)
-- [ ] `shutdown sequence starting: 4 endpoint(s)`
-- [ ] ssh.log gets 4 lines, **2 s apart**, in config order:
+- [ ] `shutdown sequence starting: 3 endpoint(s)`
+- [ ] ssh.log gets 3 lines, **2 s apart**, in config order:
   - `ups-shutdown@10.99.0.1: shutdown /s /t 60 /c "Inverter battery low, ..."`
   - `ups-shutdown@10.99.0.2: shutdown /s /t 60 ...`
   - `root@10.99.0.3: nohup sh -c 'sleep 10; /sbin/poweroff' > /tmp/ups-shutdown.log 2>&1 < /dev/null &`
-  - `root@10.99.0.4: nohup sh -c ...`
 - [ ] `shutdown sequence complete`
 
 **D2. Latched -- no second shutdown.** `soc 22`, then `soc 21`.
@@ -94,7 +93,7 @@ Timings below assume the test config: grid-lost wait **5 s**, recovery wait
 **D3. Grid back -- wake-up, even though the battery is still low.** `restore` (SOC still 21); wait 10 s.
 - [ ] `ShutdownLatched -> RecoveryDebouncing` right away, 10 s later `RecoveryDebouncing -> Idle`
 - [ ] `Wake-on-LAN round 1/4` ... `round 4/4`, 5 s apart
-- [ ] WOL listener: 4 rounds of 4 packets (`AA:BB:CC:00:00:01` ... `:04`), all `ok`
+- [ ] WOL listener: 4 rounds of 3 packets (`AA:BB:CC:00:00:01` ... `:03`), all `ok`
 - [ ] `/tmp/mub-test/shutdown_fired` disappears only **after** round 4
 
 ## E. Grid flickers back, then drops with SOC already low (regression)
@@ -106,11 +105,11 @@ This is the bug found in the original code: the shutdown used to be skipped here
 **Expect:**
 - [ ] `OnBattery -> RecoveryDebouncing` after `restore`
 - [ ] on the second `outage`: `firing shutdown sequence` and `RecoveryDebouncing -> ShutdownLatched`
-- [ ] 4 lines in ssh.log
+- [ ] 3 lines in ssh.log
 
 ## F. Bridge restarts mid-outage -- remembers the shutdown
 
-**Do:** `./setup.sh reset`; run D1 (outage, `soc 25`, 4 ssh lines). Stop the bridge (Ctrl+C) and start it again with `./run-bridge.sh`.
+**Do:** `./setup.sh reset`; run D1 (outage, `soc 25`, 3 ssh lines). Stop the bridge (Ctrl+C) and start it again with `./run-bridge.sh`.
 
 **Expect:**
 - [ ] `/tmp/mub-test/shutdown_fired exists: a previous run shut the endpoints down and never finished waking them -- resuming latched, Wake-on-LAN will follow recovery`
@@ -128,9 +127,9 @@ printf '# shutdown sequence in progress\ndispatched: ws-1\ndispatched: ws-2\n' >
 Set simulator to outage (`outage`, `soc 25`), then start the bridge (`./run-bridge.sh`).
 
 **Expect:**
-- [ ] `/tmp/mub-test/shutdown_fired indicates incomplete shutdown: 2 endpoint(s) already dispatched, 2 remaining: ["proxmox-a", "proxmox-b"]`
-- [ ] `grid still down: resuming shutdown sequence for 2 remaining endpoint(s)`
-- [ ] `ssh.log` gets shutdown calls **only** for `proxmox-a` (10.99.0.3) and `proxmox-b` (10.99.0.4) -- no re-dispatching `ws-1` or `ws-2`
+- [ ] `/tmp/mub-test/shutdown_fired indicates incomplete shutdown: 2 endpoint(s) already dispatched, 1 remaining: ["proxmox"]`
+- [ ] `grid still down: resuming shutdown sequence for 1 remaining endpoint(s)`
+- [ ] `ssh.log` gets shutdown calls **only** for `proxmox` (10.99.0.3) -- no re-dispatching `ws-1` or `ws-2`
 - [ ] `shutdown sequence complete` and `/tmp/mub-test/shutdown_fired` is updated with `completed`
 - [ ] then `restore` + `soc 40`: after 10 s, 4 Wake-on-LAN rounds wake all endpoints and the marker is deleted
 
@@ -145,10 +144,10 @@ printf '# shutdown sequence in progress\ndispatched: ws-1\ndispatched: ws-2\n' >
 Set simulator to grid restored (`restore`, `soc 25`), then start the bridge (`./run-bridge.sh`). After 2 seconds, simulate outage returning (`outage`).
 
 **Expect:**
-- [ ] `/tmp/mub-test/shutdown_fired indicates incomplete shutdown: 2 endpoint(s) already dispatched, 2 remaining: ["proxmox-a", "proxmox-b"]`
-- [ ] `grid currently up; holding 2 remaining shutdown(s) pending recovery confirmation`
-- [ ] on `outage`: `grid still down: resuming shutdown sequence for 2 remaining endpoint(s)`
-- [ ] `ssh.log` receives shutdown commands only for `proxmox-a` and `proxmox-b`
+- [ ] `/tmp/mub-test/shutdown_fired indicates incomplete shutdown: 2 endpoint(s) already dispatched, 1 remaining: ["proxmox"]`
+- [ ] `grid currently up; holding 1 remaining shutdown(s) pending recovery confirmation`
+- [ ] on `outage`: `grid still down: resuming shutdown sequence for 1 remaining endpoint(s)`
+- [ ] `ssh.log` receives shutdown commands only for `proxmox`
 - [ ] `shutdown sequence complete` and marker file marked `completed`
 - [ ] then `restore` + `soc 40`: after 10 s, Wake-on-LAN rounds sent and marker deleted
 
@@ -160,10 +159,10 @@ Simulates an endpoint failing (or a bridge restart during long Proxmox VM shutdo
 
 **Expect:**
 - [ ] `shutting down ws-1` succeeds; `failed to shut down ws-2` logged
-- [ ] during Proxmox VM shutdown, `/tmp/mub-test/shutdown_fired` contains `dispatched: ws-1`, but neither `ws-2` nor `proxmox-a`
-- [ ] on restart: `indicates incomplete shutdown: 1 endpoint(s) already dispatched, 3 remaining: ["ws-2", "proxmox-a", "proxmox-b"]`
+- [ ] during Proxmox VM shutdown, `/tmp/mub-test/shutdown_fired` contains `dispatched: ws-1`, but neither `ws-2` nor `proxmox`
+- [ ] on restart: `indicates incomplete shutdown: 1 endpoint(s) already dispatched, 2 remaining: ["ws-2", "proxmox"]`
 - [ ] `ws-2` is retried and accepted
-- [ ] `proxmox-a` and `proxmox-b` complete VM shutdown and host poweroff
+- [ ] `proxmox` completes VM shutdown and host poweroff
 - [ ] `shutdown sequence complete` and marker file marked `completed`
 
 ## F5. Failed endpoint retried after sequence finishes (completed withheld)
@@ -173,10 +172,10 @@ Simulates an endpoint that fails permanently or exhausts its retry budget while 
 **Do:** `./setup.sh reset`. Add failure for ws-2: `echo 10.99.0.2 > /tmp/mub-test/ssh-fail`. Start bridge: `./run-bridge.sh`. Trigger outage: `outage`, `soc 25`. Wait for the full shutdown sequence to finish (`shutdown sequence complete`). Inspect `/tmp/mub-test/shutdown_fired`: verify `completed` is absent and `ws-2` is not dispatched. Stop bridge (Ctrl+C). Remove failure: `rm /tmp/mub-test/ssh-fail`. Restart bridge: `./run-bridge.sh`.
 
 **Expect:**
-- [ ] during initial outage, ws-1, proxmox-a, proxmox-b succeed; ws-2 exhausts retry budget and fails
-- [ ] bridge logs: `shutdown sequence finished: 3/4 endpoint(s) succeeded; marker left incomplete for retry on restart`
-- [ ] `/tmp/mub-test/shutdown_fired` contains `dispatched` for ws-1, proxmox-a, proxmox-b, but NOT `completed`
-- [ ] on restart: `indicates incomplete shutdown: 3 endpoint(s) already dispatched, 1 remaining: ["ws-2"]`
+- [ ] during initial outage, ws-1, proxmox succeed; ws-2 exhausts retry budget and fails
+- [ ] bridge logs: `shutdown sequence finished: 2/3 endpoint(s) succeeded; marker left incomplete for retry on restart`
+- [ ] `/tmp/mub-test/shutdown_fired` contains `dispatched` for ws-1, proxmox, but NOT `completed`
+- [ ] on restart: `indicates incomplete shutdown: 2 endpoint(s) already dispatched, 1 remaining: ["ws-2"]`
 - [ ] `resuming shutdown sequence for 1 remaining endpoint(s)`
 - [ ] `ws-2` is retried and succeeds: `ws-2: shutdown command accepted`
 - [ ] bridge logs: `shutdown sequence complete: all 1 endpoint(s) succeeded`
@@ -268,10 +267,10 @@ with the other test config (`[proxmox] method = "vms_then_poweroff"`,
 ./run-bridge.sh vms
 ```
 
-The fake ssh now **executes** the bridge's commands for proxmox-a (10.99.0.3)
-and proxmox-b (10.99.0.4) against simulated VMs (`test/pve-bin/`): after
-`./setup.sh reset`, proxmox-a has `dc01` (VM 100, shuts down 3 s after the request) and
-`app server` (VM 101, 6 s), proxmox-b has `db01` (VM 102, 4 s). Each simulated VM is a line in
+The fake ssh now **executes** the bridge's commands for proxmox (10.99.0.3)
+against simulated VMs (`test/pve-bin/`): after
+`./setup.sh reset`, proxmox has `dc01` (VM 100, shuts down 3 s after the request) and
+`app server` (VM 101, 6 s). Each simulated VM is a line in
 `/tmp/mub-test/proxmox/<host>/vms` (`<id>|<name>|<behaviour>`); its state is in
 `state_<id>`, and `host` appears once the host has been powered off.
 In ssh.log, each executed command ends with `-> exit <code>`.
@@ -280,60 +279,57 @@ In ssh.log, each executed command ends with `-> exit <code>`.
 
 **Do:** `./setup.sh reset`; `outage`; wait for `OnBattery`; `soc 25`.
 
-- [ ] `shutting down proxmox-a (10.99.0.3) via Proxmox: VMs first, then poweroff`
-- [ ] `proxmox-a: 2 VM(s) registered, 2 running: dc01, app server`, then `guest shutdown requested for VM ...` for each
-- [ ] proxmox-b starts 2 s later **while proxmox-a is still waiting** (the hosts run in parallel)
-- [ ] `proxmox-a: VM dc01 is off`, `VM app server is off`, `proxmox-b: VM db01 is off`
-- [ ] `proxmox-a: host power-off scheduled via systemctl poweroff` -- same for proxmox-b
-- [ ] `shutdown sequence complete` only after both hosts are done
-- [ ] `cat /tmp/mub-test/proxmox/*/host` shows `poweroff via systemctl` for both
+- [ ] `shutting down proxmox (10.99.0.3) via Proxmox: VMs first, then poweroff`
+- [ ] `proxmox: 2 VM(s) registered, 2 running: dc01, app server`, then `guest shutdown requested for VM ...` for each
+- [ ] `proxmox: VM dc01 is off`, `VM app server is off`
+- [ ] `proxmox: host power-off scheduled via systemctl poweroff`
+- [ ] `shutdown sequence complete`
+- [ ] `cat /tmp/mub-test/proxmox/10.99.0.3/host` shows `poweroff via systemctl`
 
 ### N2. A hung VM and a VM without QEMU Guest Agent
 
-**Do:** `./setup.sh reset`, then add a VM that never shuts down to proxmox-a
-and one without the guest agent to proxmox-b:
+**Do:** `./setup.sh reset`, then add a VM that never shuts down and one without the guest agent to proxmox:
 
 ```bash
 echo "109|stuck-vm|hang" >> /tmp/mub-test/proxmox/10.99.0.3/vms; echo on > /tmp/mub-test/proxmox/10.99.0.3/state_109
-echo "108|no-tools-vm|notools" >> /tmp/mub-test/proxmox/10.99.0.4/vms; echo on > /tmp/mub-test/proxmox/10.99.0.4/state_108
+echo "108|no-tools-vm|notools" >> /tmp/mub-test/proxmox/10.99.0.3/vms; echo on > /tmp/mub-test/proxmox/10.99.0.3/state_108
 ```
 
 then `outage`, wait for `OnBattery`, `soc 25`.
 
-- [ ] `proxmox-b: guest shutdown of VM no-tools-vm failed ... -- will be powered off`
+- [ ] `proxmox: guest shutdown of VM no-tools-vm failed ... -- will be powered off`
 - [ ] the other VMs go off normally
-- [ ] as soon as proxmox-b's other VM is off (no point waiting for a VM that refused):
-      `proxmox-b: VM no-tools-vm could not be shut down gracefully -- powering it off hard`
-- [ ] 15 s after the requests: `proxmox-a: VM stuck-vm still running after 15 s -- powering it off hard`
-- [ ] **both hosts are still powered off** (`host power-off scheduled via systemctl poweroff`) -- a stuck VM never
-      keeps a host running into the inverter's cutoff
+- [ ] as soon as the other VMs are off:
+      `proxmox: VM no-tools-vm could not be shut down gracefully -- powering it off hard`
+- [ ] 15 s after the requests: `proxmox: VM stuck-vm still running after 15 s -- powering it off hard`
+- [ ] host is powered off (`host power-off scheduled via systemctl poweroff`) -- a stuck VM never keeps a host running into the inverter's cutoff
 
 ### N3. systemctl poweroff refused (fallback to /sbin/poweroff)
 
-**Do:** `./setup.sh reset`; `touch /tmp/mub-test/proxmox/10.99.0.4/systemctl-refuse`; `outage`; wait for `OnBattery`; `soc 25`.
+**Do:** `./setup.sh reset`; `touch /tmp/mub-test/proxmox/10.99.0.3/systemctl-refuse`; `outage`; wait for `OnBattery`; `soc 25`.
 
-- [ ] `proxmox-b: systemctl poweroff refused (...) -- falling back to /sbin/poweroff`
-- [ ] `proxmox-b: host power-off scheduled via /sbin/poweroff (10 s)`; proxmox-a uses systemctl poweroff as in N1
-- [ ] `cat /tmp/mub-test/proxmox/10.99.0.4/host` shows `poweroff via /sbin/poweroff`
+- [ ] `proxmox: systemctl poweroff refused (...) -- falling back to /sbin/poweroff`
+- [ ] `proxmox: host power-off scheduled via /sbin/poweroff (10 s)`
+- [ ] `cat /tmp/mub-test/proxmox/10.99.0.3/host` shows `poweroff via /sbin/poweroff`
 
 ### N4. Grid back while a host is still shutting its VMs down (Safety Verification & VM Restart)
 
-**Do:** `./setup.sh reset`; add the hung VM to proxmox-a as in N2 (first line only); `outage`;
+**Do:** `./setup.sh reset`; add the hung VM to proxmox as in N2 (first line only); `outage`;
 wait for `OnBattery`; `soc 25`; about 2 s later `restore` and `soc 40`.
 
 - [ ] ~10 s after `restore`: `recovery confirmed -- stopping the rest of the shutdown sequence`
       and `recovery confirmed while VM shutdowns were in progress -- aborting local waits; no hard stop or host poweroff will be issued`
 - [ ] Wake-on-LAN rounds start (`Wake-on-LAN round 1/4`)
-- [ ] proxmox-a **aborts destructive steps**: `qm stop` (hard VM power-off) is **never** executed
+- [ ] proxmox **aborts destructive steps**: `qm stop` (hard VM power-off) is **never** executed
 - [ ] host power-off (`systemctl poweroff` or `/sbin/poweroff`) is **never** executed -- the host stays running and running guests are not killed on power restoration
 - [ ] **stopped VMs are restarted**: `restarting ... stopped VM(s)` logged and `qm start` executed for VMs that stopped before recovery, bringing them back to running without requiring a host power cycle
 
 ### N5. One Proxmox host unreachable
 
-**Do:** `./setup.sh reset`; `echo 10.99.0.4 > /tmp/mub-test/ssh-fail`; `outage`; wait for `OnBattery`; `soc 25`.
+**Do:** `./setup.sh reset`; `echo 10.99.0.3 > /tmp/mub-test/ssh-fail`; `outage`; wait for `OnBattery`; `soc 25`.
 
-- [ ] `failed to shut down proxmox-b: listing VMs: ssh to 10.99.0.4 exited Some(255): ...`
-- [ ] proxmox-a is shut down normally, as in N1
+- [ ] `failed to shut down proxmox: listing VMs: ssh to 10.99.0.3 exited Some(255): ...`
+- [ ] ws-1 and ws-2 completed while proxmox failed gracefully
 
 ---
 
@@ -347,7 +343,7 @@ Simulates an endpoint that is still booting up from a previous Wake-on-LAN round
 - [ ] `ws-1: SSH connection failed ... -- host may still be booting; continuing retries in background (5s retry budget remaining)`
 - [ ] `ws-2` is dispatched immediately without waiting for `ws-1`
 - [ ] `ws-1` background retries until the `ssh-booting` counter is exhausted, then logs `ws-1: shutdown command accepted (after background retry)`
-- [ ] sequence proceeds through `proxmox-a` and `proxmox-b`
+- [ ] sequence proceeds through `proxmox`
 - [ ] `shutdown sequence complete` with all endpoints recorded in marker file
 - [ ] `restore`, `soc 80`: Wake-on-LAN fires on recovery and clears marker
 
@@ -360,10 +356,9 @@ Simulates a heavy server or Proxmox host that takes longer to boot than standard
 **Do:** `./setup.sh reset`; `echo 3 > /tmp/mub-test/ssh-booting-10.99.0.3`; `outage`; wait for `OnBattery`; `soc 25`.
 
 **Expect:**
-- [ ] `proxmox-a` initial connect returns transient failure; logs background retry with extended budget: `continuing retries in background (11s retry budget remaining)`
-- [ ] `proxmox-b` is dispatched immediately without delay
-- [ ] `proxmox-a` background task succeeds within its 12s budget: `proxmox-a: shutdown command accepted (after background retry)`
-- [ ] all 4 endpoints successfully complete and are recorded in the marker file
+- [ ] `proxmox` initial connect returns transient failure; logs background retry with extended budget: `continuing retries in background (11s retry budget remaining)`
+- [ ] `proxmox` background task succeeds within its 12s budget: `proxmox: shutdown command accepted (after background retry)`
+- [ ] all 3 endpoints successfully complete and are recorded in the marker file
 - [ ] sequence finishes with `shutdown sequence complete`
 
 ---

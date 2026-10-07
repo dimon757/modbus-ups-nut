@@ -272,7 +272,7 @@ packets, real marker file -- but everything *around* it is simulated:
 | Real thing | Replaced by |
 |---|---|
 | Sunsynk inverter on RS485 | `test/inverter_sim.py` on a virtual serial cable (`socat`) |
-| SSH to the 4 machines | `test/bin/ssh` -- writes to `/tmp/mub-test/ssh.log`; for the two Proxmox hosts it also runs the bridge's `qm`/`systemctl` commands against **simulated VMs** (`test/pve-bin/`) |
+| SSH to the 3 machines | `test/bin/ssh` -- writes to `/tmp/mub-test/ssh.log`; for the Proxmox host it also runs the bridge's `qm`/`systemctl` commands against **simulated VMs** (`test/pve-bin/`) |
 | Wake-on-LAN on the site LAN | packets to `127.0.0.1:40009`, shown by `test/wol_listen.py` |
 | 60 s / 180 s / 30 s / 2 min waits | 5 s / 10 s / 2 s / 5 s (`test/bridge-test.toml`) |
 | `/var/lib/modbus-ups-bridge/shutdown_fired` | `/tmp/mub-test/shutdown_fired` |
@@ -512,9 +512,9 @@ The fake `ssh` reads files in `/tmp/mub-test`:
 | `ssh-booting-<host>` | Returns simulated `Connection refused` for N attempts, then succeeds | `echo 2 > /tmp/mub-test/ssh-booting-10.99.0.1` |
 | `ssh-flaky-qm-shutdown-<host>` | Drops the next N `qm shutdown` calls with `kex_exchange_identification: ... Connection reset by peer`, like sshd's MaxStartups | `echo 2 > /tmp/mub-test/ssh-flaky-qm-shutdown-10.99.0.3` |
 
-The test endpoints are `10.99.0.1` (ws-1), `10.99.0.2` (ws-2), `10.99.0.3`
-(proxmox-a) and `10.99.0.4` (proxmox-b). `./setup.sh reset` removes both files and
-restores the fake Proxmox hosts' default VMs (see CHECKLIST.md, scenarios N).
+The test endpoints are `10.99.0.1` (ws-1), `10.99.0.2` (ws-2) and `10.99.0.3`
+(proxmox). `./setup.sh reset` removes both files and
+restores the fake Proxmox host's default VMs (see CHECKLIST.md, scenarios N).
 
 ### Troubleshooting
 
