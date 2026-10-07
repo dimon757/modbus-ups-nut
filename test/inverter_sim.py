@@ -17,6 +17,7 @@ import asyncio
 import sys
 
 from pymodbus import FramerType
+from pymodbus.constants import ExcCodes
 from pymodbus.server import StartAsyncSerialServer, StartAsyncTcpServer
 from pymodbus.simulator import DataType, SimData, SimDevice
 
@@ -48,6 +49,9 @@ HELP = """  grid <volts>     grid voltage, e.g. `grid 0` (outage), `grid 230`
   outage           same as `grid 0`
   restore          same as `grid 230`
   set <reg> <val>  any register; <val> may be hex (0x0300) or negative
+  mute <reg>...    answer requests touching these registers with a Modbus
+                   "illegal data address" error, like firmware that lacks them
+  unmute           answer every register again
   show             current values
   help             this text
   quit             stop the simulator (Ctrl+C / Ctrl+D also work)
@@ -60,6 +64,7 @@ class Inverter:
 
     def __init__(self):
         self.regs = [0] * REGISTER_COUNT
+        self.muted = set()
         for addr, (value, _) in REGISTERS.items():
             self.regs[addr] = value
 
@@ -72,6 +77,8 @@ class Inverter:
     async def on_request(self, _func_code, start_address, address, count, registers, _values):
         # Called by pymodbus before it answers a request: copy the current
         # values into its register array. Returning None lets it proceed.
+        if self.muted and any(a in self.muted for a in range(address, address + count)):
+            return ExcCodes.ILLEGAL_ADDRESS
         offset = address - start_address
         registers[offset : offset + count] = self.regs[address : address + count]
         return None
@@ -135,6 +142,16 @@ def handle(inv, line):
         elif cmd == "batt" and len(args) == 1:
             inv.write(190, parse_int(args[0]))
             print(f"  battery {parse_int(args[0])} W")
+        elif cmd == "mute" and args:
+            for a in args:
+                addr = parse_int(a)
+                if not 0 <= addr < REGISTER_COUNT:
+                    raise ValueError("register must be 0-299")
+                inv.muted.add(addr)
+            print(f"  muted registers: {sorted(inv.muted)}")
+        elif cmd == "unmute":
+            inv.muted.clear()
+            print("  all registers answer again")
         elif cmd == "set" and len(args) == 2:
             addr, value = parse_int(args[0]), parse_int(args[1])
             if not 0 <= addr < REGISTER_COUNT:

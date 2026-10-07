@@ -189,7 +189,9 @@ Simulates an endpoint that fails permanently or exhausts its retry budget while 
 
 **Expect:**
 - [ ] `modbus poll failed: timed out reading register 0x00b8 -- reconnecting`
-- [ ] `could not read inverter settings: timed out reading register 0x0000`
+- [ ] `could not read required inverter settings: timed out reading register 0x0000`
+- [ ] `inverter settings unreadable (1 in a row) -- reconnecting and trying again`, then
+      `inverter settings could not be read 2 times in a row -- monitoring WITHOUT a settings check ...`
 - [ ] repeats; **no** state change, nothing in ssh.log
 - [ ] after the simulator restarts: `inverter: device type 0x0300 ...` and normal poll lines again
       (a restarted simulator is back at grid 230 V / SOC 80 %)
@@ -208,8 +210,9 @@ Simulates an endpoint that fails permanently or exhausts its retry budget while 
 
 **Expect:**
 - [ ] ERROR `inverter settings: inverter cuts its output at 30% SOC, but low_battery_soc is 30% -- ...`
-- [ ] WARN `inverter settings: config inverter_cutoff_soc is 20% but the inverter is set to 30% -- ...`
-- [ ] the bridge keeps running (logs only)
+- [ ] ERROR `inverter settings: config inverter_cutoff_soc is 20% but the inverter is set to 30% -- ...`
+- [ ] ERROR `inverter settings have errors (see above) -- monitoring continues anyway; ...`
+- [ ] the bridge keeps running and polling (with `strict_inverter_checks = true` it would refuse: see T)
 
 ## J. Inverter in voltage mode -- warning
 
@@ -364,6 +367,61 @@ Simulates a heavy server or Proxmox host that takes longer to boot than standard
 - [ ] sequence finishes with `shutdown sequence complete`
 
 ---
+
+## Q. Grid back while a slow VM is still shutting down -- it is restarted too
+
+**Do:** `./setup.sh reset`; add a slow VM to the fake host:
+`echo "110|slow-vm|ok:14" >> /tmp/mub-test/proxmox/10.99.0.3/vms; echo on > /tmp/mub-test/proxmox/10.99.0.3/state_110`;
+start `./run-bridge.sh vms`; `outage`; wait for `OnBattery`; `soc 25`; one second after
+`guest shutdown requested for VM slow-vm`: `restore`, `soc 40`.
+
+**Expect:**
+- [ ] `recovery confirmed while VM shutdowns were in progress -- aborting local waits ...`
+- [ ] `recovery cancelled the shutdown -- watching 3 VM(s) and restarting any that stop`
+- [ ] dc01 and app server are restarted first; **slow-vm is restarted a few seconds later**, once its
+      shutdown has finished (a single look at that moment would have found it still "running")
+- [ ] `restart watch finished: 3 VM(s) restarted`
+- [ ] `qm start 110` in ssh.log; **no** `qm stop`; the host is not powered off
+
+## R. sshd drops the VM shutdown logins -- retried, nothing hard-stopped
+
+**Do:** `./setup.sh reset`; `echo 2 > /tmp/mub-test/ssh-flaky-qm-shutdown-10.99.0.3`;
+`./run-bridge.sh vms`; `outage`; wait for `OnBattery`; `soc 25`.
+
+**Expect:**
+- [ ] `SSH connection for `qm shutdown ...` failed (... kex_exchange_identification ...) -- retrying in 2s`
+      (twice: once per dropped call)
+- [ ] both VMs still shut down gracefully; `host power-off scheduled via systemctl poweroff`
+- [ ] **no** `powering it off hard`, no `qm stop` in ssh.log
+
+## S. Inverter settings problems -- default mode keeps protecting the site
+
+Needs the simulator's `mute`/`unmute` commands. Restart the bridge between the parts.
+
+**Do (a):** `set 0 0x0500`, start the bridge. **Expect:** `inverter data cannot be trusted (wrong device
+type 0x0500, expected 0x0300) -- refusing to operate`, retried every 5 s, **no** `soc=` poll lines.
+`set 0 0x0300` -> polling starts within 5 s.
+
+**Do (b):** `set 217 15`, start the bridge, then `outage`, `soc 25`. **Expect:**
+- [ ] ERROR `inverter settings: config inverter_cutoff_soc is 20% but the inverter is set to 15% -- ...`
+- [ ] ERROR `... monitoring continues anyway`, and poll lines
+- [ ] `firing shutdown sequence` -- the site is still protected. Afterwards `set 217 20`, `restore`.
+
+**Do (c):** `mute 0 213 217 220`, start the bridge. **Expect:**
+- [ ] `inverter settings unreadable (1 in a row) -- reconnecting and trying again`
+- [ ] `... monitoring WITHOUT a settings check ...` and normal poll lines
+- [ ] after `unmute`: within ~60 s `trying the inverter settings check again`, then
+      `inverter: device type 0x0300 ...`
+
+## T. strict_inverter_checks = true -- refuses instead of running unchecked
+
+Put `strict_inverter_checks = true` on its own line under `wol_broadcast_addr` (above `[modbus]`).
+
+**Do (a):** `set 217 15`, start the bridge. **Expect:** `strict_inverter_checks is enabled and the
+inverter settings have errors -- refusing to operate` every 5 s, **no** poll lines. `set 217 20` -> polling starts.
+
+**Do (b):** `mute 0 213 217 220`, start the bridge. **Expect:** `inverter settings unreadable (2 in a row)`,
+`(3 in a row)`, ... -- **never** `monitoring WITHOUT a settings check`, no poll lines. `unmute` -> polling starts.
 
 ## What this does and doesn't prove
 

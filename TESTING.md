@@ -17,10 +17,10 @@ procedures: [docs/register-verification.md](docs/register-verification.md)
 (inverter registers) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)
 (Proxmox shutdown command).
 
-**Status (2026-10-06).** Level 1: 53 tests, all passing on Debian 13 (52 on
-Windows, where the one Linux-only test is skipped). Level 2: all 24 scenarios
+**Status (2026-10-07).** Level 1: 67 tests, all passing on Debian 13 (66 on
+Windows, where the one Linux-only test is skipped). Level 2: all 28 scenarios
 (A-M plus the 60 s SSH timeout, F2 for mid-sequence restart resumption, F3 for grid flicker during restart, F4 for failed endpoint retry & Proxmox timing, F5 for failed endpoint retry after sequence finishes, N1-N5 for the Proxmox method
-`vms_then_poweroff` against simulated VMs, O for host booting without head-of-line blocking, and P for server booting with per-endpoint retry budget) passing on Debian 13 under WSL2.
+`vms_then_poweroff` against simulated VMs, O for host booting without head-of-line blocking, P for server booting with per-endpoint retry budget, Q for restarting a VM that was still shutting down when the grid returned, R for dropped VM shutdown logins, and S/T for inverter-settings handling in default and strict mode) passing on Debian 13 under WSL2.
 Earlier runs found and fixed a serial-port lock that stopped the bridge
 reconnecting, `setup.sh` hanging when its output was piped, misleading
 log lines, and SSH connection drop handling on Proxmox poweroff. Level 3
@@ -79,7 +79,7 @@ on immediately. A wait of **3600 s** can never pass during the test, so the
 state is guaranteed to stay put. That's also the main limit: the tests
 can't check exact timings ("fires at 60 s, not at 59 s").
 
-### The 53 tests
+### The 67 tests
 
 **State machine -- `src/state.rs`**
 
@@ -141,6 +141,18 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `remote_shutdown::recognises_qm_failure_text` | Failure text printed by `qm` (which may still exit 0) is recognised as a refused shutdown |
 | `remote_shutdown::qm_shutdown_command_includes_timeout` | The `qm shutdown` command format includes `--timeout` for Proxmox VE |
 | `remote_shutdown::qm_start_command_formats_correctly` | Formats `qm start <id>` command correctly for VM restart upon recovery |
+| `remote_shutdown::resilience_tests::ssh_connection_failures_are_told_apart_from_qm_failures` | "Connection reset/refused/timed out", `kex_exchange_identification` and the like count as ssh failing to connect (retried); `qm` failures, auth errors and our own timeout do not |
+| `remote_shutdown::resilience_tests::vm_shutdown_calls_are_spread_out_but_never_for_long` | VM shutdown calls start 250 ms apart (sshd's login limit), never spread over more than 10 s |
+| `remote_shutdown::resilience_tests::vm_reconnect_budget_never_exceeds_the_guest_timeout` | A VM's reconnect budget is the endpoint's, capped at `vm_shutdown_timeout_secs` |
+| `remote_shutdown::resilience_tests::restart_plan_starts_stopped_vms_and_keeps_watching_the_rest` | After a cancelled shutdown: stopped VMs are started, VMs still shutting down (or unlisted) keep being watched |
+| `remote_shutdown::resilience_tests::restart_plan_with_nothing_stopped_changes_nothing` | Nothing stopped yet -> nothing started, everything still watched |
+| `config::strict_inverter_checks_line_in_the_example_can_be_uncommented` | Switching the option on exactly as the example config says loads without error |
+| `tests::accepts_valid_settings_in_default_and_strict_modes` (main.rs) | Valid inverter settings are accepted either way |
+| `tests::refuses_wrong_device_type_even_in_non_strict_mode` (main.rs) | A wrong device type (data can't be trusted) is refused, with the reason |
+| `tests::non_strict_mode_keeps_running_on_cutoff_mismatch_or_margin_errors` (main.rs) | Cutoff/margin errors don't stop monitoring by default; strict mode refuses |
+| `tests::non_strict_mode_keeps_running_on_no_battery_mode` (main.rs) | The same for "no battery" mode |
+| `tests::unreadable_settings_get_one_clean_reconnect_then_monitoring_goes_ahead` (main.rs) | Unreadable settings: reconnect once, then monitor without the check |
+| `tests::strict_mode_never_runs_without_the_settings_check` (main.rs) | In strict mode unreadable settings are retried forever |
 | `remote_shutdown::distinguishes_timeout_from_guest_refusal` | Error classification accurately separates VM shutdown timeouts from guest agent refusals |
 | `remote_shutdown::identifies_transient_connection_errors` | Distinguishes transient connection errors (connection refused, timed out, 255) from permanent auth or command failures |
 | `remote_shutdown::stop_signal_resolves_on_true_but_not_on_a_dropped_sender` | Confirmed recovery stops the sequence from starting more endpoints, but a replaced sequence doesn't skip its stagger delays |
@@ -292,7 +304,7 @@ anything: the fake `ssh` never connects, Wake-on-LAN only goes to
 | `bridge-test-vms.toml` | The same, with Proxmox method `vms_then_poweroff` and a 15 s VM timeout -- for scenarios N (`./run-bridge.sh vms`) |
 | `run-bridge.sh` | Builds the bridge and starts it with the test config, the fake `ssh` first on `PATH`, and debug logging |
 | `requirements.txt` | pymodbus 3.15.0 and pyserial 3.5, pinned -- pymodbus changes its API between versions |
-| `CHECKLIST.md` | The 24 scenarios (A-M, F2, F3, F4, F5, N1-N5, O, P), with the exact log lines to expect |
+| `CHECKLIST.md` | The 28 scenarios (A-M, F2, F3, F4, F5, N1-N5, O, P, Q, R, S, T), with the exact log lines to expect |
 
 ### How to run it
 
@@ -447,6 +459,10 @@ The simulator and bridge can keep running.
 | N5 | Proxmox host unreachable | `ssh-fail` file | Logged; the other host still shut down |
 | O | Host booting on wakeup (no head-of-line blocking) | `ssh-booting-<host>` file | Initial attempt returns connection refused; moved to background retry up to `ssh_connect_retry_secs`; subsequent machines dispatched immediately without delay; all endpoints complete |
 | P | Server booting (per-endpoint extended budget) | `ssh-booting-<host>` file on server | Server uses custom `ssh_connect_retry_secs` override while rest proceed; server succeeds within extended window |
+| Q | Slow VM still shutting down when the grid returns | extra VM `110|slow-vm|ok:14`, `restore` mid-shutdown | The watch catches it once it has stopped: `qm start 110`, no hard stop, host left up |
+| R | sshd drops VM shutdown logins | `ssh-flaky-qm-shutdown-<host>` file | Dropped calls are retried; both VMs shut down gracefully, none hard-stopped |
+| S | Inverter settings problems, default mode | `set 0`, `set 217`, `mute` | Wrong device refused; cutoff mismatch logged but still protecting; unreadable settings: one reconnect, then monitoring, check retried later |
+| T | `strict_inverter_checks = true` | `set 217`, `mute` | Refuses on errors and on unreadable settings until fixed; never runs unchecked |
 
 #### Step 8 -- finish
 
@@ -477,6 +493,7 @@ bridge's next poll (within 1 s).
 | `load 1500` | Load power (register 178) |
 | `batt -800` | Battery power (register 190); Deye convention: + discharging, - charging |
 | `set 217 30` | Any register; value may be hex (`0x0300`) or negative |
+| `mute 0 213 217 220` | Registers that answer with a Modbus "illegal data address" error, like firmware that lacks them (`unmute` undoes it) |
 | `show` | Current values of all simulated registers |
 | `help` | The command list |
 | `quit` | Stop the simulator (also `Ctrl+C`) |
@@ -493,6 +510,7 @@ The fake `ssh` reads files in `/tmp/mub-test`:
 | `ssh-fail` | Fails immediately, like a machine that's off or unreachable | `echo 10.99.0.3 >> /tmp/mub-test/ssh-fail` |
 | `ssh-hang` | Never answers, until the bridge's 60 s SSH timeout kills it | `echo 10.99.0.2 >> /tmp/mub-test/ssh-hang` |
 | `ssh-booting-<host>` | Returns simulated `Connection refused` for N attempts, then succeeds | `echo 2 > /tmp/mub-test/ssh-booting-10.99.0.1` |
+| `ssh-flaky-qm-shutdown-<host>` | Drops the next N `qm shutdown` calls with `kex_exchange_identification: ... Connection reset by peer`, like sshd's MaxStartups | `echo 2 > /tmp/mub-test/ssh-flaky-qm-shutdown-10.99.0.3` |
 
 The test endpoints are `10.99.0.1` (ws-1), `10.99.0.2` (ws-2), `10.99.0.3`
 (proxmox-a) and `10.99.0.4` (proxmox-b). `./setup.sh reset` removes both files and

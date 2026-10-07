@@ -251,8 +251,9 @@ impl Config {
         }
         // The watchdog must be fed more often than its timeout (30 s for the
         // N2840's iTCO_wdt). The longest gap between feeds is one poll
-        // interval plus at most three 3 s read timeouts (a failed poll, then
-        // the two informational settings reads) -- 19 s with 10 s polling.
+        // interval plus up to 15 s of settings reads at a (re)connect (four
+        // required reads, then an optional one that times out at 3 s) --
+        // 25 s with 10 s polling.
         if !(1..=10).contains(&self.modbus.poll_interval_secs) {
             bail!(
                 "modbus.poll_interval_secs is {} -- must be 1-10, or the watchdog \
@@ -554,6 +555,20 @@ mod tests {
     fn grid_lost_voltage_outside_range_is_rejected() {
         let err = validate_err(&example_with("grid_lost_voltage = 100.0", "grid_lost_voltage = 0.0"));
         assert!(err.contains("grid_lost_voltage"), "{err}");
+    }
+
+    #[test]
+    fn strict_inverter_checks_line_in_the_example_can_be_uncommented() {
+        // The documented way to switch it on must actually load: the line has
+        // to sit above the first [section] header, where the example puts it.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config/bridge.toml.example");
+        let raw = std::fs::read_to_string(path).unwrap();
+        let edited = raw.replace("# strict_inverter_checks = false", "strict_inverter_checks = true");
+        assert_ne!(raw, edited, "the example must contain the commented line");
+        let cfg: Config = toml::from_str(&edited).expect("uncommented example must parse");
+        assert!(cfg.strict_inverter_checks());
+        let cfg: Config = toml::from_str(&raw).unwrap();
+        assert!(!cfg.strict_inverter_checks());
     }
 
     #[test]

@@ -7,6 +7,9 @@
 # Simulate an unreachable endpoint:  echo 10.99.0.3 >> /tmp/mub-test/ssh-fail
 # Simulate a hung endpoint:          echo 10.99.0.3 >> /tmp/mub-test/ssh-hang
 #   (the bridge should give up after its 60 s SSH timeout)
+# Simulate sshd dropping logins (MaxStartups) for `qm shutdown` only:
+#   echo 2 > /tmp/mub-test/ssh-flaky-qm-shutdown-10.99.0.3
+#   (the next 2 `qm shutdown` calls to that host fail before the command runs)
 #
 # Fake Proxmox hosts: for a host with a directory /tmp/mub-test/proxmox/<host>/
 # (made by setup.sh), commands using qm or systemctl are really EXECUTED,
@@ -33,6 +36,22 @@ if [ -f "$dir/ssh-booting-$host" ]; then
     else
         rm -f "$dir/ssh-booting-$host"
     fi
+fi
+
+if [ -f "$dir/ssh-flaky-qm-shutdown-$host" ]; then
+    case $remote_cmd in
+        *"qm shutdown"*)
+            count=$(cat "$dir/ssh-flaky-qm-shutdown-$host" 2>/dev/null || echo 0)
+            if [ "$count" -gt 0 ]; then
+                echo "$((count - 1))" > "$dir/ssh-flaky-qm-shutdown-$host"
+                echo "$(date +%T) $target DROPPED (simulated): $remote_cmd ($count drop(s) remaining)" >> "$dir/ssh.log"
+                echo "kex_exchange_identification: read: Connection reset by peer (simulated)" >&2
+                exit 255
+            else
+                rm -f "$dir/ssh-flaky-qm-shutdown-$host"
+            fi
+            ;;
+    esac
 fi
 
 if [ -f "$dir/ssh-fail" ] && grep -qxF "$host" "$dir/ssh-fail"; then

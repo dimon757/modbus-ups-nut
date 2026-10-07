@@ -272,7 +272,9 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
    live values on every connect and logs an error if there is a discrepancy or
    no margin. The bridge refuses to operate only if data cannot be trusted (wrong device
    type in register 0); for other discrepancies it logs at Error level and continues running
-   (unless `strict_inverter_checks = true` is configured).
+   (unless `strict_inverter_checks = true` is configured). If the settings can't be read at
+   all, it reconnects once, then monitors anyway and tries the check again every minute
+   (strict mode keeps retrying instead).
 4. **`wol_broadcast_addr`** matches your site's actual subnet, and that
    your switch doesn't filter broadcast traffic between the bridge and the
    endpoints.
@@ -308,13 +310,16 @@ or readable by others are logged as errors (ssh refuses such keys).
   Debian/Proxmox's systemd unit `pve-guests.service` stops all running VMs
   and containers gracefully with their configured timeout/ordering, then powers
   off the host; `vms_then_poweroff` has the bridge shut every running VM down
-  in parallel (`qm shutdown <id> --timeout <secs>`, QEMU guest agent / ACPI),
+  in parallel (`qm shutdown <id> --timeout <secs>`, QEMU guest agent / ACPI; the calls
+  start 250 ms apart so sshd's login limit doesn't drop some, and a call whose SSH
+  connection fails is retried -- a VM the request never reached is **not** powered off hard),
   power off hard any VM still running after `vm_shutdown_timeout_secs` (`qm stop`),
   then `systemctl poweroff --no-block` (falls back to `/sbin/poweroff` if refused)
   -- each such host runs in parallel with the rest of the sequence. If recovery is confirmed
   while VM shutdowns are in progress or during the power-off delay, the bridge aborts destructive
-  hard stops, cancels host power-off, and automatically restarts any VMs that already completed
-  shutdown via `qm start`. Start at boot on each guest ensures VMs start
+  hard stops, cancels host power-off, and keeps watching the VMs for up to
+  `vm_shutdown_timeout_secs` (+15 s), restarting each one that stops (including VMs still
+  shutting down when recovery arrived) via `qm start`. Start at boot on each guest ensures VMs start
   again at boot after WOL. Which method to use is decided on site:
   [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md).
   SSH host keys are pinned (`StrictHostKeyChecking=yes`); an endpoint whose
@@ -347,8 +352,8 @@ Full explanation and step-by-step instructions: [TESTING.md](TESTING.md).
    simulator on a virtual serial cable, with a fake `ssh` and a local
    Wake-on-LAN listener, on any Linux machine (including the N2840 before
    it goes to site). Needs no root and can't shut down anything. Start with
-   `test/setup.sh`, then follow the 20 scenarios in
-   [`test/CHECKLIST.md`](test/CHECKLIST.md) (18 automated in `test/auto_level2.py`).
+   `test/setup.sh`, then follow the 28 scenarios in
+   [`test/CHECKLIST.md`](test/CHECKLIST.md) (26 automated in `test/auto_level2.py`).
 3. **On site** -- the real inverter and machines: step 8 of the deployment
    sketch below, after [docs/register-verification.md](docs/register-verification.md)
    (inverter) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)

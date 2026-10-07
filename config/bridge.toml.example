@@ -21,6 +21,15 @@ wol_broadcast_addr = "192.168.1.255:9"
 # ~/.ssh/known_hosts -- leave it; only the test config changes it.
 # ssh_known_hosts_file = "/root/.ssh/known_hosts"
 
+# Refuse to run on ANY Error-level problem with the inverter's own settings
+# (its cutoff differs from inverter_cutoff_soc below, no safety margin, "no
+# battery" mode), and when those settings cannot be read at all. Default
+# (false): those problems are logged at Error level and the bridge keeps
+# protecting the site -- it refuses only when the inverter's data cannot be
+# trusted (wrong device type in register 0). Like wol_broadcast_addr, this
+# key must stay above the first [section] header.
+# strict_inverter_checks = false
+
 [modbus]
 device = "/dev/ttyS0"            # onboard RS485 port wired to the inverter;
                                   # VERIFY which ttyS it is (dmesg | grep ttyS)
@@ -48,12 +57,12 @@ on_battery_debounce_secs = 60
 # hardware protection cuts output. On every connect the bridge also reads
 # registers 213/217/220 from the inverter itself and logs an error if the
 # live cutoff leaves no margin, or a warning if the inverter manages the
-# battery by voltage instead of SOC. By default (strict_inverter_checks = false),
-# the bridge refuses to operate ONLY if the inverter data cannot be trusted
-# (wrong device type in register 0); other discrepancies are logged at Error
-# level while the bridge keeps running. Set strict_inverter_checks = true to
-# refuse on any Error-level discrepancy.
-# strict_inverter_checks = false
+# battery by voltage instead of SOC. By default the bridge refuses to operate
+# ONLY if the inverter data cannot be trusted (wrong device type in register
+# 0); other discrepancies are logged at Error level while the bridge keeps
+# running. If the settings cannot be read at all, it reconnects once and then
+# monitors anyway, trying the check again every minute. See
+# strict_inverter_checks at the top of this file to refuse instead.
 low_battery_soc = 30.0           # percent; triggers the shutdown sequence
                                   # once 2 of the last 3 readings are at/below it
 inverter_cutoff_soc = 20.0       # percent; the inverter's OWN cutoff setting

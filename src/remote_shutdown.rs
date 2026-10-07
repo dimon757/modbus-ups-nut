@@ -57,6 +57,63 @@ pub fn is_transient_connection_error(err: &anyhow::Error) -> bool {
         || s.contains("exited some(255)")
 }
 
+/// ssh itself could not reach (or was turned away by) the host, as opposed to
+/// the remote command having run and failed. `qm` also exits 255 when a guest
+/// shutdown times out, so the exit code alone cannot tell the two apart; the
+/// message can. Only failures from *before* the command started count -- a
+/// session that broke halfway ("closed by remote host") might have run it.
+pub fn is_ssh_connection_failure(err: &anyhow::Error) -> bool {
+    let s = format!("{:#}", err).to_lowercase();
+    if s.contains("permission denied")
+        || s.contains("host key verification failed")
+        || s.contains("offending key")
+        || s.contains("identification has changed")
+        || s.contains("could not resolve hostname")
+        || s.contains("name or service not known")
+        || s.contains("no such file or directory")
+        || s.contains("bad configuration option")
+    {
+        return false;
+    }
+    // sshd dropping a login before authentication (e.g. MaxStartups) shows
+    // up as kex_exchange_identification, whatever follows it.
+    if s.contains("kex_exchange_identification") {
+        return true;
+    }
+    // Our own wrapper timeout: the command ran, or hung -- not a failed connect.
+    if s.contains("timed out after") || s.contains("closed by remote host") {
+        return false;
+    }
+    s.contains("connection refused")
+        || s.contains("connection reset")
+        || s.contains("connection timed out")
+        || s.contains("connection closed by")
+        || s.contains("no route to host")
+        || s.contains("network is unreachable")
+        || s.contains("banner exchange")
+}
+
+/// Gap between starting one VM's shutdown call and the next. All of them
+/// at the same instant can exceed sshd's limit on simultaneous logins
+/// (MaxStartups, default 10:30:100), which drops some of them.
+const VM_START_SPACING: Duration = Duration::from_millis(250);
+/// Upper bound on the total spread, so a host with very many VMs is not slowed.
+const VM_START_SPREAD_CAP: Duration = Duration::from_secs(10);
+
+/// When the `index`-th VM's shutdown call starts, counted from the first.
+fn vm_start_delay(index: usize) -> Duration {
+    VM_START_SPACING
+        .checked_mul(u32::try_from(index).unwrap_or(u32::MAX))
+        .unwrap_or(VM_START_SPREAD_CAP)
+        .min(VM_START_SPREAD_CAP)
+}
+
+/// How long a VM's shutdown call may keep reconnecting: the endpoint's SSH
+/// retry budget, but never longer than the guest is given to shut down.
+fn vm_retry_budget(endpoint_budget_secs: u64, vm_timeout_secs: u64) -> Duration {
+    Duration::from_secs(endpoint_budget_secs.min(vm_timeout_secs))
+}
+
 /// Runs the full site shutdown sequence in the order `endpoints` are
 /// configured, starting one endpoint every `stagger_secs`.
 ///
@@ -336,15 +393,27 @@ async fn proxmox_vms_then_poweroff(
     let timeout_secs = opts.proxmox.vm_shutdown_timeout_secs;
     let ssh_timeout = Duration::from_secs(timeout_secs.saturating_add(15));
     let mut tasks = JoinSet::new();
+    let retry_budget = vm_retry_budget(
+        ep.effective_ssh_connect_retry_secs(opts.ssh_connect_retry_secs),
+        timeout_secs,
+    );
 
-    for vm in &running {
+    for (index, vm) in running.iter().enumerate() {
         let vm = vm.clone();
         let ep = ep.clone();
         let opts = opts.clone();
-        log::info!("{}: guest shutdown requested for VM {}", ep.name, vm.name);
+        let mut stop_rx = stop.clone();
+        let delay = vm_start_delay(index);
         tasks.spawn(async move {
+            if !delay.is_zero() {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = stopped(&mut stop_rx) => {}
+                }
+            }
+            log::info!("{}: guest shutdown requested for VM {}", ep.name, vm.name);
             let cmd = qm_shutdown_command(vm.id, timeout_secs);
-            let res = ssh_exec_timeout(&ep, &opts, &cmd, ssh_timeout).await;
+            let res = qm_shutdown_with_retry(&ep, &opts, &cmd, ssh_timeout, retry_budget, &mut stop_rx).await;
             (vm, res)
         });
     }
@@ -383,7 +452,18 @@ async fn proxmox_vms_then_poweroff(
                     }
                     Ok((vm, Err(e))) => {
                         let err_str = format!("{:#}", e);
-                        if is_timeout(&err_str) && !is_guest_refusal(&err_str) {
+                        if is_ssh_connection_failure(&e) {
+                            // The request never reached the host. Powering the VM
+                            // off hard would be doing it blind, so leave it to the
+                            // host's own poweroff, which stops guests properly.
+                            log::error!(
+                                "{}: could not reach the host to shut VM {} down ({:#}) -- \
+                                 not powering it off hard; the host's own poweroff will stop it",
+                                ep.name,
+                                vm.name,
+                                e
+                            );
+                        } else if is_timeout(&err_str) && !is_guest_refusal(&err_str) {
                             pending.push(vm);
                         } else {
                             log::warn!(
@@ -486,51 +566,132 @@ async fn proxmox_vms_then_poweroff(
     Ok(())
 }
 
-/// When Proxmox host shutdown is cancelled due to recovery, the host is not powered off
-/// and will not reboot -- meaning Wake-on-LAN will not trigger Proxmox autostart.
-/// Any VM that was running when the shutdown began and has since stopped must be restarted.
-async fn restart_stopped_vms(
+/// One VM's `qm shutdown` over SSH. Retries only when ssh could not connect
+/// (see `is_ssh_connection_failure`), for at most `budget`; a failure of `qm`
+/// itself -- guest agent not running, shutdown timed out -- is returned as is.
+async fn qm_shutdown_with_retry(
     ep: &Endpoint,
     opts: &ShutdownOptions,
-    running: &[Vm],
-) {
+    cmd: &str,
+    ssh_timeout: Duration,
+    budget: Duration,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<String> {
+    let start = tokio::time::Instant::now();
+    loop {
+        if *stop.borrow() {
+            bail!("recovery confirmed -- cancelled shutdown on {}", ep.name);
+        }
+        match ssh_exec_timeout(ep, opts, cmd, ssh_timeout).await {
+            Ok(out) => return Ok(out),
+            Err(e) => {
+                let elapsed = start.elapsed();
+                if !is_ssh_connection_failure(&e) || elapsed >= budget {
+                    return Err(e);
+                }
+                log::warn!(
+                    "{}: SSH connection for `{}` failed ({:#}) -- retrying in {:?} ({}s left)",
+                    ep.name,
+                    cmd,
+                    e,
+                    SSH_RETRY_INTERVAL,
+                    budget.saturating_sub(elapsed).as_secs()
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(SSH_RETRY_INTERVAL) => {}
+                    _ = stopped(stop) => {
+                        bail!("recovery confirmed -- cancelled shutdown on {}", ep.name);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// How often the clean-up looks at the VMs again.
+const RESTART_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// One look at the VMs still being waited for, from `power_states_command`
+/// output: which are stopped now (start them) and which are not (keep
+/// watching). A VM whose state is missing counts as not stopped.
+fn plan_restart(waiting: &[Vm], states_out: &str) -> (Vec<Vm>, Vec<Vm>) {
+    let stopped = select_stopped(waiting, states_out);
+    let rest = waiting
+        .iter()
+        .filter(|vm| !stopped.iter().any(|s| s.id == vm.id))
+        .cloned()
+        .collect();
+    (stopped, rest)
+}
+
+/// When Proxmox host shutdown is cancelled due to recovery, the host is not
+/// powered off and will not reboot -- so Wake-on-LAN will not trigger
+/// Proxmox autostart. Every VM that was running when the shutdown began and
+/// is stopped now must be started again.
+///
+/// VMs that were already asked to shut down keep shutting down on the host
+/// after the bridge stops waiting for them, so one look is not enough: this
+/// keeps watching, starting each VM as it turns up stopped, until all are
+/// handled or `vm_shutdown_timeout_secs` (+15 s) have passed. A VM still
+/// running by then never stopped, and needs nothing.
+async fn restart_stopped_vms(ep: &Endpoint, opts: &ShutdownOptions, running: &[Vm]) {
     if running.is_empty() {
         return;
     }
-
     log::info!(
-        "{}: checking VM power states to restart any guests stopped before recovery",
-        ep.name
+        "{}: recovery cancelled the shutdown -- watching {} VM(s) and restarting any that stop{}",
+        ep.name,
+        running.len(),
+        names_suffix(running)
     );
 
-    let cmd = power_states_command(running);
-    let out = match ssh_exec(ep, opts, &cmd).await {
-        Ok(out) => out,
-        Err(e) => {
-            log::error!("{}: failed to query VM power states for restart: {:#}", ep.name, e);
-            return;
-        }
-    };
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_secs(opts.proxmox.vm_shutdown_timeout_secs.saturating_add(15));
+    let mut waiting: Vec<Vm> = running.to_vec();
+    let mut restarted = 0usize;
 
-    let stopped = select_stopped(running, &out);
-    if stopped.is_empty() {
-        log::info!(
-            "{}: all {} previously running VM(s) are still running; no restart needed",
-            ep.name,
-            running.len()
-        );
-        return;
+    loop {
+        match ssh_exec(ep, opts, &power_states_command(&waiting)).await {
+            Ok(out) => {
+                let (stopped, rest) = plan_restart(&waiting, &out);
+                if !stopped.is_empty() {
+                    log::warn!(
+                        "{}: restarting {} stopped VM(s){}",
+                        ep.name,
+                        stopped.len(),
+                        names_suffix(&stopped)
+                    );
+                    restarted += start_vms(ep, opts, &stopped).await;
+                }
+                waiting = rest;
+            }
+            Err(e) => {
+                log::error!("{}: failed to query VM power states for restart: {:#}", ep.name, e);
+            }
+        }
+        if waiting.is_empty() || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(RESTART_POLL_INTERVAL).await;
     }
 
-    log::warn!(
-        "{}: restarting {} stopped VM(s){}",
-        ep.name,
-        stopped.len(),
-        names_suffix(&stopped)
-    );
+    if waiting.is_empty() {
+        log::info!("{}: restart watch finished: {} VM(s) restarted", ep.name, restarted);
+    } else {
+        log::info!(
+            "{}: restart watch finished: {} VM(s) restarted; still running (never stopped, nothing to restart){}",
+            ep.name,
+            restarted,
+            names_suffix(&waiting)
+        );
+    }
+}
 
+/// `qm start` for each VM in parallel, 3 attempts each. Returns how many started.
+async fn start_vms(ep: &Endpoint, opts: &ShutdownOptions, vms: &[Vm]) -> usize {
     let mut tasks = JoinSet::new();
-    for vm in stopped {
+    for vm in vms {
+        let vm = vm.clone();
         let ep = ep.clone();
         let opts = opts.clone();
         tasks.spawn(async move {
@@ -540,7 +701,7 @@ async fn restart_stopped_vms(
                 match ssh_exec(&ep, &opts, &start_cmd).await {
                     Ok(_) => {
                         log::info!("{}: VM {} (id {}) restarted", ep.name, vm.name, vm.id);
-                        return;
+                        return true;
                     }
                     Err(e) => {
                         if attempt < 3 {
@@ -566,10 +727,16 @@ async fn restart_stopped_vms(
                     e
                 );
             }
+            false
         });
     }
-
-    while tasks.join_next().await.is_some() {}
+    let mut started = 0;
+    while let Some(res) = tasks.join_next().await {
+        if let Ok(true) = res {
+            started += 1;
+        }
+    }
+    started
 }
 
 async fn power_off_hard(
@@ -945,5 +1112,82 @@ mod tests {
 
         let err_bad_opt = anyhow!("ssh to 10.99.0.1 exited Some(255): stderr=Bad configuration option: invalidoption");
         assert!(!is_transient_connection_error(&err_bad_opt));
+    }
+}
+
+#[cfg(test)]
+mod resilience_tests {
+    use super::*;
+
+    fn err(msg: &str) -> anyhow::Error {
+        anyhow!(msg.to_string())
+    }
+
+    fn vm(id: u32, name: &str) -> Vm {
+        Vm { id, name: name.into() }
+    }
+
+    #[test]
+    fn ssh_connection_failures_are_told_apart_from_qm_failures() {
+        for msg in [
+            "ssh to h exited Some(255): stderr=kex_exchange_identification: read: Connection reset by peer",
+            "ssh to h exited Some(255): stderr=kex_exchange_identification: Connection closed by remote host",
+            "ssh to h exited Some(255): stderr=ssh: connect to host h port 22: Connection refused",
+            "ssh to h exited Some(255): stderr=ssh: connect to host h port 22: Connection timed out",
+            "ssh to h exited Some(255): stderr=Connection closed by 10.0.0.3 port 22",
+            "ssh to h exited Some(255): stderr=ssh: connect to host h port 22: No route to host",
+        ] {
+            assert!(is_ssh_connection_failure(&err(msg)), "should be a connection failure: {msg}");
+        }
+        for msg in [
+            "ssh to h exited Some(255): stderr=VM quit/powerdown failed - got timeout",
+            "ssh to h exited Some(255): stderr=QEMU guest agent is not running",
+            "ssh to h exited Some(255): stderr=VM 100 not running",
+            "ssh to h exited Some(255): stderr=root@h: Permission denied (publickey).",
+            "ssh to h exited Some(255): stderr=Host key verification failed.",
+            "ssh to h timed out after 135s",
+            "ssh to h exited Some(255): stderr=Connection to h closed by remote host.",
+        ] {
+            assert!(!is_ssh_connection_failure(&err(msg)), "must not be retried as a connection failure: {msg}");
+        }
+    }
+
+    #[test]
+    fn vm_shutdown_calls_are_spread_out_but_never_for_long() {
+        assert_eq!(vm_start_delay(0), Duration::ZERO);
+        assert_eq!(vm_start_delay(1), Duration::from_millis(250));
+        assert_eq!(vm_start_delay(8), Duration::from_secs(2));
+        assert_eq!(vm_start_delay(40), Duration::from_secs(10));
+        assert_eq!(vm_start_delay(100_000), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn vm_reconnect_budget_never_exceeds_the_guest_timeout() {
+        assert_eq!(vm_retry_budget(900, 120), Duration::from_secs(120));
+        assert_eq!(vm_retry_budget(60, 120), Duration::from_secs(60));
+        assert_eq!(vm_retry_budget(0, 120), Duration::ZERO);
+    }
+
+    #[test]
+    fn restart_plan_starts_stopped_vms_and_keeps_watching_the_rest() {
+        let waiting = vec![vm(100, "dc01"), vm(101, "app"), vm(102, "db")];
+        // 100 stopped, 101 still shutting down (reads as running), 102 not listed at all
+        let out = "100 status: stopped\n101 status: running\n";
+        let (start, rest) = plan_restart(&waiting, out);
+        assert_eq!(start, vec![vm(100, "dc01")]);
+        assert_eq!(rest, vec![vm(101, "app"), vm(102, "db")]);
+
+        // A later look: 101 has stopped by now.
+        let (start, rest) = plan_restart(&rest, "101 status: stopped\n102 status: running\n");
+        assert_eq!(start, vec![vm(101, "app")]);
+        assert_eq!(rest, vec![vm(102, "db")]);
+    }
+
+    #[test]
+    fn restart_plan_with_nothing_stopped_changes_nothing() {
+        let waiting = vec![vm(100, "dc01")];
+        let (start, rest) = plan_restart(&waiting, "100 status: running\n");
+        assert!(start.is_empty());
+        assert_eq!(rest, waiting);
     }
 }

@@ -93,7 +93,7 @@ class AllLevel2Runner:
                 os.remove(p)
         if os.path.exists(DIR):
             for f in os.listdir(DIR):
-                if f.startswith("ssh-booting-"):
+                if f.startswith("ssh-booting-") or f.startswith("ssh-flaky-"):
                     try:
                         os.remove(os.path.join(DIR, f))
                     except Exception:
@@ -1139,6 +1139,191 @@ class AllLevel2Runner:
         self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
         log("--> SCENARIO P: PASSED", Color.GREEN + Color.BOLD)
 
+
+    def test_scenario_q(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO Q: Grid back while a slow VM is still shutting down -- it is restarted too", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+        with open(f"{DIR}/proxmox/10.99.0.3/vms", "a") as f:
+            f.write("110|slow-vm|ok:14\n")
+        with open(f"{DIR}/proxmox/10.99.0.3/state_110", "w") as f:
+            f.write("on\n")
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.start_bridge()
+        self.wait_for_bridge_log(r"loaded config from .*bridge\.toml")
+
+        self.send_sim_cmd("outage")
+        self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
+        self.send_sim_cmd("soc 25")
+        self.wait_for_bridge_log(r"proxmox: guest shutdown requested for VM slow-vm", timeout=15)
+        time.sleep(1)
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 40")
+
+        line = self.wait_for_bridge_log(r"recovery confirmed while VM shutdowns were in progress", timeout=25)
+        log(f"  [OK] {line}", Color.GREEN)
+        # slow-vm is still shutting down at this moment (it takes 14 s). One look
+        # would find it "running" and miss it; the watch must catch it later.
+        line = self.wait_for_bridge_log(r"proxmox: VM slow-vm \(id 110\) restarted", timeout=30)
+        log(f"  [OK] {line}", Color.GREEN)
+        line = self.wait_for_bridge_log(r"proxmox: restart watch finished: 3 VM\(s\) restarted", timeout=15)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        for i in (100, 101, 110):
+            with open(f"{DIR}/proxmox/10.99.0.3/state_{i}") as f:
+                assert f.read().strip() == "on", f"VM {i} must be running again"
+        with open(f"{DIR}/ssh.log") as f:
+            ssh_content = f.read()
+        assert "qm start 110" in ssh_content
+        assert "qm stop" not in ssh_content
+        assert not os.path.exists(f"{DIR}/proxmox/10.99.0.3/host")
+        log("  [OK] All three VMs are running again; no hard stop, host left up", Color.GREEN)
+        log("--> SCENARIO Q: PASSED", Color.GREEN + Color.BOLD)
+
+    def test_scenario_r(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO R: sshd drops the VM shutdown logins -- retried, nothing hard-stopped", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+        with open(f"{DIR}/ssh-flaky-qm-shutdown-10.99.0.3", "w") as f:
+            f.write("2\n")
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.start_bridge()
+        self.wait_for_bridge_log(r"loaded config from .*bridge\.toml")
+
+        self.send_sim_cmd("outage")
+        self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
+        self.send_sim_cmd("soc 25")
+
+        line = self.wait_for_bridge_log(r"proxmox: SSH connection for `.*qm shutdown.*` failed", timeout=20)
+        log(f"  [OK] {line}", Color.GREEN)
+        line = self.wait_for_bridge_log(r"proxmox: host power-off scheduled via systemctl poweroff", timeout=40, from_start=True)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        for l in self.bridge_logs:
+            assert "powering it off hard" not in l, l
+            assert "will be powered off" not in l, l
+        with open(f"{DIR}/ssh.log") as f:
+            ssh_content = f.read()
+        assert ssh_content.count("DROPPED (simulated)") == 2, ssh_content
+        assert "qm stop" not in ssh_content
+        for i in (100, 101):
+            with open(f"{DIR}/proxmox/10.99.0.3/state_{i}") as f:
+                assert f.read().strip() == "off", f"VM {i} must have been shut down gracefully"
+        log("  [OK] Two dropped logins were retried; both VMs shut down gracefully, none hard-stopped", Color.GREEN)
+        log("--> SCENARIO R: PASSED", Color.GREEN + Color.BOLD)
+
+    def _strict_config(self):
+        path = f"{DIR}/bridge-strict.toml"
+        with open(CONFIG) as f:
+            text = f.read()
+        marker = 'wol_broadcast_addr = "127.0.0.1:40009"'
+        assert marker in text
+        text = text.replace(marker, marker + "\nstrict_inverter_checks = true", 1)
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def test_scenario_s(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO S: Inverter settings problems -- default mode keeps protecting the site", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+
+        # (a) A device that is not the expected inverter: its data cannot be trusted.
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.send_sim_cmd("set 0 0x0500")
+        self.start_bridge()
+        line = self.wait_for_bridge_log(r"wrong device type 0x0500.*refusing to operate", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+        time.sleep(3)
+        assert not [l for l in self.bridge_logs if "soc=" in l and "grid=" in l], "must not poll a device it cannot trust"
+        self.send_sim_cmd("set 0 0x0300")
+        line = self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V", timeout=15)
+        log(f"  [OK] Right device again, monitoring starts: {line}", Color.GREEN)
+        self.stop_bridge()
+
+        # (b) The cutoff on the inverter differs from the config: logged, but still protecting.
+        self.reset_env()
+        self.send_sim_cmd("set 217 15")
+        self.start_bridge()
+        line = self.wait_for_bridge_log(r"inverter settings: config inverter_cutoff_soc is 20% but the inverter is set to 15%", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+        line = self.wait_for_bridge_log(r"monitoring continues anyway", timeout=5)
+        log(f"  [OK] {line}", Color.GREEN)
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V", timeout=10)
+        self.send_sim_cmd("outage")
+        self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
+        self.send_sim_cmd("soc 25")
+        line = self.wait_for_bridge_log(r"firing shutdown sequence", timeout=8)
+        log(f"  [OK] Outage with a low battery still shuts the site down: {line}", Color.GREEN)
+        self.stop_bridge()
+        self.send_sim_cmd("set 217 20")
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+
+        # (c) The inverter answers the polls but not the settings registers: one
+        # clean reconnect, then monitoring without the check -- and the check is
+        # tried again (here: once the registers answer) instead of being given up.
+        self.reset_env()
+        self.send_sim_cmd("mute 0 213 217 220")
+        self.start_bridge()
+        line = self.wait_for_bridge_log(r"inverter settings unreadable \(1 in a row\) -- reconnecting", timeout=15)
+        log(f"  [OK] {line}", Color.GREEN)
+        line = self.wait_for_bridge_log(r"monitoring WITHOUT a settings check", timeout=15)
+        log(f"  [OK] {line}", Color.GREEN)
+        line = self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V", timeout=10)
+        log(f"  [OK] The site is being monitored regardless: {line}", Color.GREEN)
+        self.send_sim_cmd("unmute")
+        line = self.wait_for_bridge_log(r"trying the inverter settings check again", timeout=40)
+        log(f"  [OK] {line}", Color.GREEN)
+        line = self.wait_for_bridge_log(r"inverter: device type 0x0300", timeout=20)
+        log(f"  [OK] Check completes once the inverter answers: {line}", Color.GREEN)
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V", timeout=10)
+        log("--> SCENARIO S: PASSED", Color.GREEN + Color.BOLD)
+
+    def test_scenario_t(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO T: strict_inverter_checks = true -- refuses instead of running unchecked", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+        strict = self._strict_config()
+
+        # (a) A settings error stops monitoring until it is fixed.
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.send_sim_cmd("set 217 15")
+        self.start_bridge(config=strict)
+        line = self.wait_for_bridge_log(r"strict_inverter_checks is enabled and the inverter settings have errors -- refusing to operate", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+        time.sleep(3)
+        assert not [l for l in self.bridge_logs if "soc=" in l and "grid=" in l], "strict mode must not monitor"
+        self.send_sim_cmd("set 217 20")
+        line = self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V", timeout=15)
+        log(f"  [OK] Fixed on the inverter: monitoring starts: {line}", Color.GREEN)
+        self.stop_bridge()
+
+        # (b) Unreadable settings are never run unchecked in strict mode.
+        self.reset_env()
+        self.send_sim_cmd("mute 0 213 217 220")
+        self.start_bridge(config=strict)
+        self.wait_for_bridge_log(r"inverter settings unreadable \(2 in a row\)", timeout=30)
+        time.sleep(3)
+        assert not [l for l in self.bridge_logs if "WITHOUT a settings check" in l], "strict mode must keep retrying"
+        assert not [l for l in self.bridge_logs if "soc=" in l and "grid=" in l]
+        self.send_sim_cmd("unmute")
+        line = self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V", timeout=30)
+        log(f"  [OK] Registers answer again: monitoring starts: {line}", Color.GREEN)
+        log("--> SCENARIO T: PASSED", Color.GREEN + Color.BOLD)
+
     def run(self, targets=None):
         all_scenarios = [
             ("a", "Scenario A", self.test_scenario_a),
@@ -1163,6 +1348,10 @@ class AllLevel2Runner:
             ("n5", "Scenario N5", self.test_scenario_n5),
             ("o", "Scenario O", self.test_scenario_o),
             ("p", "Scenario P", self.test_scenario_p),
+            ("q", "Scenario Q", self.test_scenario_q),
+            ("r", "Scenario R", self.test_scenario_r),
+            ("s", "Scenario S", self.test_scenario_s),
+            ("t", "Scenario T", self.test_scenario_t),
         ]
 
         if targets:
