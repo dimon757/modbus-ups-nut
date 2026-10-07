@@ -44,6 +44,14 @@ const REG_AC_POWER_RATIO: u16 = 54;
 const REG_GRID_VOLTAGE: u16 = 150;
 const GRID_VOLTAGE_SCALE: f64 = 10.0;
 
+/// Grid side relay status: 0 = open (the inverter is disconnected from the
+/// grid and running from the battery), 1 = closed. Unlike the voltage above,
+/// this is what the inverter actually decided: on a sagging grid it opens
+/// the relay while register 150 can still read well above `grid_lost_voltage`.
+/// Optional on purpose: if the firmware doesn't answer for it, the bridge
+/// falls back to the voltage alone.
+const REG_GRID_RELAY: u16 = 194;
+
 /// Load side total power, 1 W, signed int.
 const REG_LOAD_POWER: u16 = 178;
 
@@ -71,6 +79,9 @@ const BATTERY_VOLTAGE_SCALE: f64 = 100.0;
 pub struct InverterReading {
     pub battery_soc_pct: f64,
     pub grid_voltage: f64,
+    /// Register 194: `Some(true)` relay closed (on grid), `Some(false)` open
+    /// (off grid), `None` if the register is unreadable or holds another value.
+    pub grid_relay_closed: Option<bool>,
     pub load_power_w: f64,
     pub battery_power_w: f64,
 }
@@ -119,6 +130,9 @@ impl ModbusClient {
         let grid_raw = self.read_one(REG_GRID_VOLTAGE).await?;
         let load_raw = self.read_one(REG_LOAD_POWER).await?;
         let batt_raw = self.read_one(REG_BATTERY_POWER).await?;
+        // Optional: an unsupported register gives None (voltage-only
+        // detection); a timeout is an error, so the loop reconnects.
+        let relay_raw = self.read_optional(REG_GRID_RELAY).await?;
 
         // The protocol document gives SOC as [0,100]; anything else is a
         // garbled read, which must not be allowed to look like a low battery.
@@ -129,6 +143,7 @@ impl ModbusClient {
         Ok(InverterReading {
             battery_soc_pct: soc_raw as f64,
             grid_voltage: grid_raw as f64 / GRID_VOLTAGE_SCALE,
+            grid_relay_closed: decode_grid_relay(relay_raw),
             load_power_w: load_raw as i16 as f64,
             battery_power_w: batt_raw as i16 as f64,
         })
@@ -167,6 +182,7 @@ impl ModbusClient {
             // a timeout is an error that reconnects to keep RTU framing in sync.
             protocol_version: self.read_optional(REG_PROTOCOL_VERSION).await?,
             ac_power_ratio: self.read_optional(REG_AC_POWER_RATIO).await?,
+            grid_relay: self.read_optional(REG_GRID_RELAY).await?,
             device_type,
             battery_mode,
             shutdown_soc_pct,
@@ -182,15 +198,53 @@ pub struct InverterSettings {
     pub protocol_version: Option<u16>,
     /// Register 54, if readable.
     pub ac_power_ratio: Option<u16>,
+    /// Register 194 raw, if readable (checked at connect; polled every cycle).
+    pub grid_relay: Option<u16>,
     pub device_type: u16,
     pub battery_mode: u16,
     pub shutdown_soc_pct: f64,
     pub shutdown_voltage: f64,
 }
 
+/// Register 194 -> relay state. Only 0 and 1 are defined; anything else is
+/// treated as unknown rather than guessed at.
+fn decode_grid_relay(raw: Option<u16>) -> Option<bool> {
+    match raw {
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        Some(other) => {
+            log::debug!(
+                "grid relay register {} holds {}, expected 0 or 1 -- ignoring",
+                REG_GRID_RELAY,
+                other
+            );
+            None
+        }
+        None => None,
+    }
+}
+
 impl InverterSettings {
+    /// A warning if the grid relay (register 194) can't be used: grid-loss
+    /// detection then rests on the voltage alone, which a sagging grid that
+    /// the inverter has already disconnected from can fool.
+    pub fn grid_relay_finding(&self, use_grid_relay: bool) -> Option<(log::Level, String)> {
+        if use_grid_relay && !matches!(self.grid_relay, Some(0) | Some(1)) {
+            return Some((
+                log::Level::Warn,
+                format!(
+                    "grid relay register {} is unreadable or not 0/1 -- grid loss is detected from \
+                     the grid voltage alone, so a sagging grid that the inverter has already \
+                     disconnected from would go unnoticed",
+                    REG_GRID_RELAY
+                ),
+            ));
+        }
+        None
+    }
+
     /// One log line identifying the firmware's protocol: register 2 raw and
-    /// decoded (0x0102 -> "1.2"), and register 54 raw.
+    /// decoded (0x0102 -> "1.2"), register 54 raw, and register 194 (grid relay).
     pub fn protocol_summary(&self) -> String {
         let version = match self.protocol_version {
             Some(v) => format!("{:#06x} ({}.{})", v, v >> 8, v & 0xFF),
@@ -200,9 +254,13 @@ impl InverterSettings {
             Some(v) => v.to_string(),
             None => "unreadable".into(),
         };
+        let relay = match self.grid_relay {
+            Some(v) => v.to_string(),
+            None => "unreadable".into(),
+        };
         format!(
-            "protocol version (reg 2) {}, reg 54 {} -- see docs/protocol-versions.md",
-            version, ratio
+            "protocol version (reg 2) {}, reg 54 {}, grid relay (reg 194) {} -- see docs/protocol-versions.md",
+            version, ratio, relay
         )
     }
 
@@ -297,6 +355,7 @@ mod tests {
         InverterSettings {
             protocol_version: Some(0x0102),
             ac_power_ratio: Some(0),
+            grid_relay: Some(1),
             device_type: DEVICE_TYPE_SINGLE_PHASE_STORAGE,
             battery_mode,
             shutdown_soc_pct,
@@ -341,6 +400,30 @@ mod tests {
         let s = settings(1, 20.0).protocol_summary();
         assert!(s.contains("0x0102 (1.2)"), "{s}");
         assert!(s.contains("reg 54 0"), "{s}");
+        assert!(s.contains("grid relay (reg 194) 1"), "{s}");
+    }
+
+    #[test]
+    fn decode_grid_relay_accepts_only_0_and_1() {
+        assert_eq!(decode_grid_relay(Some(0)), Some(false));
+        assert_eq!(decode_grid_relay(Some(1)), Some(true));
+        assert_eq!(decode_grid_relay(Some(2)), None);
+        assert_eq!(decode_grid_relay(None), None);
+    }
+
+    #[test]
+    fn unreadable_grid_relay_warns_only_when_it_is_used() {
+        let mut s = settings(1, 20.0);
+        assert!(s.grid_relay_finding(true).is_none(), "a readable relay needs no warning");
+        s.grid_relay = None;
+        let (level, msg) = s.grid_relay_finding(true).expect("must warn");
+        assert_eq!(level, log::Level::Warn);
+        assert!(msg.contains("194"), "{msg}");
+        // Switched off in the config: nothing to warn about.
+        assert!(s.grid_relay_finding(false).is_none());
+        // A value other than 0/1 is treated like an unreadable one.
+        s.grid_relay = Some(7);
+        assert!(s.grid_relay_finding(true).is_some());
     }
 
     #[test]
@@ -348,8 +431,10 @@ mod tests {
         let mut st = settings(1, 20.0);
         st.protocol_version = None;
         st.ac_power_ratio = None;
+        st.grid_relay = None;
         let s = st.protocol_summary();
         assert!(s.contains("version (reg 2) unreadable"), "{s}");
         assert!(s.contains("reg 54 unreadable"), "{s}");
+        assert!(s.contains("reg 194) unreadable"), "{s}");
     }
 }

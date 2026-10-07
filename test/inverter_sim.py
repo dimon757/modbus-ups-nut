@@ -37,17 +37,20 @@ REGISTERS = {
     178: (500, "load total power, W, signed"),
     184: (80, "battery SOC, %"),
     190: (0, "battery power, W, signed (sign convention unverified)"),
+    194: (1, "grid side relay status: 0 open (off grid) / 1 closed (on grid)"),
     213: (1, "battery mode: 0 voltage / 1 capacity / 2 none"),
     217: (20, "battery capacity ShutDown (cutoff), %"),
     220: (4600, "battery voltage ShutDown, 0.01 V"),
 }
 
-HELP = """  grid <volts>     grid voltage, e.g. `grid 0` (outage), `grid 230`
+HELP = """  grid <volts>     grid voltage ONLY (register 150), e.g. `grid 0`, `grid 230`
+  relay <0|1>      grid relay (register 194): 0 open / 1 closed; with `grid 150`
+                   it simulates a sagging grid the inverter has disconnected from
   soc <percent>    battery SOC, e.g. `soc 25`
   load <watts>     load power
   batt <watts>     battery power (Deye convention: + discharging, - charging)
-  outage           same as `grid 0`
-  restore          same as `grid 230`
+  outage           grid 0 V and relay open
+  restore          grid 230 V and relay closed
   set <reg> <val>  any register; <val> may be hex (0x0300) or negative
   mute <reg>...    answer requests touching these registers with a Modbus
                    "illegal data address" error, like firmware that lacks them
@@ -125,10 +128,18 @@ def handle(inv, line):
             show(inv)
         elif cmd == "outage":
             inv.write(150, 0)
-            print("  grid 0.0 V")
+            inv.write(194, 0)
+            print("  grid 0.0 V, relay open")
         elif cmd == "restore":
             inv.write(150, 2300)
-            print("  grid 230.0 V")
+            inv.write(194, 1)
+            print("  grid 230.0 V, relay closed")
+        elif cmd == "relay" and len(args) == 1:
+            state = parse_int(args[0])
+            if state not in (0, 1):
+                raise ValueError("relay must be 0 (open) or 1 (closed)")
+            inv.write(194, state)
+            print(f"  grid relay {'closed' if state else 'open'}")
         elif cmd == "grid" and len(args) == 1:
             volts = float(args[0])
             inv.write(150, round(volts * 10))

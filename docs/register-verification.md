@@ -99,15 +99,22 @@ This is also the **shift test**: 184 must be the SOC (0-100) and 183 the
 battery voltage (thousands). If the SOC shows up at `[185]`, or `[184]`
 looks like a voltage, every address is off by one.
 
-## Step 3 -- Grid voltage (register 150)
+## Step 3 -- Grid voltage and grid relay (registers 150 and 194)
 
 ```bash
-mbpoll -m rtu -a 1 -b 9600 -P none -t 4 -0 -1 -r 150 /dev/ttyS0
+mbpoll -m rtu -a 1 -b 9600 -P none -t 4 -0 -1 -r 150,194 /dev/ttyS0
 ```
 
-Divide by 10: `2301` → 230.1 V. It must match the grid voltage on the display
-(within a volt or two). This is the register that starts the whole shutdown
-path; step 6 checks it without grid.
+| Register | Meaning | With the grid on |
+|---|---|---|
+| `[150]` | Grid voltage, 0.1 V | Divide by 10: `2301` → 230.1 V. Must match the display (within a volt or two) |
+| `[194]` | Grid side relay: 0 = open (off grid), 1 = closed (on grid) | **1** |
+
+These two registers are the whole gate on the shutdown path: the bridge
+counts the grid as lost if the voltage is below `grid_lost_voltage` **or** the
+relay reads 0. The relay is there because on a sagging grid the inverter
+disconnects and runs from the battery while register 150 still shows a
+healthy-looking voltage. Step 6 checks both without grid.
 
 ## Step 4 -- Power (registers 178 and 190)
 
@@ -143,18 +150,30 @@ mbpoll -m rtu -a 1 -b 9600 -P none -t 4 -0 -1 -r 213,217,220,54 /dev/ttyS0
 A good confirmation that 217 is really the shutdown setting: change the
 Shutdown % on the inverter by one step, read `[217]` again, then set it back.
 
-## Step 6 -- Grid lost (register 150 again)
+## Step 6 -- Grid lost (registers 150 and 194 again)
 
 Only this proves the bridge will notice an outage. Switch the inverter's
-**grid breaker off**, wait 10 s, read register 150 again:
+**grid breaker off**, wait 10 s, read both registers again:
 
 ```bash
-mbpoll -m rtu -a 1 -b 9600 -P none -t 4 -0 -1 -r 150 /dev/ttyS0
+mbpoll -m rtu -a 1 -b 9600 -P none -t 4 -0 -1 -r 150,194 /dev/ttyS0
 ```
 
-It must be **below 1000** (= 100.0 V, the bridge's `grid_lost_voltage`),
-normally close to 0. Switch the grid breaker back on and check it returns to
-~2300.
+- `[150]` must be **below 1000** (= 100.0 V, the bridge's `grid_lost_voltage`),
+  normally close to 0.
+- `[194]` must be **0** (relay open).
+
+Either one is enough for the bridge, but check both: if `[194]` stays at 1
+with the grid off, or reads 0 with the grid on, it is not trustworthy on this
+unit -- set `use_grid_relay = false` in `bridge.toml` and rely on the voltage.
+
+Switch the grid breaker back on and check that `[150]` returns to ~2300 and
+`[194]` returns to **1** -- note how many seconds that takes (the inverter
+reconnects after a delay); the bridge simply waits for it.
+
+If an error mentioning "Illegal data address" appears for 194, the firmware
+doesn't have it: the bridge then logs `relay=n/a`, a warning at connect, and
+decides on the voltage alone.
 
 ## Step 7 -- Cross-check with the bridge
 
@@ -171,13 +190,14 @@ Expect:
 
 ```
 inverter: device type 0x0300, battery mode 1, cutoff 20% / 46.00 V
-inverter: protocol version (reg 2) 0x0102 (1.2), reg 54 0 -- see docs/protocol-versions.md
+inverter: protocol version (reg 2) 0x0102 (1.2), reg 54 0, grid relay (reg 194) 1 -- see docs/protocol-versions.md
 inverter settings: inverter cutoff 20% SOC, shutdown sequence at 30% -- 10 points of margin
-soc=80.0% grid=230.1V load=500W batt=-300W on_battery=false low_battery=false
+soc=80.0% grid=230.1V relay=closed load=500W batt=-300W on_battery=false low_battery=false
 ```
 
-`soc`, `grid`, `load` and `batt` must agree with what `mbpoll` read in
-steps 2-4. Then start the service again:
+`soc`, `grid`, `relay`, `load` and `batt` must agree with what `mbpoll` read
+in steps 2-4 (`relay=closed` is register 194 = 1, `open` is 0, `n/a` means
+unreadable). Then start the service again:
 
 ```bash
 sudo systemctl start modbus-ups-bridge
@@ -220,6 +240,7 @@ Date: ______________ Inverter serial no.: ______________ Firmware: _____________
 | 2 | 183 battery voltage | = display ×100 | | | |
 | 2 | 184 SOC | = display | | | |
 | 3 | 150 grid voltage | = display ×10 | | | |
+| 3 | 194 grid relay, grid on | 1 | | -- | |
 | 4 | 178 load power | = display (or /10) | | | |
 | 4 | 190 battery power | = display; sign when charging: ____ | | | |
 | 5 | 213 battery mode | 1 | | | |
@@ -227,7 +248,9 @@ Date: ______________ Inverter serial no.: ______________ Firmware: _____________
 | 5 | 220 shutdown voltage | = display ×100 | | | |
 | 5 | 54 | -- (record only) | | -- | |
 | 6 | 150 with grid breaker off | < 1000 | | | |
+| 6 | 194 with grid breaker off | 0 | | -- | |
+| 6 | 194 after grid breaker back on | 1 (seconds taken: ____) | | -- | |
 | 7 | bridge log agrees with mbpoll | yes | | -- | |
 
-Copy the values of registers 2 and 54 into the table at the end of
+Copy the values of registers 2, 54 and 194 into the table at the end of
 [protocol-versions.md](protocol-versions.md).

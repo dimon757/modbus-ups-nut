@@ -285,7 +285,7 @@ Expect, within a few seconds:
 ```
 loaded config from /etc/modbus-ups-bridge/bridge.toml (4 endpoint(s))
 inverter: device type 0x0300, battery mode 1, cutoff 20% / 46.00 V
-inverter: protocol version (reg 2) 0x0102 (1.2), reg 54 0 -- see docs/protocol-versions.md
+inverter: protocol version (reg 2) 0x0102 (1.2), reg 54 0, grid relay (reg 194) 1 -- see docs/protocol-versions.md
 inverter settings: inverter cutoff 20% SOC, shutdown sequence at 30% -- 10 points of margin
 ```
 

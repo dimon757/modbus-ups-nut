@@ -50,12 +50,16 @@ async def main():
     for addr, (want, desc) in sim.REGISTERS.items():
         check(f"reg {addr} ({desc})", await read(client, addr), want)
     # Neighbours must stay 0, or the map is shifted by one.
-    for addr in (149, 151, 183, 185):
+    for addr in (149, 151, 183, 185, 193, 195):
         check(f"reg {addr} (unused neighbour)", await read(client, addr), 0)
 
     print("after simulator commands:")
     for line, addr, want in [
         ("outage", 150, 0),
+        ("outage", 194, 0),
+        ("restore", 194, 1),
+        ("relay 0", 194, 0),
+        ("relay 1", 194, 1),
         ("grid 229.5", 150, 2295),
         ("soc 25", 184, 25),
         ("batt -1200", 190, 0x10000 - 1200),

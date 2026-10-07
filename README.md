@@ -49,13 +49,13 @@ flowchart TD
     m_grid -- "yes: on battery" --> resume["Resume sequence for<br/>remaining endpoints"] --> done_seq["Mark completed"] --> latched
     m_grid -- "no: grid flickered back" --> hold_wait["Hold remaining sequence<br/>pending recovery confirmation"] --> recover
 
-    poll["Poll the inverter every 5 s<br/>SOC · grid voltage · load · battery power"] --> lost{"Grid voltage<br/>below 100 V?<br/><i>grid_lost_voltage</i>"}
+    poll["Poll the inverter every 5 s<br/>SOC · grid voltage · grid relay · load · battery power"] --> lost{"Grid lost?<br/>voltage below 100 V<br/>or grid relay open<br/><i>grid_lost_voltage · use_grid_relay</i>"}
     lost -- "no" --> poll
     lost -- "yes" --> deb{"Still lost after 60 s?<br/><i>on_battery_debounce_secs</i>"}
     deb -- "no, grid came back" --> poll
     deb -- "yes" --> onbatt["On battery"]
 
-    onbatt --> back1{"Grid back?"}
+    onbatt --> back1{"Grid back?<br/>voltage OK &<br/>relay closed"}
     back1 -- "yes" --> recover
     back1 -- "no" --> low{"SOC at or below 30 % on<br/>2 of the last 3 readings?<br/><i>low_battery_soc</i>"}
     low -- "no" --> onbatt
@@ -67,7 +67,7 @@ flowchart TD
     win --> done_seq
     pve --> done_seq
 
-    latched["Latched<br/>never fires a second time"] --> healthy{"Grid back?<br/>(whatever the SOC)"}
+    latched["Latched<br/>never fires a second time"] --> healthy{"Grid back?<br/>voltage OK &<br/>relay closed<br/>(whatever the SOC)"}
     healthy -- "no" --> latched
     healthy -- "yes" --> recover
 
@@ -123,6 +123,8 @@ stateDiagram-v2
 | RecoveryDebouncing → ShutdownLatched | grid lost, not yet sent, SOC low on 2 of the last 3 readings | **fire** the shutdown sequence (aborts any previous in-flight task) |
 | RecoveryDebouncing → OnBattery | grid lost, not yet sent, SOC not (yet) confirmed low | -- |
 | RecoveryDebouncing → Idle | grid back for `recovery_debounce_secs` (3 min) | **Wake-on-LAN** (stops in-flight shutdown, suppresses VM hard stops & host poweroff, restarts stopped VMs via `qm start`, with resends), only if a shutdown was sent |
+
+*\* **Grid lost** is triggered if grid voltage < `grid_lost_voltage` OR grid relay (register 194) is open (`use_grid_relay = true`). **Grid back** requires both to be healthy: grid voltage at/above threshold AND grid relay closed (or unreadable).*
 
 ## Target platform
 
@@ -180,8 +182,14 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
 ## The logic, plainly
 
 - **Grid present (220V AC on the inverter's input) → nothing ever shuts
-  down**, regardless of SOC. `thresholds.grid_lost_voltage` is the sole
-  gate on the whole shutdown path.
+  down**, regardless of SOC. The gate on the whole shutdown path is two
+  signals, and **either one** counts as "grid lost": the grid voltage
+  (register 150) below `thresholds.grid_lost_voltage`, or the inverter's
+  **grid side relay (register 194) open**. The relay matters because on a
+  sagging grid the inverter disconnects and runs from the battery while the
+  voltage register still reads well above 100 V. If register 194 can't be
+  read, the voltage alone decides. Recovery needs both healthy: the voltage
+  back *and* the relay closed.
 - **Grid lost + SOC at or below `low_battery_soc` on 2 of the last 3
   readings → shutdown sequence fires once**, latched so it doesn't re-fire
   while still down or on a flapping grid. Requiring two readings means one
@@ -244,10 +252,11 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
    | 0 | device type (0x0300 = single-phase storage) | -- |
    | 2 | protocol version (logged only) | e.g. 0x0102 = 1.2 |
    | 54 | V119 "AC power ratio" / V117 "EEPROM initial" (logged only, never written) | -- |
-   | 150 | grid side voltage L1-N | 0.1 V |
+   | 150 | grid side voltage L1-N (decides grid lost, together with 194) | 0.1 V |
    | 178 | load side total power | 1 W, signed |
    | 184 | battery SOC | 1 %, 0-100 |
    | 190 | battery output power | 1 W, signed |
+   | 194 | grid side relay status: 0 open (off grid) / 1 closed (on grid) -- with 150, decides grid lost | -- |
    | 213 | battery managed by 0 voltage / 1 capacity / 2 no battery | -- |
    | 217 | battery capacity ShutDown (inverter's own SOC cutoff) | 1 % |
    | 220 | battery voltage ShutDown | 0.01 V |
@@ -278,11 +287,17 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
 4. **`wol_broadcast_addr`** matches your site's actual subnet, and that
    your switch doesn't filter broadcast traffic between the bridge and the
    endpoints.
-5. **Grid detection.** With the inverter's grid breaker off, register 150
-   (`grid=` in the debug log) must fall below `grid_lost_voltage` (100 V) --
-   the document calls it the *grid side* voltage, which should read near
-   0 V without grid. This is the only signal that starts the shutdown path,
-   so see it happen once before relying on it.
+5. **Grid detection.** With the inverter's grid breaker off, register 194
+   (`relay=` in the debug log) must read **open**, and register 150
+   (`grid=`) should fall below `grid_lost_voltage` (100 V) -- the document
+   calls it the *grid side* voltage, which should read near 0 V without
+   grid. These two are the only signals that start the shutdown path, so
+   see them change once before relying on them. Also watch `relay=` while
+   the grid comes back: it should return to **closed** on its own, a little
+   after the voltage does. If register 194 turns out wrong on your unit
+   (reads open with the grid on), set `use_grid_relay = false` and rely on
+   the voltage; if it shows `relay=n/a`, the firmware doesn't answer for it
+   and the bridge already falls back to the voltage alone.
 
 The bridge checks at startup, and refuses to start on, a wrong SOC range,
 a `grid_lost_voltage` outside 1.0-400.0 V, a poll interval outside 1-10 s
@@ -293,7 +308,7 @@ or readable by others are logged as errors (ssh refuses such keys).
 
 ## Layout
 
-- `src/modbus.rs` -- polls the four registers over RS485 RTU.
+- `src/modbus.rs` -- polls the four registers (plus the grid relay flag, register 194) over RS485 RTU.
 - `src/state.rs` -- debounced state machine (Idle / GridLostDebouncing /
   OnBattery / ShutdownLatched / RecoveryDebouncing). Fires the shutdown
   sequence exactly once per outage, and one Wake-on-LAN round (with its
@@ -352,8 +367,8 @@ Full explanation and step-by-step instructions: [TESTING.md](TESTING.md).
    simulator on a virtual serial cable, with a fake `ssh` and a local
    Wake-on-LAN listener, on any Linux machine (including the N2840 before
    it goes to site). Needs no root and can't shut down anything. Start with
-   `test/setup.sh`, then follow the 28 scenarios in
-   [`test/CHECKLIST.md`](test/CHECKLIST.md) (26 automated in `test/auto_level2.py`).
+   `test/setup.sh`, then follow the 29 scenarios in
+   [`test/CHECKLIST.md`](test/CHECKLIST.md) (27 automated in `test/auto_level2.py`).
 3. **On site** -- the real inverter and machines: step 8 of the deployment
    sketch below, after [docs/register-verification.md](docs/register-verification.md)
    (inverter) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)
@@ -449,7 +464,8 @@ keys, watchdog, logs, starting, updating -- is
    Wake-on-LAN actually brings everything back -- before trusting any of
    this unattended. To rehearse without cutting the grid, temporarily
    **raise** `grid_lost_voltage` above the real grid voltage (e.g. `300.0`)
-   and **raise** `low_battery_soc` just above the current SOC, then
+   and **raise** `low_battery_soc` just above the current SOC (the voltage
+   test alone is enough: either signal counts as grid lost), then
    `systemctl restart modbus-ups-bridge`; put both back afterwards.
 
 ## Deliberately not handled here

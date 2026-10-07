@@ -17,10 +17,10 @@ procedures: [docs/register-verification.md](docs/register-verification.md)
 (inverter registers) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)
 (Proxmox shutdown command).
 
-**Status (2026-10-07).** Level 1: 67 tests, all passing on Debian 13 (66 on
-Windows, where the one Linux-only test is skipped). Level 2: all 28 scenarios
+**Status (2026-10-07).** Level 1: 74 tests, all passing on Debian 13 (73 on
+Windows, where the one Linux-only test is skipped). Level 2: all 29 scenarios
 (A-M plus the 60 s SSH timeout, F2 for mid-sequence restart resumption, F3 for grid flicker during restart, F4 for failed endpoint retry & Proxmox timing, F5 for failed endpoint retry after sequence finishes, N1-N5 for the Proxmox method
-`vms_then_poweroff` against simulated VMs, O for host booting without head-of-line blocking, P for server booting with per-endpoint retry budget, Q for restarting a VM that was still shutting down when the grid returned, R for dropped VM shutdown logins, and S/T for inverter-settings handling in default and strict mode) passing on Debian 13 under WSL2.
+`vms_then_poweroff` against simulated VMs, O for host booting without head-of-line blocking, P for server booting with per-endpoint retry budget, Q for restarting a VM that was still shutting down when the grid returned, R for dropped VM shutdown logins, S/T for inverter-settings handling in default and strict mode, and U for a sagging grid with the grid relay open) passing on Debian 13 under WSL2.
 Earlier runs found and fixed a serial-port lock that stopped the bridge
 reconnecting, `setup.sh` hanging when its output was piped, misleading
 log lines, and SSH connection drop handling on Proxmox poweroff. Level 3
@@ -79,7 +79,7 @@ on immediately. A wait of **3600 s** can never pass during the test, so the
 state is guaranteed to stay put. That's also the main limit: the tests
 can't check exact timings ("fires at 60 s, not at 59 s").
 
-### The 67 tests
+### The 74 tests
 
 **State machine -- `src/state.rs`**
 
@@ -95,6 +95,10 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `wol_only_after_a_real_shutdown` | A short outage, then a real one | No Wake-on-LAN after a blip; exactly one after a real shutdown |
 | `resumed_after_reboot_wakes_on_recovery` | Bridge restarts with the marker file, grid back | It still wakes everything |
 | `resumed_during_outage_does_not_refire` | Bridge restarts with the marker file, grid down | It stays latched: no second shutdown |
+| `sagging_grid_with_open_relay_counts_as_lost` | Voltage reads 150 V (above 100 V) but the grid relay is open, SOC falls | Treated as an outage: the shutdown fires. Voltage alone would have missed it |
+| `voltage_alone_would_have_missed_the_sag` | Same readings with `use_grid_relay = false` | No shutdown ever -- shows what the relay check adds |
+| `unreadable_relay_falls_back_to_voltage` | No relay value (register 194 unreadable) | Behaves exactly as before: the voltage alone decides |
+| `recovery_waits_for_the_relay_to_close` | After a shutdown the voltage is back but the relay is still open | Stays latched, no Wake-on-LAN, until the relay closes |
 
 **Configuration -- `src/config.rs`**
 
@@ -109,6 +113,7 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `duplicate_endpoint_names_are_rejected` | Two endpoints with the same name are refused (the log would be ambiguous) |
 | `soc_outside_0_100_is_rejected` | SOC thresholds outside 0-100 % are refused |
 | `grid_lost_voltage_outside_range_is_rejected` | Grid-lost voltage outside 1.0-400.0 V is refused (prevents 0 or negative voltage disabling outage detection) |
+| `grid_relay_check_defaults_on_and_can_be_switched_off` | `use_grid_relay` defaults to true (also for configs without the key) and `false` is accepted |
 | `loose_ssh_key_permissions_are_reported` | *Linux only.* An SSH key readable by others, or missing, is reported at startup -- ssh would refuse it during a real shutdown |
 | `old_register_settings_are_rejected` | A config that still sets register addresses (`reg_...`) is rejected: the register map lives in `src/modbus.rs` now, so the setting would do nothing |
 | `proxmox_section_is_optional_and_defaults_to_poweroff` | A config without `[proxmox]` loads, with method `poweroff` and a 300 s VM timeout |
@@ -127,7 +132,9 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `voltage_mode_warns` | Inverter managing the battery by voltage -- logged as a warning |
 | `wrong_device_type_is_an_error` | Device isn't a single-phase storage inverter -- logged as an error |
 | `protocol_summary_decodes_version_and_shows_reg_54` | Register 2 is logged raw and decoded (0x0102 -> 1.2), with register 54 |
-| `protocol_summary_survives_unreadable_registers` | Firmware that doesn't answer for register 2 or 54 gives `unreadable`, not an error |
+| `protocol_summary_survives_unreadable_registers` | Firmware that doesn't answer for register 2, 54 or 194 gives `unreadable`, not an error |
+| `decode_grid_relay_accepts_only_0_and_1` | Register 194: 0 = open, 1 = closed, any other value or no answer = unknown |
+| `unreadable_grid_relay_warns_only_when_it_is_used` | A missing/odd register 194 logs a warning (voltage-only detection), unless `use_grid_relay = false` |
 
 **Other modules**
 
@@ -304,7 +311,7 @@ anything: the fake `ssh` never connects, Wake-on-LAN only goes to
 | `bridge-test-vms.toml` | The same, with Proxmox method `vms_then_poweroff` and a 15 s VM timeout -- for scenarios N (`./run-bridge.sh vms`) |
 | `run-bridge.sh` | Builds the bridge and starts it with the test config, the fake `ssh` first on `PATH`, and debug logging |
 | `requirements.txt` | pymodbus 3.15.0 and pyserial 3.5, pinned -- pymodbus changes its API between versions |
-| `CHECKLIST.md` | The 28 scenarios (A-M, F2, F3, F4, F5, N1-N5, O, P, Q, R, S, T), with the exact log lines to expect |
+| `CHECKLIST.md` | The 29 scenarios (A-M, F2, F3, F4, F5, N1-N5, O, P, Q, R, S, T, U), with the exact log lines to expect |
 
 ### How to run it
 
@@ -406,11 +413,11 @@ the four panes: `sudo apt install tmux`, run `tmux`, split with
 Without typing anything, the bridge terminal should show:
 
 ```
-loaded config from .../test/bridge-test.toml (4 endpoint(s))
+loaded config from .../test/bridge-test.toml (3 endpoint(s))
 inverter: device type 0x0300, battery mode 1, cutoff 20% / 46.00 V
 inverter settings: inverter cutoff 20% SOC, shutdown sequence at 30% -- 10 points of margin
-soc=80.0% grid=230.0V load=500W batt=0W on_battery=false low_battery=false
-soc=80.0% grid=230.0V load=500W batt=0W on_battery=false low_battery=false
+soc=80.0% grid=230.0V relay=closed load=500W batt=0W on_battery=false low_battery=false
+soc=80.0% grid=230.0V relay=closed load=500W batt=0W on_battery=false low_battery=false
 ...
 ```
 
@@ -463,6 +470,7 @@ The simulator and bridge can keep running.
 | R | sshd drops VM shutdown logins | `ssh-flaky-qm-shutdown-<host>` file | Dropped calls are retried; both VMs shut down gracefully, none hard-stopped |
 | S | Inverter settings problems, default mode | `set 0`, `set 217`, `mute` | Wrong device refused; cutoff mismatch logged but still protecting; unreadable settings: one reconnect, then monitoring, check retried later |
 | T | `strict_inverter_checks = true` | `set 217`, `mute` | Refuses on errors and on unreadable settings until fixed; never runs unchecked |
+| U | Sagging grid | `grid 150`, then `relay 0`, `soc 25`, `relay 1`, `restore` | 150 V with the relay closed: nothing. Relay open: counts as outage, shutdown fires. Relay closed again: recovery starts |
 
 #### Step 8 -- finish
 
@@ -486,9 +494,10 @@ bridge's next poll (within 1 s).
 
 | Command | Effect |
 |---|---|
-| `outage` | Grid voltage 0 V (register 150) |
-| `restore` | Grid voltage 230 V |
-| `grid 180` | Any grid voltage |
+| `outage` | Grid voltage 0 V (register 150) and grid relay open (register 194) |
+| `restore` | Grid voltage 230 V and grid relay closed |
+| `grid 180` | Any grid voltage (register 150 only) |
+| `relay 0` | Grid relay open (`relay 1` = closed). With `grid 150` it simulates a sagging grid |
 | `soc 25` | Battery SOC 25 % (register 184) |
 | `load 1500` | Load power (register 178) |
 | `batt -800` | Battery power (register 190); Deye convention: + discharging, - charging |

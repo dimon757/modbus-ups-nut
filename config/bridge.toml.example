@@ -44,9 +44,18 @@ poll_interval_secs = 5
 
 [thresholds]
 grid_lost_voltage = 100.0        # volts (1.0-400.0); below this = 220V AC considered lost.
-                                  # This is the sole gate: above this voltage,
-                                  # nothing here shuts anything down, ever,
-                                  # regardless of SOC.
+use_grid_relay = true            # ALSO count "grid side relay open" (register 194)
+                                  # as grid lost. The inverter opens that relay when
+                                  # the grid leaves its accepted window (say a sag to
+                                  # 150 V) while register 150 still reads above
+                                  # grid_lost_voltage. Either signal is enough; an
+                                  # unreadable register falls back to voltage alone.
+                                  # Together these two are the gate: while the voltage
+                                  # is above the threshold AND the relay is closed
+                                  # (or unreadable), nothing here shuts anything
+                                  # down, ever, regardless of SOC. Set false only if
+                                  # register 194 proves wrong on the real unit
+                                  # (docs/register-verification.md, steps 3 and 6).
 on_battery_debounce_secs = 60
 
 # low_battery_soc MUST be set higher than inverter_cutoff_soc -- the bridge

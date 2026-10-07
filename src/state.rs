@@ -16,6 +16,11 @@ pub struct BridgeStatus {
     pub low_battery: bool,
     pub battery_soc_pct: f64,
     pub grid_voltage: f64,
+    pub grid_relay_closed: Option<bool>,
+    /// The decision the state machine acted on this poll: voltage below the
+    /// threshold, or the inverter's grid relay open. Everything else in the
+    /// bridge that needs to know "is the grid down?" uses this.
+    pub grid_lost: bool,
     pub load_power_w: f64,
     pub battery_power_w: f64,
 }
@@ -104,7 +109,14 @@ impl StateMachine {
     /// to take as a result of this transition.
     pub fn observe(&mut self, reading: InverterReading) -> (BridgeStatus, Action) {
         self.last_reading = Some(reading);
-        let grid_lost = reading.grid_voltage < self.thresholds.grid_lost_voltage;
+        // Lost if the voltage is low OR the inverter itself has opened its
+        // grid relay (it does that on a sagging grid while the voltage still
+        // reads above the threshold). An unreadable relay (None) counts as
+        // "not open": voltage alone decides, as before. Recovery needs both
+        // signals healthy, so a relay that is still open keeps us on battery.
+        let voltage_lost = reading.grid_voltage < self.thresholds.grid_lost_voltage;
+        let relay_open = self.thresholds.use_grid_relay && reading.grid_relay_closed == Some(false);
+        let grid_lost = voltage_lost || relay_open;
         if self.recent_soc_low.len() == LOW_SOC_WINDOW {
             self.recent_soc_low.pop_front();
         }
@@ -174,6 +186,8 @@ impl StateMachine {
             low_battery: matches!(self.phase, Phase::ShutdownLatched),
             battery_soc_pct: reading.battery_soc_pct,
             grid_voltage: reading.grid_voltage,
+            grid_relay_closed: reading.grid_relay_closed,
+            grid_lost,
             load_power_w: reading.load_power_w,
             battery_power_w: reading.battery_power_w,
         };
@@ -191,6 +205,7 @@ mod tests {
     fn thresholds(recovery_debounce_secs: u64) -> Thresholds {
         Thresholds {
             grid_lost_voltage: 100.0,
+            use_grid_relay: true,
             on_battery_debounce_secs: 0,
             low_battery_soc: 30.0,
             inverter_cutoff_soc: 20.0,
@@ -206,8 +221,17 @@ mod tests {
         InverterReading {
             battery_soc_pct: soc,
             grid_voltage,
+            grid_relay_closed: None,
             load_power_w: 0.0,
             battery_power_w: 0.0,
+        }
+    }
+
+    /// Same, with register 194 (the grid relay) as well.
+    fn reading_relay(grid_voltage: f64, soc: f64, relay_closed: bool) -> InverterReading {
+        InverterReading {
+            grid_relay_closed: Some(relay_closed),
+            ..reading(grid_voltage, soc)
         }
     }
 
@@ -231,6 +255,68 @@ mod tests {
     fn on_battery(sm: &mut StateMachine, soc: f64) {
         sm.observe(reading(GRID_DOWN, soc)); // -> GridLostDebouncing
         sm.observe(reading(GRID_DOWN, soc)); // -> OnBattery
+    }
+
+    const GRID_SAG: f64 = 150.0; // above grid_lost_voltage, but the inverter has let go
+
+    #[test]
+    fn sagging_grid_with_open_relay_counts_as_lost() {
+        // The voltage register still reads 150 V (> 100 V), but the inverter
+        // has opened its grid relay and runs from the battery. Voltage alone
+        // would never notice; the relay must.
+        let mut sm = StateMachine::new(thresholds(3600), false);
+        sm.observe(reading_relay(GRID_SAG, 50.0, false)); // -> GridLostDebouncing
+        sm.observe(reading_relay(GRID_SAG, 50.0, false)); // -> OnBattery
+        let (status, a) = sm.observe(reading_relay(GRID_SAG, 29.0, false));
+        assert!(status.grid_lost, "the published decision must say grid lost");
+        assert!(matches!(a, Action::None), "one low reading is not enough");
+        assert!(is_shutdown(&sm.observe(reading_relay(GRID_SAG, 28.0, false)).1));
+    }
+
+    #[test]
+    fn voltage_alone_would_have_missed_the_sag() {
+        // Same readings with the relay check switched off: no shutdown ever.
+        let mut t = thresholds(3600);
+        t.use_grid_relay = false;
+        let mut sm = StateMachine::new(t, false);
+        for soc in [50.0, 50.0, 29.0, 28.0, 27.0] {
+            let (status, a) = sm.observe(reading_relay(GRID_SAG, soc, false));
+            assert!(!status.grid_lost);
+            assert!(matches!(a, Action::None));
+        }
+    }
+
+    #[test]
+    fn unreadable_relay_falls_back_to_voltage() {
+        // reading() has no relay value (None): behaves exactly as before.
+        let mut sm = StateMachine::new(thresholds(3600), false);
+        for _ in 0..4 {
+            let (status, a) = sm.observe(reading(GRID_SAG, 5.0));
+            assert!(!status.grid_lost, "no relay info and voltage fine: grid present");
+            assert!(matches!(a, Action::None));
+        }
+        on_battery(&mut sm, 50.0); // GRID_DOWN voltage still works
+        sm.observe(reading(GRID_DOWN, 29.0));
+        assert!(is_shutdown(&sm.observe(reading(GRID_DOWN, 28.0)).1));
+    }
+
+    #[test]
+    fn recovery_waits_for_the_relay_to_close() {
+        // Voltage is back at 230 V but the inverter has not reconnected yet:
+        // still lost, so no recovery countdown and no Wake-on-LAN.
+        let mut sm = StateMachine::new(thresholds(0), false);
+        on_battery(&mut sm, 50.0);
+        sm.observe(reading(GRID_DOWN, 30.0));
+        assert!(is_shutdown(&sm.observe(reading(GRID_DOWN, 29.0)).1)); // -> ShutdownLatched
+        for _ in 0..3 {
+            let (status, a) = sm.observe(reading_relay(GRID_UP, 25.0, false));
+            assert!(matches!(a, Action::None));
+            assert!(status.grid_lost, "voltage is back but the relay is open: still lost");
+            assert!(status.low_battery, "stays latched while the relay is open");
+        }
+        sm.observe(reading_relay(GRID_UP, 25.0, true)); // -> RecoveryDebouncing
+        let (_, a) = sm.observe(reading_relay(GRID_UP, 25.0, true)); // -> Idle
+        assert!(matches!(a, Action::TriggerWakeOnLan));
     }
 
     #[test]

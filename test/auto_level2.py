@@ -1324,6 +1324,50 @@ class AllLevel2Runner:
         log(f"  [OK] Registers answer again: monitoring starts: {line}", Color.GREEN)
         log("--> SCENARIO T: PASSED", Color.GREEN + Color.BOLD)
 
+    def test_scenario_u(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO U: Sagging grid -- voltage still 150 V, but the grid relay is open", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.start_bridge()
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V relay=closed")
+
+        # A low voltage reading alone, with the relay still closed, is above
+        # grid_lost_voltage (100 V): nothing may happen.
+        self.send_sim_cmd("grid 150")
+        self.wait_for_bridge_log(r"soc=80\.0% grid=150\.0V relay=closed")
+        time.sleep(7)
+        states = [l for l in self.bridge_logs[self.log_cursor:] if "state:" in l]
+        assert not states, f"150 V with the relay closed must not count as an outage: {states}"
+        log("  [OK] 150 V with the relay closed is not an outage", Color.GREEN)
+
+        # The inverter lets go of the grid: voltage still reads 150 V, relay opens.
+        self.send_sim_cmd("relay 0")
+        line = self.wait_for_bridge_log(r"state: Idle -> GridLostDebouncing")
+        log(f"  [OK] {line}", Color.GREEN)
+        line = self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        self.send_sim_cmd("soc 25")
+        line = self.wait_for_bridge_log(r"firing shutdown sequence", timeout=8)
+        log(f"  [OK] {line}", Color.GREEN)
+        assert os.path.exists(f"{DIR}/shutdown_fired"), "Marker file must exist after the shutdown fired"
+        self.wait_for_bridge_log(r"shutdown sequence complete", timeout=60)
+
+        # Relay closes again (voltage still 150 V): recovery starts.
+        self.send_sim_cmd("relay 1")
+        line = self.wait_for_bridge_log(r"state: ShutdownLatched -> RecoveryDebouncing")
+        log(f"  [OK] {line}", Color.GREEN)
+        self.send_sim_cmd("restore")
+        line = self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
+        log(f"  [OK] {line}", Color.GREEN)
+        line = self.wait_for_bridge_log(r"Wake-on-LAN round 1/4", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+        log("--> SCENARIO U: PASSED", Color.GREEN + Color.BOLD)
+
     def run(self, targets=None):
         all_scenarios = [
             ("a", "Scenario A", self.test_scenario_a),
@@ -1352,6 +1396,7 @@ class AllLevel2Runner:
             ("r", "Scenario R", self.test_scenario_r),
             ("s", "Scenario S", self.test_scenario_s),
             ("t", "Scenario T", self.test_scenario_t),
+            ("u", "Scenario U", self.test_scenario_u),
         ]
 
         if targets:

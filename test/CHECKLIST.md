@@ -54,7 +54,7 @@ Timings below assume the test config: grid-lost wait **5 s**, recovery wait
 - [ ] `inverter: device type 0x0300, battery mode 1, cutoff 20% / 46.00 V`
 - [ ] `inverter: protocol version (reg 2) 0x0102 (1.2), reg 54 0 -- see docs/protocol-versions.md`
 - [ ] `inverter settings: inverter cutoff 20% SOC, shutdown sequence at 30% -- 10 points of margin`
-- [ ] every second: `soc=80.0% grid=230.0V load=500W batt=0W on_battery=false low_battery=false`
+- [ ] every second: `soc=80.0% grid=230.0V relay=closed load=500W batt=0W on_battery=false low_battery=false`
 - [ ] no state changes, nothing in ssh.log, nothing in the WOL listener
 
 ## B. Short grid blip -- ignored
@@ -417,6 +417,28 @@ inverter settings have errors -- refusing to operate` every 5 s, **no** poll lin
 
 **Do (b):** `mute 0 213 217 220`, start the bridge. **Expect:** `inverter settings unreadable (2 in a row)`,
 `(3 in a row)`, ... -- **never** `monitoring WITHOUT a settings check`, no poll lines. `unmute` -> polling starts.
+
+## U. Sagging grid -- voltage still 150 V, but the inverter's grid relay is open
+
+The real-world failure this covers: on a weak grid the inverter opens its
+grid relay and runs from the battery while the voltage register still reads
+well above `grid_lost_voltage`. Voltage alone would never notice.
+
+**Do:** from normal running (A): `grid 150`; wait 7 s; `relay 0`; wait for
+`OnBattery`; `soc 25`; wait for the sequence to finish; then `relay 1`; then `restore`.
+
+**Expect:**
+- [ ] after `grid 150`: log shows `grid=150.0V relay=closed` and **no** `state:` line, even after 7 s
+- [ ] after `relay 0`: `state: Idle -> GridLostDebouncing`, then `-> OnBattery` (voltage unchanged at 150 V)
+- [ ] after `soc 25`: `firing shutdown sequence`, marker file exists, all endpoints shut down
+- [ ] after `relay 1` (voltage still 150 V): `state: ShutdownLatched -> RecoveryDebouncing`
+- [ ] after `restore`: `-> Idle`, then Wake-on-LAN rounds, marker removed
+
+To try the fallback by hand: `set 194 7` (an undefined value) makes the bridge
+ignore the relay again -- `relay=n/a` in the log -- and decide on the voltage
+alone (and logs a warning at the next connect).
+
+---
 
 ## What this does and doesn't prove
 

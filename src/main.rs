@@ -132,16 +132,23 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
         let (status, action) = sm.observe(reading);
 
         log::debug!(
-            "soc={:.1}% grid={:.1}V load={:.0}W batt={:.0}W on_battery={} low_battery={}",
+            "soc={:.1}% grid={:.1}V relay={} load={:.0}W batt={:.0}W on_battery={} low_battery={}",
             status.battery_soc_pct,
             status.grid_voltage,
+            match status.grid_relay_closed {
+                Some(true) => "closed",
+                Some(false) => "open",
+                None => "n/a",
+            },
             status.load_power_w,
             status.battery_power_w,
             status.on_battery,
             status.low_battery
         );
 
-        let grid_down = status.grid_voltage < cfg.thresholds.grid_lost_voltage;
+        // The state machine's own decision (voltage low or grid relay open),
+        // so this check can never disagree with it.
+        let grid_down = status.grid_lost;
         if grid_down {
             if let Some(remaining) = pending_resume_endpoints.take() {
                 if !remaining.is_empty() {
@@ -402,10 +409,13 @@ async fn check_inverter_settings(client: &mut modbus::ModbusClient, cfg: &Config
                 s.shutdown_voltage
             );
             log::info!("inverter: {}", s.protocol_summary());
-            let findings = s.findings(
+            let mut findings = s.findings(
                 cfg.thresholds.low_battery_soc,
                 cfg.thresholds.inverter_cutoff_soc,
             );
+            if let Some(f) = s.grid_relay_finding(cfg.thresholds.use_grid_relay) {
+                findings.push(f);
+            }
             for (level, msg) in &findings {
                 log::log!(*level, "inverter settings: {}", msg);
             }
@@ -441,6 +451,7 @@ mod tests {
         modbus::InverterSettings {
             protocol_version: Some(0x0102),
             ac_power_ratio: Some(0),
+            grid_relay: Some(1),
             device_type,
             battery_mode,
             shutdown_soc_pct: cutoff,

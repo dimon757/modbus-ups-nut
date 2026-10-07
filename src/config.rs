@@ -104,11 +104,20 @@ pub struct ModbusConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Thresholds {
-    /// Grid voltage below this is considered "grid lost" (volts). This is
-    /// the sole gate on the whole shutdown path: as long as this reads
-    /// above threshold, nothing here ever shuts anything down, regardless
-    /// of SOC.
+    /// Grid voltage below this is considered "grid lost" (volts). Together
+    /// with the grid relay (see `use_grid_relay`) this is the gate on the
+    /// whole shutdown path: while the voltage is above this AND the relay
+    /// is closed (or unreadable), nothing here ever shuts anything down,
+    /// regardless of SOC.
     pub grid_lost_voltage: f64,
+    /// Also treat "grid side relay open" (register 194) as grid lost. The
+    /// inverter opens that relay when the grid leaves its accepted window --
+    /// e.g. a sag to 150 V -- while the voltage register still reads above
+    /// `grid_lost_voltage`. Either signal is enough to count as lost; an
+    /// unreadable register falls back to the voltage alone. Set to false
+    /// only if the relay register turns out wrong on the real unit.
+    #[serde(default = "default_use_grid_relay")]
+    pub use_grid_relay: bool,
     /// Grid must be lost for this long before we declare on_battery (seconds).
     pub on_battery_debounce_secs: u64,
     /// SOC (%) at or below which, while on_battery, we start the shutdown
@@ -144,6 +153,10 @@ pub struct Thresholds {
 
 fn default_wol_resend_count() -> u32 {
     8
+}
+
+fn default_use_grid_relay() -> bool {
+    true
 }
 
 fn default_wol_resend_interval_secs() -> u64 {
@@ -555,6 +568,22 @@ mod tests {
     fn grid_lost_voltage_outside_range_is_rejected() {
         let err = validate_err(&example_with("grid_lost_voltage = 100.0", "grid_lost_voltage = 0.0"));
         assert!(err.contains("grid_lost_voltage"), "{err}");
+    }
+
+    #[test]
+    fn grid_relay_check_defaults_on_and_can_be_switched_off() {
+        let cfg: Config = toml::from_str(&example_with("use_grid_relay = true", "use_grid_relay = false")).unwrap();
+        assert!(!cfg.thresholds.use_grid_relay);
+        // A config without the key keeps the safer behaviour.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config/bridge.toml.example");
+        let raw = std::fs::read_to_string(path).unwrap();
+        let without: String = raw
+            .lines()
+            .filter(|l| !l.starts_with("use_grid_relay"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let cfg: Config = toml::from_str(&without).unwrap();
+        assert!(cfg.thresholds.use_grid_relay);
     }
 
     #[test]
