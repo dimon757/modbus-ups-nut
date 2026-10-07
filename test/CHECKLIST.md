@@ -9,7 +9,7 @@ world is simulated:
 | Sunsynk inverter on RS485 | `inverter_sim.py` on a `socat` virtual serial cable |
 | SSH to the 3 machines | `bin/ssh`, which writes to `/tmp/mub-test/ssh.log` -- and, for the Proxmox host, runs the bridge's `qm`/`systemctl` commands against simulated VMs (scenarios N) |
 | Wake-on-LAN on the site LAN | packets to `127.0.0.1:40009`, shown by `wol_listen.py` |
-| Real waits (60 s / 180 s / 30 s / 2 min) | 5 s / 10 s / 2 s / 5 s (`bridge-test.toml`) |
+| Real waits (60 s / 180 s / 30 s / 2 min / 300 s) | 5 s / 10 s / 2 s / 5 s / 5 s (`bridge-test.toml`) |
 | `/var/lib/modbus-ups-bridge/shutdown_fired` | `/tmp/mub-test/shutdown_fired` |
 
 Nothing here needs root, touches the network, or can shut down or reboot
@@ -437,6 +437,43 @@ well above `grid_lost_voltage`. Voltage alone would never notice.
 To try the fallback by hand: `set 194 7` (an undefined value) makes the bridge
 ignore the relay again -- `relay=n/a` in the log -- and decide on the voltage
 alone (and logs a warning at the next connect).
+
+## V. Comms loss while on battery -- fail-safe shutdown fired
+
+If the inverter stops answering over RS485 (adapter unplugged, cable severed,
+inverter locked up) while the site is running on battery, the battery is draining
+unseen. After `comms_loss_shutdown_secs` (5 s in test config), the bridge fires
+the shutdown sequence fail-safe rather than waiting for the hard cutoff.
+
+**Do:** from normal running: `outage`; wait for `OnBattery`; then stop the simulator (Ctrl+C).
+
+**Expect:**
+- [ ] `state: Idle -> GridLostDebouncing`, then `-> OnBattery`
+- [ ] after the simulator stops: `modbus poll failed: timed out reading register ...`
+- [ ] ~5 s after the last reading:
+      `battery state unknown, firing shutdown sequence (comms_loss_shutdown_secs = 5)`
+- [ ] `state machine triggered shutdown sequence`
+- [ ] marker file exists, SSH commands dispatched to all endpoints in `ssh.log`
+- [ ] when simulator is restarted (default 230 V): `inverter: device type 0x0300`,
+      `state: ShutdownLatched -> RecoveryDebouncing`, then `-> Idle`, WOL rounds sent
+
+## W. Windows shutdown already scheduled (error 1190) -- treated as accepted
+
+Windows `shutdown /s` returns error 1190 ("A system shutdown has already been scheduled")
+if a shutdown was already initiated (e.g., following a previous SSH retry that timed out
+client-side after dispatch). The bridge recognises this and treats it as successfully accepted.
+
+**Do:**
+```bash
+echo 1 > /tmp/mub-test/ssh-already-scheduled-10.99.0.1
+```
+Then `outage`; wait for `OnBattery`; `soc 25`.
+
+**Expect:**
+- [ ] `firing shutdown sequence`
+- [ ] `ws-1: a shutdown is already scheduled on the host (error 1190) -- treating as accepted`
+- [ ] `ws-1` marked as dispatched in manifest without retrying
+- [ ] sequence proceeds to `ws-2` and `proxmox`; `shutdown sequence complete`
 
 ---
 

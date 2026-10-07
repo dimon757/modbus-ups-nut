@@ -93,7 +93,7 @@ class AllLevel2Runner:
                 os.remove(p)
         if os.path.exists(DIR):
             for f in os.listdir(DIR):
-                if f.startswith("ssh-booting-") or f.startswith("ssh-flaky-"):
+                if f.startswith("ssh-booting-") or f.startswith("ssh-flaky-") or f.startswith("ssh-already-scheduled-"):
                     try:
                         os.remove(os.path.join(DIR, f))
                     except Exception:
@@ -245,6 +245,11 @@ class AllLevel2Runner:
         log("\n=======================================================", Color.BOLD)
         log("RUNNING SCENARIO B: Short Grid Blip (< 5s)", Color.BOLD)
         log("=======================================================", Color.BOLD)
+        if not self.bridge_proc:
+            self.send_sim_cmd("restore")
+            self.send_sim_cmd("soc 80")
+            self.start_bridge()
+            self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
         self.send_sim_cmd("outage")
         line = self.wait_for_bridge_log(r"state: Idle -> GridLostDebouncing")
         log(f"  [OK] {line}", Color.GREEN)
@@ -262,6 +267,11 @@ class AllLevel2Runner:
         log("\n=======================================================", Color.BOLD)
         log("RUNNING SCENARIO C: Outage Without Low Battery", Color.BOLD)
         log("=======================================================", Color.BOLD)
+        if not self.bridge_proc:
+            self.send_sim_cmd("restore")
+            self.send_sim_cmd("soc 80")
+            self.start_bridge()
+            self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: Idle -> GridLostDebouncing")
         line = self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
@@ -496,7 +506,7 @@ class AllLevel2Runner:
         line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 2 endpoint\(s\) already dispatched, 1 remaining", timeout=10)
         log(f"  [OK] {line}", Color.GREEN)
 
-        line = self.wait_for_bridge_log(r"grid currently up; holding 1 remaining shutdown\(s\) pending recovery confirmation", timeout=10)
+        line = self.wait_for_bridge_log(r"grid currently up; holding 1 remaining shutdown\(s\) pending (?:recovery )?confirmation", timeout=10)
         log(f"  [OK] {line}", Color.GREEN)
 
         time.sleep(2)
@@ -504,7 +514,7 @@ class AllLevel2Runner:
             assert len(f.read().strip()) == 0
 
         self.send_sim_cmd("outage")
-        line = self.wait_for_bridge_log(r"grid still down: resuming shutdown sequence for 1 remaining endpoint\(s\)", timeout=10)
+        line = self.wait_for_bridge_log(r"grid (?:still|confirmed) down: resuming shutdown sequence for 1 remaining endpoint\(s\)", timeout=10)
         log(f"  [OK] {line}", Color.GREEN)
 
         self.wait_for_bridge_log(r"shutdown sequence complete", timeout=25)
@@ -764,7 +774,7 @@ class AllLevel2Runner:
         line = self.wait_for_bridge_log(r"failed to shut down ws-2", timeout=25)
         log(f"  [OK] Caught expected failure: {line}", Color.GREEN)
 
-        self.wait_for_bridge_log(r"shutdown sequence complete", timeout=25)
+        self.wait_for_bridge_log(r"shutdown sequence (?:complete|finished)", timeout=35)
         with open(f"{DIR}/ssh.log") as f:
             content = f.read()
         assert "10.99.0.2 FAILED (simulated)" in content
@@ -1037,7 +1047,7 @@ class AllLevel2Runner:
         line = self.wait_for_bridge_log(r"failed to shut down proxmox: listing VMs: ssh to 10\.99\.0\.3 exited Some\(255\)", timeout=20)
         log(f"  [OK] {line}", Color.GREEN)
 
-        self.wait_for_bridge_log(r"shutdown sequence complete", timeout=10)
+        self.wait_for_bridge_log(r"shutdown sequence (?:complete|finished)", timeout=10)
         log("  [OK] ws-1 and ws-2 completed while proxmox failed gracefully", Color.GREEN)
         log("--> SCENARIO N5: PASSED", Color.GREEN + Color.BOLD)
 
@@ -1368,6 +1378,97 @@ class AllLevel2Runner:
         log(f"  [OK] {line}", Color.GREEN)
         log("--> SCENARIO U: PASSED", Color.GREEN + Color.BOLD)
 
+    def test_scenario_v(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO V: Comms loss on battery -- fail-safe shutdown fired", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.start_bridge()
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
+
+        # Grid drops, battery still healthy (SOC 80%)
+        self.send_sim_cmd("outage")
+        line = self.wait_for_bridge_log(r"state: Idle -> GridLostDebouncing")
+        log(f"  [OK] {line}", Color.GREEN)
+        line = self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        # Inverter RS485 communication is lost while running on battery
+        log("--> Killing inverter simulator to simulate comms loss during outage...", Color.CYAN)
+        if self.sim_proc:
+            self.sim_proc.kill()
+            self.sim_proc.wait()
+            self.sim_proc = None
+
+        # After comms_loss_shutdown_secs (5 s), the fail-safe must fire
+        line = self.wait_for_bridge_log(r"battery state unknown, firing shutdown sequence", timeout=15)
+        log(f"  [OK] {line}", Color.GREEN)
+        line = self.wait_for_bridge_log(r"shutdown sequence starting: 3 endpoint\(s\)", timeout=5)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        assert os.path.exists(f"{DIR}/shutdown_fired"), "Marker file must exist after fail-safe shutdown fired"
+        self.wait_for_bridge_log(r"shutdown sequence complete", timeout=45)
+        with open(f"{DIR}/ssh.log") as f:
+            ssh_content = f.read()
+        assert "10.99.0.1" in ssh_content and "10.99.0.2" in ssh_content and "10.99.0.3" in ssh_content
+        log("  [OK] All endpoints dispatched in fail-safe shutdown", Color.GREEN)
+
+        # Simulator returns with grid back (default 230 V, SOC 80%)
+        log("--> Restarting inverter simulator (grid restored)...", Color.CYAN)
+        self.start_simulator()
+        self.wait_for_bridge_log(r"inverter: device type 0x0300", timeout=15)
+        line = self.wait_for_bridge_log(r"state: ShutdownLatched -> RecoveryDebouncing", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+        line = self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
+        log(f"  [OK] {line}", Color.GREEN)
+        line = self.wait_for_bridge_log(r"Wake-on-LAN round 1/4", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+        log("--> SCENARIO V: PASSED", Color.GREEN + Color.BOLD)
+
+    def test_scenario_w(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO W: Windows shutdown already scheduled (error 1190) accepted", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+
+        # Simulate Windows returning error 1190 for ws-1
+        with open(f"{DIR}/ssh-already-scheduled-10.99.0.1", "w") as f:
+            f.write("1\n")
+
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.start_bridge()
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
+
+        self.send_sim_cmd("outage")
+        self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
+        self.send_sim_cmd("soc 25")
+        self.wait_for_bridge_log(r"firing shutdown sequence", timeout=8)
+
+        # ws-1 reports error 1190, bridge treats it as accepted
+        line = self.wait_for_bridge_log(r"ws-1: a shutdown is already scheduled on the host \(error 1190\) -- treating as accepted", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        # ws-2 and proxmox proceed normally
+        self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=10)
+        self.wait_for_bridge_log(r"shutdown sequence complete", timeout=45)
+
+        with open(f"{DIR}/shutdown_fired") as f:
+            marker = f.read()
+        assert "completed" in marker
+        assert "dispatched: ws-1" in marker
+        log("  [OK] ws-1 recorded as dispatched in manifest despite error 1190", Color.GREEN)
+
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.wait_for_bridge_log(r"state: ShutdownLatched -> RecoveryDebouncing", timeout=10)
+        self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
+        log("--> SCENARIO W: PASSED", Color.GREEN + Color.BOLD)
+
     def run(self, targets=None):
         all_scenarios = [
             ("a", "Scenario A", self.test_scenario_a),
@@ -1397,6 +1498,8 @@ class AllLevel2Runner:
             ("s", "Scenario S", self.test_scenario_s),
             ("t", "Scenario T", self.test_scenario_t),
             ("u", "Scenario U", self.test_scenario_u),
+            ("v", "Scenario V", self.test_scenario_v),
+            ("w", "Scenario W", self.test_scenario_w),
         ]
 
         if targets:

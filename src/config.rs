@@ -149,6 +149,18 @@ pub struct Thresholds {
     /// Retries run concurrently without delaying the shutdown of other endpoints.
     #[serde(default = "default_ssh_connect_retry_secs")]
     pub ssh_connect_retry_secs: u64,
+    /// Fail-safe for losing the inverter mid-outage (RS485 adapter unplugged,
+    /// cable fault, inverter not answering): if the last valid reading said
+    /// the grid was lost and no valid reading has come in for this long, the
+    /// shutdown sequence fires anyway -- the battery is draining unseen, and
+    /// the inverter's hard cutoff would otherwise take everything down
+    /// ungracefully. 0 disables it.
+    #[serde(default = "default_comms_loss_shutdown_secs")]
+    pub comms_loss_shutdown_secs: u64,
+}
+
+fn default_comms_loss_shutdown_secs() -> u64 {
+    300
 }
 
 fn default_wol_resend_count() -> u32 {
@@ -262,11 +274,17 @@ impl Config {
                 t.ssh_connect_retry_secs
             );
         }
+        if t.comms_loss_shutdown_secs > 3600 {
+            bail!(
+                "thresholds.comms_loss_shutdown_secs is {} s -- must be <= 3600 (0 disables)",
+                t.comms_loss_shutdown_secs
+            );
+        }
         // The watchdog must be fed more often than its timeout (30 s for the
         // N2840's iTCO_wdt). The longest gap between feeds is one poll
-        // interval plus up to 15 s of settings reads at a (re)connect (four
-        // required reads, then an optional one that times out at 3 s) --
-        // 25 s with 10 s polling.
+        // interval plus settings reads at a (re)connect (four required
+        // reads, then up to three optional reads each timing out at 3 s) --
+        // ~20-22 s with 10 s polling.
         if !(1..=10).contains(&self.modbus.poll_interval_secs) {
             bail!(
                 "modbus.poll_interval_secs is {} -- must be 1-10, or the watchdog \

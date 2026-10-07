@@ -21,6 +21,10 @@ pub struct BridgeStatus {
     /// threshold, or the inverter's grid relay open. Everything else in the
     /// bridge that needs to know "is the grid down?" uses this.
     pub grid_lost: bool,
+    /// `grid_lost` has held continuously for `on_battery_debounce_secs`.
+    /// For decisions taken outside the phase machine (resuming a shutdown
+    /// after a restart) that must not act on a single glitchy reading.
+    pub grid_lost_confirmed: bool,
     pub load_power_w: f64,
     pub battery_power_w: f64,
 }
@@ -42,7 +46,12 @@ pub struct StateMachine {
     phase: Phase,
     thresholds: Thresholds,
     phase_entered_at: Instant,
-    last_reading: Option<InverterReading>,
+    /// What the last valid reading said about the grid. Drives the
+    /// comms-loss fail-safe: losing the inverter only matters if we were
+    /// running from the battery when it went quiet.
+    last_grid_lost: bool,
+    /// Since when `grid_lost` has held without a break (None: grid present).
+    grid_lost_since: Option<Instant>,
     /// Low-SOC flags of the last LOW_SOC_WINDOW readings, newest last.
     recent_soc_low: VecDeque<bool>,
     /// Set when the shutdown sequence has actually been fired, cleared once
@@ -76,7 +85,8 @@ impl StateMachine {
             },
             thresholds,
             phase_entered_at: Instant::now(),
-            last_reading: None,
+            last_grid_lost: false,
+            grid_lost_since: None,
             recent_soc_low: VecDeque::with_capacity(LOW_SOC_WINDOW),
             shutdown_fired: resume_after_shutdown,
         }
@@ -105,10 +115,39 @@ impl StateMachine {
         Action::TriggerShutdownSequence
     }
 
+    /// Called on every poll cycle that produced no valid reading (inverter
+    /// silent, adapter missing, settings refused), with how long it has been
+    /// since the last valid one.
+    ///
+    /// Fail-safe: if that last reading said the grid was lost, the battery
+    /// has been draining unobserved; once `comms_loss_shutdown_secs` have
+    /// passed, fire the sequence rather than wait for the inverter's hard
+    /// cutoff. Never fires when the grid was present at the last reading, or
+    /// when the sequence has already been fired. A later valid reading is
+    /// handled as usual: grid back -> recovery -> Wake-on-LAN.
+    pub fn comms_lost(&mut self, since_last_reading: Duration) -> Action {
+        let limit = self.thresholds.comms_loss_shutdown_secs;
+        if limit == 0
+            || !self.last_grid_lost
+            || self.shutdown_fired
+            || since_last_reading < Duration::from_secs(limit)
+        {
+            return Action::None;
+        }
+        log::error!(
+            "no valid inverter reading for {} s while the grid was lost at the last one -- \
+             battery state unknown, firing shutdown sequence (comms_loss_shutdown_secs = {})",
+            since_last_reading.as_secs(),
+            limit
+        );
+        self.enter(Phase::ShutdownLatched);
+        self.shutdown_fired = true;
+        Action::TriggerShutdownSequence
+    }
+
     /// Feed one poll result in; returns the status to publish and any action
     /// to take as a result of this transition.
     pub fn observe(&mut self, reading: InverterReading) -> (BridgeStatus, Action) {
-        self.last_reading = Some(reading);
         // Lost if the voltage is low OR the inverter itself has opened its
         // grid relay (it does that on a sagging grid while the voltage still
         // reads above the threshold). An unreadable relay (None) counts as
@@ -117,6 +156,15 @@ impl StateMachine {
         let voltage_lost = reading.grid_voltage < self.thresholds.grid_lost_voltage;
         let relay_open = self.thresholds.use_grid_relay && reading.grid_relay_closed == Some(false);
         let grid_lost = voltage_lost || relay_open;
+        self.last_grid_lost = grid_lost;
+        if !grid_lost {
+            self.grid_lost_since = None;
+        } else if self.grid_lost_since.is_none() {
+            self.grid_lost_since = Some(Instant::now());
+        }
+        let grid_lost_confirmed = self.grid_lost_since.is_some_and(|t| {
+            t.elapsed() >= Duration::from_secs(self.thresholds.on_battery_debounce_secs)
+        });
         if self.recent_soc_low.len() == LOW_SOC_WINDOW {
             self.recent_soc_low.pop_front();
         }
@@ -188,6 +236,7 @@ impl StateMachine {
             grid_voltage: reading.grid_voltage,
             grid_relay_closed: reading.grid_relay_closed,
             grid_lost,
+            grid_lost_confirmed,
             load_power_w: reading.load_power_w,
             battery_power_w: reading.battery_power_w,
         };
@@ -214,6 +263,7 @@ mod tests {
             wol_resend_count: 0,
             wol_resend_interval_secs: 0,
             ssh_connect_retry_secs: 0,
+            comms_loss_shutdown_secs: 0,
         }
     }
 
@@ -428,6 +478,64 @@ mod tests {
             let (status, a) = sm.observe(reading(GRID_DOWN, soc));
             assert!(matches!(a, Action::None));
             assert!(status.low_battery);
+        }
+    }
+
+    fn with_comms_loss(secs: u64) -> Thresholds {
+        let mut t = thresholds(0);
+        t.comms_loss_shutdown_secs = secs;
+        t
+    }
+
+    #[test]
+    fn comms_loss_on_battery_fires_after_the_limit() {
+        let mut sm = StateMachine::new(with_comms_loss(300), false);
+        on_battery(&mut sm, 80.0);
+        assert!(matches!(sm.comms_lost(Duration::from_secs(299)), Action::None));
+        assert!(is_shutdown(&sm.comms_lost(Duration::from_secs(300))));
+        // Latched: never fires twice.
+        assert!(matches!(sm.comms_lost(Duration::from_secs(900)), Action::None));
+        // Readings come back with the grid up -> recovery -> WOL.
+        sm.observe(reading(GRID_UP, 80.0)); // -> RecoveryDebouncing
+        let (_, a) = sm.observe(reading(GRID_UP, 80.0)); // -> Idle
+        assert!(matches!(a, Action::TriggerWakeOnLan));
+    }
+
+    #[test]
+    fn comms_loss_with_grid_present_never_fires() {
+        let mut sm = StateMachine::new(with_comms_loss(300), false);
+        sm.observe(reading(GRID_UP, 50.0));
+        assert!(matches!(sm.comms_lost(Duration::from_secs(3600)), Action::None));
+    }
+
+    #[test]
+    fn comms_loss_before_any_reading_never_fires() {
+        let mut sm = StateMachine::new(with_comms_loss(300), false);
+        assert!(matches!(sm.comms_lost(Duration::from_secs(3600)), Action::None));
+    }
+
+    #[test]
+    fn comms_loss_disabled_with_zero() {
+        let mut sm = StateMachine::new(with_comms_loss(0), false);
+        on_battery(&mut sm, 80.0);
+        assert!(matches!(sm.comms_lost(Duration::from_secs(3600)), Action::None));
+    }
+
+    #[test]
+    fn grid_lost_confirmed_needs_the_debounce() {
+        // Zero debounce: confirmed on the first lost reading.
+        let mut sm = StateMachine::new(thresholds(3600), true);
+        assert!(sm.observe(reading(GRID_DOWN, 50.0)).0.grid_lost_confirmed);
+        assert!(!sm.observe(reading(GRID_UP, 50.0)).0.grid_lost_confirmed);
+
+        // Long debounce: a single glitch (or several within it) is not confirmed.
+        let mut t = thresholds(3600);
+        t.on_battery_debounce_secs = 3600;
+        let mut sm = StateMachine::new(t, true);
+        for _ in 0..3 {
+            let (status, _) = sm.observe(reading(GRID_DOWN, 50.0));
+            assert!(status.grid_lost);
+            assert!(!status.grid_lost_confirmed);
         }
     }
 }

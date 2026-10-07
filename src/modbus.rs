@@ -149,16 +149,21 @@ impl ModbusClient {
         })
     }
 
-    /// Read an optional holding register. If the inverter returns a Modbus error
+    /// Read an optional holding register. If the inverter returns a Modbus protocol exception
     /// (e.g. Illegal Data Address on older firmware), returns Ok(None).
-    /// If the read times out, returns an Err so the caller reconnects rather than
-    /// leaving stale bytes on the serial line that would desynchronize RTU framing.
+    /// If the read times out or encounters a transport/framing error, returns an Err so the
+    /// caller reconnects rather than leaving stale bytes on the serial line that would desynchronize RTU framing.
     async fn read_optional(&mut self, addr: u16) -> Result<Option<u16>> {
         match tokio::time::timeout(READ_TIMEOUT, self.ctx.read_holding_registers(addr, 1)).await {
             Ok(Ok(rsp)) => Ok(rsp.first().copied()),
             Ok(Err(e)) => {
-                log::debug!("optional register {:#06x} not available: {}", addr, e);
-                Ok(None)
+                let err_str = e.to_string().to_lowercase();
+                if is_modbus_exception_error(&err_str) {
+                    log::debug!("optional register {:#06x} not available: {}", addr, e);
+                    Ok(None)
+                } else {
+                    bail!("modbus transport/framing error reading optional register {:#06x}: {}", addr, e);
+                }
             }
             Err(_) => bail!("timed out reading register {:#06x}", addr),
         }
@@ -204,6 +209,17 @@ pub struct InverterSettings {
     pub battery_mode: u16,
     pub shutdown_soc_pct: f64,
     pub shutdown_voltage: f64,
+}
+
+/// Checks whether a Modbus error string indicates a standard protocol exception response
+/// (e.g. Illegal Function, Illegal Data Address) rather than a transport/framing error.
+fn is_modbus_exception_error(err_str: &str) -> bool {
+    err_str.contains("illegal")
+        || err_str.contains("exception")
+        || err_str.contains("not supported")
+        || err_str.contains("acknowledged")
+        || err_str.contains("server device busy")
+        || err_str.contains("negative acknowledge")
 }
 
 /// Register 194 -> relay state. Only 0 and 1 are defined; anything else is
@@ -315,7 +331,7 @@ impl InverterSettings {
                         ),
                     ));
                 }
-                if self.shutdown_soc_pct != configured_cutoff_soc {
+                if (self.shutdown_soc_pct - configured_cutoff_soc).abs() > 0.01 {
                     out.push((
                         Error,
                         format!(

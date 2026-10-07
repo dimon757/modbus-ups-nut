@@ -7,7 +7,7 @@ mod watchdog;
 mod wol;
 
 use anyhow::Result;
-use config::Config;
+use config::{Config, Endpoint};
 use persist::{ShutdownMarker, ShutdownState};
 use state::{Action, StateMachine};
 use std::time::{Duration, Instant};
@@ -57,7 +57,7 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
     let marker = ShutdownMarker::new(&cfg.state_file);
     let marker_state = marker.state();
     let resume = marker_state != ShutdownState::NotSet;
-    let mut pending_resume_endpoints = match &marker_state {
+    let pending_resume_endpoints = match &marker_state {
         ShutdownState::Incomplete { dispatched } => {
             let remaining: Vec<_> = cfg
                 .endpoints
@@ -85,21 +85,30 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
         ShutdownState::NotSet => None,
     };
     let mut sm = StateMachine::new(cfg.thresholds.clone(), resume);
-
-    // At most one of each in flight. A new shutdown cancels leftover WOL
-    // resends. Confirmed recovery stops the shutdown sequence and prevents
-    // any not-yet-executed destructive Proxmox step (hard VM stop or host
-    // poweroff). An already-issued guest shutdown may still finish remotely.
-    let mut shutdown_task: Option<(JoinHandle<()>, watch::Sender<bool>)> = None;
-    let mut wake_task: Option<JoinHandle<()>> = None;
-    // A shutdown sequence that recovery cancelled keeps running briefly to put
-    // right what it already did (restarting VMs it had stopped). Kept here so
-    // a new outage can cancel that clean-up before it fights the new shutdown.
-    let mut winding_down: Option<JoinHandle<()>> = None;
+    let mut sup = Supervisor {
+        cfg: &cfg,
+        marker,
+        shutdown_task: None,
+        wake_task: None,
+        winding_down: None,
+        pending_resume_endpoints,
+    };
 
     let poll_interval = Duration::from_secs(cfg.modbus.poll_interval_secs);
-    let (mut modbus_client, mut settings_checked) = connect_with_retry(&cfg, &mut wdt).await;
-    let mut settings_recheck_at = Instant::now() + SETTINGS_FIRST_RECHECK;
+    let strict = cfg.strict_inverter_checks();
+
+    // Connection state. The loop owns (re)connecting -- one attempt per
+    // cycle, never an inner retry loop -- so an inverter that stays
+    // unreachable still gets a comms-loss tick into the state machine every
+    // cycle (see `StateMachine::comms_lost`).
+    let mut modbus_client: Option<modbus::ModbusClient> = None;
+    let mut settings_checked = false;
+    let mut settings_recheck_at = Instant::now();
+    // How long after a connect that skipped the settings check to try it
+    // again: short after a fresh (re)connect, longer after a periodic retry.
+    let mut recheck_delay = SETTINGS_FIRST_RECHECK;
+    let mut unreadable_in_a_row = 0u32;
+    let mut last_reading_at = Instant::now();
 
     loop {
         wdt.feed();
@@ -107,27 +116,48 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
         // Monitoring started without a settings check because the inverter
         // would not give its settings up. Try again every so often, so a
         // cutoff or device-type problem is not missed for good.
-        if !settings_checked && Instant::now() >= settings_recheck_at {
+        if modbus_client.is_some() && !settings_checked && Instant::now() >= settings_recheck_at {
             log::info!("trying the inverter settings check again");
-            drop(modbus_client);
-            (modbus_client, settings_checked) = connect_with_retry(&cfg, &mut wdt).await;
-            settings_recheck_at = Instant::now() + SETTINGS_RECHECK_INTERVAL;
-            wdt.feed();
+            // Close the old port before opening it again, so the new
+            // connection never competes with the old one for the device.
+            modbus_client = None;
+            recheck_delay = SETTINGS_RECHECK_INTERVAL;
+            unreadable_in_a_row = 0;
         }
 
-        let reading = match modbus_client.poll().await {
+        if modbus_client.is_none() {
+            match connect_once(&cfg, strict, &mut unreadable_in_a_row).await {
+                ConnectOutcome::Ready(c, checked) => {
+                    unreadable_in_a_row = 0;
+                    settings_checked = checked;
+                    if !checked {
+                        settings_recheck_at = Instant::now() + recheck_delay;
+                    }
+                    modbus_client = Some(c);
+                    wdt.feed();
+                }
+                ConnectOutcome::Retry(pause) => {
+                    sup.handle(sm.comms_lost(last_reading_at.elapsed()));
+                    tokio::time::sleep(pause).await;
+                    continue;
+                }
+            }
+        }
+        let Some(client) = modbus_client.as_mut() else { continue };
+
+        let reading = match client.poll().await {
             Ok(r) => r,
             Err(e) => {
                 log::error!("modbus poll failed: {:#} -- reconnecting", e);
-                // Close the old port before opening it again, so the new
-                // connection never competes with the old one for the device.
-                drop(modbus_client);
-                (modbus_client, settings_checked) = connect_with_retry(&cfg, &mut wdt).await;
-                settings_recheck_at = Instant::now() + SETTINGS_FIRST_RECHECK;
+                modbus_client = None;
+                recheck_delay = SETTINGS_FIRST_RECHECK;
+                unreadable_in_a_row = 0;
+                sup.handle(sm.comms_lost(last_reading_at.elapsed()));
                 tokio::time::sleep(poll_interval).await;
                 continue;
             }
         };
+        last_reading_at = Instant::now();
 
         let (status, action) = sm.observe(reading);
 
@@ -146,55 +176,96 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
             status.low_battery
         );
 
-        // The state machine's own decision (voltage low or grid relay open),
-        // so this check can never disagree with it.
-        let grid_down = status.grid_lost;
-        if grid_down {
-            if let Some(remaining) = pending_resume_endpoints.take() {
-                if !remaining.is_empty() {
-                    log::warn!(
-                        "grid still down: resuming shutdown sequence for {} remaining endpoint(s)",
-                        remaining.len()
-                    );
-                    let opts = remote_shutdown::ShutdownOptions::from_config(&cfg);
-                    let (stop_tx, stop_rx) = watch::channel(false);
-                    let task = tokio::spawn(remote_shutdown::run_shutdown_sequence(
-                        remaining,
-                        opts,
-                        Some(marker.clone()),
-                        stop_rx,
-                    ));
-                    shutdown_task = Some((task, stop_tx));
-                } else {
-                    log::info!("all endpoints were already dispatched; marking shutdown complete");
-                    marker.mark_completed();
-                }
-            }
-        } else if let Some(ref remaining) = pending_resume_endpoints {
+        sup.resume_if_grid_down(status.grid_lost, status.grid_lost_confirmed);
+        sup.handle(action);
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// The background work the poll loop starts and stops: at most one of each
+/// in flight. A new shutdown cancels leftover WOL resends. Confirmed recovery
+/// stops the shutdown sequence and prevents any not-yet-executed destructive
+/// Proxmox step (hard VM stop or host poweroff). An already-issued guest
+/// shutdown may still finish remotely.
+struct Supervisor<'a> {
+    cfg: &'a Config,
+    marker: ShutdownMarker,
+    shutdown_task: Option<(JoinHandle<()>, watch::Sender<bool>)>,
+    wake_task: Option<JoinHandle<()>>,
+    /// A shutdown sequence that recovery cancelled keeps running briefly to
+    /// put right what it already did (restarting VMs it had stopped). Kept
+    /// here so a new outage can cancel that clean-up before it fights the
+    /// new shutdown.
+    winding_down: Option<JoinHandle<()>>,
+    /// After a restart mid-sequence: the endpoints not yet dispatched. Sent
+    /// once the grid is confirmed down, dropped once recovery is confirmed.
+    pending_resume_endpoints: Option<Vec<Endpoint>>,
+}
+
+impl Supervisor<'_> {
+    fn spawn_shutdown(&mut self, endpoints: Vec<Endpoint>) {
+        let opts = remote_shutdown::ShutdownOptions::from_config(self.cfg);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        // Spawned so the poll loop (and watchdog feed) keeps running while
+        // the sequence executes.
+        let task = tokio::spawn(remote_shutdown::run_shutdown_sequence(
+            endpoints,
+            opts,
+            Some(self.marker.clone()),
+            stop_rx,
+        ));
+        self.shutdown_task = Some((task, stop_tx));
+    }
+
+    /// Resumes an interrupted shutdown once the grid is *confirmed* down --
+    /// lost for the full `on_battery_debounce_secs`, like the normal path --
+    /// so one glitchy reading right after a reboot can't shut down the
+    /// endpoints the previous run never reached.
+    fn resume_if_grid_down(&mut self, grid_lost: bool, grid_lost_confirmed: bool) {
+        let Some(remaining) = self.pending_resume_endpoints.as_ref() else {
+            return;
+        };
+        if !grid_lost_confirmed {
             if !remaining.is_empty() {
                 log::debug!(
-                    "grid currently up; holding {} remaining shutdown(s) pending recovery confirmation",
+                    "grid {}; holding {} remaining shutdown(s) pending recovery confirmation",
+                    if grid_lost { "lost, not yet confirmed" } else { "currently up" },
                     remaining.len()
                 );
             }
+            return;
         }
+        let remaining = self.pending_resume_endpoints.take().unwrap_or_default();
+        if remaining.is_empty() {
+            log::info!("all endpoints were already dispatched; marking shutdown complete");
+            self.marker.mark_completed();
+        } else {
+            log::warn!(
+                "grid still down: resuming shutdown sequence for {} remaining endpoint(s)",
+                remaining.len()
+            );
+            self.spawn_shutdown(remaining);
+        }
+    }
 
+    fn handle(&mut self, action: Action) {
         match action {
             Action::TriggerShutdownSequence => {
-                pending_resume_endpoints.take();
-                if let Some(t) = winding_down.take() {
+                self.pending_resume_endpoints.take();
+                if let Some(t) = self.winding_down.take() {
                     if !t.is_finished() {
                         log::warn!("cancelling the clean-up of the previous cancelled shutdown");
                     }
                     t.abort();
                 }
-                if let Some(t) = wake_task.take() {
+                if let Some(t) = self.wake_task.take() {
                     if !t.is_finished() {
                         log::warn!("cancelling pending Wake-on-LAN resends");
                     }
                     t.abort();
                 }
-                if let Some((t, stop)) = shutdown_task.take() {
+                if let Some((t, stop)) = self.shutdown_task.take() {
                     if !t.is_finished() {
                         log::warn!("cancelling previous in-flight shutdown sequence");
                         let _ = stop.send(true);
@@ -203,22 +274,11 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
                 }
                 // Before anything goes out, so a power cut mid-sequence still
                 // leaves a record that recovery needs to wake the endpoints.
-                marker.set();
-                let endpoints = cfg.endpoints.clone();
-                let opts = remote_shutdown::ShutdownOptions::from_config(&cfg);
-                let (stop_tx, stop_rx) = watch::channel(false);
-                // Spawned so the poll loop (and watchdog feed) keeps running
-                // while the sequence executes.
-                let task = tokio::spawn(remote_shutdown::run_shutdown_sequence(
-                    endpoints,
-                    opts,
-                    Some(marker.clone()),
-                    stop_rx,
-                ));
-                shutdown_task = Some((task, stop_tx));
+                self.marker.set();
+                self.spawn_shutdown(self.cfg.endpoints.clone());
             }
             Action::TriggerWakeOnLan => {
-                if let Some(remaining) = pending_resume_endpoints.take() {
+                if let Some(remaining) = self.pending_resume_endpoints.take() {
                     if !remaining.is_empty() {
                         log::warn!(
                             "recovery confirmed: {} remaining endpoint(s) were spared from shutdown",
@@ -226,20 +286,25 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
                         );
                     }
                 }
-                if let Some((task, stop)) = shutdown_task.take() {
+                if let Some((task, stop)) = self.shutdown_task.take() {
                     if !task.is_finished() {
                         log::warn!("recovery confirmed -- stopping the rest of the shutdown sequence");
                         let _ = stop.send(true);
+                        // An older clean-up still running would otherwise be
+                        // detached and impossible to cancel later.
+                        if let Some(old) = self.winding_down.take() {
+                            old.abort();
+                        }
                         // Not dropped: it is still busy undoing what it had done.
-                        winding_down = Some(task);
+                        self.winding_down = Some(task);
                     }
                 }
-                let endpoints = cfg.endpoints.clone();
-                let addr = cfg.wol_broadcast_addr.clone();
-                let resends = cfg.thresholds.wol_resend_count;
-                let interval = Duration::from_secs(cfg.thresholds.wol_resend_interval_secs);
-                let marker = marker.clone();
-                wake_task = Some(tokio::spawn(async move {
+                let endpoints = self.cfg.endpoints.clone();
+                let addr = self.cfg.wol_broadcast_addr.clone();
+                let resends = self.cfg.thresholds.wol_resend_count;
+                let interval = Duration::from_secs(self.cfg.thresholds.wol_resend_interval_secs);
+                let marker = self.marker.clone();
+                self.wake_task = Some(tokio::spawn(async move {
                     wol::wake_all_repeated(&endpoints, &addr, resends, interval).await;
                     // Only after the last round: a reboot mid-way resumes
                     // latched and runs the whole round again on recovery.
@@ -248,8 +313,26 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
             }
             Action::None => {}
         }
+    }
+}
 
-        tokio::time::sleep(poll_interval).await;
+impl Drop for Supervisor<'_> {
+    fn drop(&mut self) {
+        if let Some((ref t, _)) = self.shutdown_task {
+            if !t.is_finished() {
+                log::warn!("bridge stopped while a shutdown sequence was still in flight");
+            }
+        }
+        if let Some(ref t) = self.winding_down {
+            if !t.is_finished() {
+                log::warn!("bridge stopped while VM restart clean-up was still in flight");
+            }
+        }
+        if let Some(ref t) = self.wake_task {
+            if !t.is_finished() {
+                log::info!("bridge stopped while Wake-on-LAN resends were still in flight");
+            }
+        }
     }
 }
 
@@ -316,58 +399,63 @@ fn unreadable_action(strict: bool, unreadable_in_a_row: u32) -> UnreadableAction
     }
 }
 
-/// Keeps feeding the watchdog while retrying: a missing RS485 adapter is a
-/// condition to log and wait out, not a hang that warrants rebooting the board.
-/// Once the port is open, checks the inverter's own cutoff settings against
-/// the config, so a change made on the inverter shows up in the log at the
-/// next (re)connect.
+/// What one connection attempt led to.
+enum ConnectOutcome {
+    /// Connected; `bool` = whether the settings check actually completed
+    /// (false: the settings could not be read, see `unreadable_action`).
+    Ready(modbus::ModbusClient, bool),
+    /// Not usable yet (port won't open, settings refused or unreadable).
+    /// The port is already closed; try again after this pause.
+    Retry(Duration),
+}
+
+/// One attempt to open the port and check the inverter's own cutoff
+/// settings against the config, so a change made on the inverter shows up
+/// in the log at the next (re)connect. A missing RS485 adapter is a
+/// condition to log and wait out, not a hang: the caller keeps feeding the
+/// watchdog -- and the state machine's comms-loss check -- between attempts.
 ///
-/// Returns the client and whether the settings check actually completed
-/// (false: the settings could not be read, see `unreadable_action`).
-async fn connect_with_retry(cfg: &Config, wdt: &mut watchdog::Watchdog) -> (modbus::ModbusClient, bool) {
-    let strict = cfg.strict_inverter_checks();
-    let mut unreadable_in_a_row = 0u32;
-    loop {
-        wdt.feed();
-        match modbus::ModbusClient::connect(&cfg.modbus) {
-            Ok(mut c) => match check_inverter_settings(&mut c, cfg).await {
-                SettingsCheck::Accept => return (c, true),
-                SettingsCheck::Refuse => {
-                    log::error!(
-                        "inverter safety checks failed -- retrying in 5s without entering the shutdown state machine"
-                    );
-                    drop(c);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
-                SettingsCheck::Unreadable => {
-                    unreadable_in_a_row += 1;
-                    match unreadable_action(strict, unreadable_in_a_row) {
-                        UnreadableAction::Reconnect => {
-                            log::warn!(
-                                "inverter settings unreadable ({} in a row) -- reconnecting and trying again",
-                                unreadable_in_a_row
-                            );
-                            drop(c);
-                            let pause = if strict { 5 } else { 1 };
-                            tokio::time::sleep(Duration::from_secs(pause)).await;
-                        }
-                        UnreadableAction::RunWithoutCheck => {
-                            log::error!(
-                                "inverter settings could not be read {} times in a row -- monitoring \
-                                 WITHOUT a settings check (cutoff, margin and device type are \
-                                 unverified); the check is tried again shortly. Set \
-                                 strict_inverter_checks = true to refuse to run instead",
-                                unreadable_in_a_row
-                            );
-                            return (c, false);
-                        }
+/// `unreadable_in_a_row` counts consecutive unreadable settings checks
+/// across calls; the caller resets it when a new (re)connect cycle starts.
+async fn connect_once(cfg: &Config, strict: bool, unreadable_in_a_row: &mut u32) -> ConnectOutcome {
+    match modbus::ModbusClient::connect(&cfg.modbus) {
+        Ok(mut c) => match check_inverter_settings(&mut c, cfg).await {
+            SettingsCheck::Accept => ConnectOutcome::Ready(c, true),
+            SettingsCheck::Refuse => {
+                log::error!(
+                    "inverter safety checks failed -- retrying in 5s without entering the shutdown state machine"
+                );
+                drop(c);
+                ConnectOutcome::Retry(Duration::from_secs(5))
+            }
+            SettingsCheck::Unreadable => {
+                *unreadable_in_a_row += 1;
+                match unreadable_action(strict, *unreadable_in_a_row) {
+                    UnreadableAction::Reconnect => {
+                        log::warn!(
+                            "inverter settings unreadable ({} in a row) -- reconnecting and trying again",
+                            unreadable_in_a_row
+                        );
+                        drop(c);
+                        let pause = if strict { 5 } else { 1 };
+                        ConnectOutcome::Retry(Duration::from_secs(pause))
+                    }
+                    UnreadableAction::RunWithoutCheck => {
+                        log::error!(
+                            "inverter settings could not be read {} times in a row -- monitoring \
+                             WITHOUT a settings check (cutoff, margin and device type are \
+                             unverified); the check is tried again shortly. Set \
+                             strict_inverter_checks = true to refuse to run instead",
+                            unreadable_in_a_row
+                        );
+                        ConnectOutcome::Ready(c, false)
                     }
                 }
-            },
-            Err(e) => {
-                log::error!("modbus connect failed: {:#} -- retrying in 5s", e);
-                tokio::time::sleep(Duration::from_secs(5)).await;
             }
+        },
+        Err(e) => {
+            log::error!("modbus connect failed: {:#} -- retrying in 5s", e);
+            ConnectOutcome::Retry(Duration::from_secs(5))
         }
     }
 }

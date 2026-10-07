@@ -64,6 +64,13 @@ if [ -f "$dir/ssh-hang" ] && grep -qxF "$host" "$dir/ssh-hang"; then
     exec sleep 600
 fi
 
+if [ -f "$dir/ssh-already-scheduled-$host" ]; then
+    echo "$(date +%T) $target REFUSED (1190 already scheduled): $remote_cmd" >> "$dir/ssh.log"
+    echo "A system shutdown has already been scheduled.(1190)" >&2
+    rm -f "$dir/ssh-already-scheduled-$host"
+    exit 1
+fi
+
 proxmox="$dir/proxmox/$host"
 if [ -d "$proxmox" ]; then
     case $remote_cmd in

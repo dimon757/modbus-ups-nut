@@ -266,7 +266,6 @@ pub async fn run_shutdown_sequence(
     } else {
         log::warn!("shutdown sequence stopped: recovery confirmed");
     }
-    log::warn!("shutdown sequence complete");
 }
 
 /// Resolves once `stop` is true. If the sender is gone without ever sending
@@ -850,7 +849,10 @@ fn is_timeout(err_str: &str) -> bool {
 
 fn is_guest_refusal(err_str: &str) -> bool {
     let s = err_str.to_lowercase();
-    s.contains("agent")
+    s.contains("no guest agent")
+        || s.contains("agent is not running")
+        || s.contains("agent not running")
+        || s.contains("agent error")
         || s.contains("not running")
         || s.contains("not supported")
         || s.contains("refused")
@@ -864,7 +866,9 @@ fn looks_like_failure(out: &str) -> bool {
         || o.contains("failed")
         || o.contains("not supported")
         || o.contains("refused")
-        || o.contains("agent")
+        || o.contains("no guest agent")
+        || o.contains("agent is not running")
+        || o.contains("agent not running")
 }
 
 fn names_suffix(vms: &[Vm]) -> String {
@@ -919,14 +923,35 @@ async fn ssh_exec_timeout(
         .context("spawning ssh")?;
 
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if ep.kind == EndpointKind::Windows
+            && (windows_shutdown_already_scheduled(&stderr) || windows_shutdown_already_scheduled(&stdout))
+        {
+            log::info!(
+                "{}: a shutdown is already scheduled on the host (error 1190) -- treating as accepted",
+                ep.name
+            );
+            return Ok(stdout.into_owned());
+        }
         bail!(
             "ssh to {} exited {:?}: stderr={}",
             ep.host,
             output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
+            stderr.trim()
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Windows `shutdown /s` refuses with ERROR_SHUTDOWN_IN_PROGRESS (1190,
+/// "A system shutdown has already been scheduled.(1190)") when one is
+/// already pending -- e.g. when a retry follows a call that timed out on
+/// our side but did run. The goal is reached, so that is not a failure.
+/// The exit status can't be used: ssh truncates it to 8 bits (1190 -> 166).
+/// The "(1190)" suffix is printed whatever the system language.
+fn windows_shutdown_already_scheduled(output: &str) -> bool {
+    output.contains("(1190)") || output.to_lowercase().contains("already been scheduled")
 }
 
 /// Endpoints whose host key isn't in the known_hosts file ssh will use.
@@ -1189,5 +1214,17 @@ mod resilience_tests {
         let (start, rest) = plan_restart(&waiting, "100 status: running\n");
         assert!(start.is_empty());
         assert_eq!(rest, waiting);
+    }
+
+    #[test]
+    fn windows_already_scheduled_is_recognised_in_any_language() {
+        assert!(windows_shutdown_already_scheduled(
+            "A system shutdown has already been scheduled.(1190)"
+        ));
+        assert!(windows_shutdown_already_scheduled(
+            "Das Herunterfahren des Systems wurde bereits geplant.(1190)"
+        ));
+        assert!(!windows_shutdown_already_scheduled("Access is denied.(5)"));
+        assert!(!windows_shutdown_already_scheduled(""));
     }
 }

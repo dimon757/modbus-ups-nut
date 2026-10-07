@@ -135,7 +135,7 @@ impl ShutdownMarker {
             .append(true)
             .open(&self.path)
             .context("opening marker file for append")?;
-        writeln!(f, "dispatched: {}", endpoint_name).context("writing dispatched endpoint")?;
+        writeln!(f, "dispatched: {}", endpoint_name.trim()).context("writing dispatched endpoint")?;
         f.sync_all().context("syncing file")?;
         sync_parent(&self.path)
     }

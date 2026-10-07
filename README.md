@@ -57,12 +57,14 @@ flowchart TD
 
     onbatt --> back1{"Grid back?<br/>voltage OK &<br/>relay closed"}
     back1 -- "yes" --> recover
-    back1 -- "no" --> low{"SOC at or below 30 % on<br/>2 of the last 3 readings?<br/><i>low_battery_soc</i>"}
+    back1 -- "no" --> comms{"RS485 comms lost<br/>for 300 s while on battery?<br/><i>comms_loss_shutdown_secs</i>"}
+    comms -- "yes: unobserved drain" --> write["Write + fsync<br/>shutdown marker"]
+    comms -- "no" --> low{"SOC at or below 30 % on<br/>2 of the last 3 readings?<br/><i>low_battery_soc</i>"}
     low -- "no" --> onbatt
-    low -- "yes" --> write["Write + fsync<br/>shutdown marker"]
+    low -- "yes" --> write
 
     write --> seq["SSH shutdown sequence<br/>(cancels any previous in-flight task)<br/>record successfully dispatched endpoint in manifest<br/>(failed endpoints & mid-flight VMs omitted for retry)<br/>concurrent background retries for booting hosts<br/>immediate advance for subsequent endpoints (stagger_secs on success)<br/>(default 300 s retry budget, or per-endpoint override)"]
-    seq --> win["Windows<br/>shutdown /s /t 60"]
+    seq --> win["Windows<br/>shutdown /s /t 60<br/><i>(error 1190 already-scheduled<br/>treated as accepted)</i>"]
     seq --> pve["Proxmox VE<br/>poweroff (pve-guests)<br/>or vms_then_poweroff<br/>(parallel qm shutdown --timeout)"]
     win --> done_seq
     pve --> done_seq
@@ -92,10 +94,13 @@ flowchart TD
     class wol,clear wake
 ```
 
-Around the whole loop: the watchdog is fed on every poll, so if the
-bridge hangs the box reboots itself. If the inverter stops answering, the
-bridge logs the error and keeps retrying; nothing is shut down on a
-missing reading.
+Around the whole loop: the watchdog is fed on every poll (and during
+reconnection cycles), so if the bridge hangs the box reboots itself.
+If the inverter stops answering while the grid is healthy, the bridge
+logs the error and keeps retrying without shutting down; if communication
+is lost while already on battery, `comms_loss_shutdown_secs` acts as a
+fail-safe and fires the shutdown sequence before the battery drains
+unobserved into the inverter's cutoff.
 
 ### State machine (`src/state.rs`)
 
@@ -107,7 +112,7 @@ stateDiagram-v2
     GridLostDebouncing --> Idle : grid back
     GridLostDebouncing --> OnBattery : still lost (debounce)
     OnBattery --> RecoveryDebouncing : grid back
-    OnBattery --> ShutdownLatched : SOC low, FIRE
+    OnBattery --> ShutdownLatched : SOC low OR comms lost on battery, FIRE
     ShutdownLatched --> RecoveryDebouncing : grid back
     RecoveryDebouncing --> ShutdownLatched : grid lost, sent or SOC low
     RecoveryDebouncing --> OnBattery : grid lost, SOC ok
@@ -117,7 +122,7 @@ stateDiagram-v2
 | Transition | Exact condition | Action |
 |---|---|---|
 | GridLostDebouncing → OnBattery | grid lost for `on_battery_debounce_secs` | -- |
-| OnBattery → ShutdownLatched | SOC ≤ `low_battery_soc` on 2 of the last 3 readings | **fire** the shutdown sequence (aborts any previous in-flight task) |
+| OnBattery → ShutdownLatched | SOC ≤ `low_battery_soc` on 2 of the last 3 readings OR RS485 comms lost for `comms_loss_shutdown_secs` while on battery | **fire** the shutdown sequence (aborts any previous in-flight task) |
 | ShutdownLatched → RecoveryDebouncing | grid back (whatever the SOC) | -- |
 | RecoveryDebouncing → ShutdownLatched | grid lost and the shutdown was already sent | -- (no second shutdown) |
 | RecoveryDebouncing → ShutdownLatched | grid lost, not yet sent, SOC low on 2 of the last 3 readings | **fire** the shutdown sequence (aborts any previous in-flight task) |
@@ -229,6 +234,10 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
   If a machine is still booting from a previous wake-up when shutdown is triggered, its initial SSH connection will fail (`Connection refused` / timeout). Rather than blocking the entire queue and delaying other endpoints, the bridge delegates the booting machine to an asynchronous background retry task (retrying every 2 s) and immediately advances to the next endpoints in the sequence. Ready machines shut down immediately to shed battery load without delay. Booting machines shut down as soon as their SSH daemon comes up.
 - **Extended, configurable retry budget for servers.**
   `ssh_connect_retry_secs` defaults to **300 s (5 minutes)**, allowing slow enterprise servers (UEFI memory training, IPMI, ZFS pool imports) ample time to finish booting. Individual endpoints can override this with their own `ssh_connect_retry_secs` in `[[endpoints]]` (up to 1800 s / 30 minutes).
+- **Windows shutdown command treats already-scheduled shutdowns (Error 1190) as accepted.**
+  If an SSH retry to a Windows machine occurs after a call that timed out client-side but actually initiated shutdown remotely, Windows returns `ERROR_SHUTDOWN_IN_PROGRESS` (1190: *"A system shutdown has already been scheduled"*). The bridge recognises the `(1190)` error suffix in any system language and treats the endpoint as successfully dispatched without retrying.
+- **Fail-safe shutdown on losing inverter communication mid-outage (`comms_loss_shutdown_secs`).**
+  If the inverter stops answering over RS485 (adapter unplugged, cable fault, serial driver issue) while the last valid reading indicated grid loss, the battery is draining unobserved. If no valid reading arrives for `comms_loss_shutdown_secs` (default 300 s / 5 minutes; 0 to disable), the bridge triggers the graceful shutdown sequence rather than letting the battery drain into the inverter's hard hardware cutoff. If the inverter went silent while the grid was healthy, it merely logs errors and retries indefinitely.
 - **If the inverter cuts output on its own hardware protection instead**
   (bridge missed the window, misconfiguration, whatever) -- there's no
   standby power on the endpoints' NICs, so WOL can't reach them. That path

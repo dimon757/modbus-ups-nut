@@ -88,6 +88,12 @@ stagger_secs = 30                # delay between each endpoint in the sequence
 # Set to 0 to disable retries.
 ssh_connect_retry_secs = 300      # seconds; default 300 (0 to disable)
 
+# Fail-safe: if the inverter stops answering (RS485 adapter or cable fault)
+# while the last valid reading said the grid was lost, fire the shutdown
+# sequence after this long without a valid reading -- the battery is
+# draining unseen. Never fires if the grid was up at the last reading.
+comms_loss_shutdown_secs = 300    # seconds; default 300 (0 to disable)
+
 # Wake-on-LAN is sent once on recovery, then resent this many times, this
 # far apart -- a machine still shutting down (e.g. Proxmox walking its VMs
 # down) when the first round goes out is woken by a later one. Make

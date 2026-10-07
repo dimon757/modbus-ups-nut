@@ -17,10 +17,10 @@ procedures: [docs/register-verification.md](docs/register-verification.md)
 (inverter registers) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)
 (Proxmox shutdown command).
 
-**Status (2026-10-07).** Level 1: 74 tests, all passing on Debian 13 (73 on
-Windows, where the one Linux-only test is skipped). Level 2: all 29 scenarios
+**Status (2026-10-07).** Level 1: 80 tests, all passing on Debian 13 (79 on
+Windows, where the one Linux-only test is skipped). Level 2: all 31 scenarios
 (A-M plus the 60 s SSH timeout, F2 for mid-sequence restart resumption, F3 for grid flicker during restart, F4 for failed endpoint retry & Proxmox timing, F5 for failed endpoint retry after sequence finishes, N1-N5 for the Proxmox method
-`vms_then_poweroff` against simulated VMs, O for host booting without head-of-line blocking, P for server booting with per-endpoint retry budget, Q for restarting a VM that was still shutting down when the grid returned, R for dropped VM shutdown logins, S/T for inverter-settings handling in default and strict mode, and U for a sagging grid with the grid relay open) passing on Debian 13 under WSL2.
+`vms_then_poweroff` against simulated VMs, O for host booting without head-of-line blocking, P for server booting with per-endpoint retry budget, Q for restarting a VM that was still shutting down when the grid returned, R for dropped VM shutdown logins, S/T for inverter-settings handling in default and strict mode, U for a sagging grid with the grid relay open, V for inverter comms loss fail-safe while on battery, and W for Windows error 1190 already-scheduled shutdown handling) passing on Debian 13 under WSL2.
 Earlier runs found and fixed a serial-port lock that stopped the bridge
 reconnecting, `setup.sh` hanging when its output was piped, misleading
 log lines, and SSH connection drop handling on Proxmox poweroff. Level 3
@@ -281,7 +281,7 @@ packets, real marker file -- but everything *around* it is simulated:
 | Sunsynk inverter on RS485 | `test/inverter_sim.py` on a virtual serial cable (`socat`) |
 | SSH to the 3 machines | `test/bin/ssh` -- writes to `/tmp/mub-test/ssh.log`; for the Proxmox host it also runs the bridge's `qm`/`systemctl` commands against **simulated VMs** (`test/pve-bin/`) |
 | Wake-on-LAN on the site LAN | packets to `127.0.0.1:40009`, shown by `test/wol_listen.py` |
-| 60 s / 180 s / 30 s / 2 min waits | 5 s / 10 s / 2 s / 5 s (`test/bridge-test.toml`) |
+| Real waits (60 s / 180 s / 30 s / 2 min / 300 s) | 5 s / 10 s / 2 s / 5 s / 5 s (`test/bridge-test.toml`) |
 | `/var/lib/modbus-ups-bridge/shutdown_fired` | `/tmp/mub-test/shutdown_fired` |
 
 ```mermaid
@@ -311,7 +311,7 @@ anything: the fake `ssh` never connects, Wake-on-LAN only goes to
 | `bridge-test-vms.toml` | The same, with Proxmox method `vms_then_poweroff` and a 15 s VM timeout -- for scenarios N (`./run-bridge.sh vms`) |
 | `run-bridge.sh` | Builds the bridge and starts it with the test config, the fake `ssh` first on `PATH`, and debug logging |
 | `requirements.txt` | pymodbus 3.15.0 and pyserial 3.5, pinned -- pymodbus changes its API between versions |
-| `CHECKLIST.md` | The 29 scenarios (A-M, F2, F3, F4, F5, N1-N5, O, P, Q, R, S, T, U), with the exact log lines to expect |
+| `CHECKLIST.md` | The 31 scenarios (A-M, F2, F3, F4, F5, N1-N5, O, P, Q, R, S, T, U, V, W), with the exact log lines to expect |
 
 ### How to run it
 
@@ -471,6 +471,8 @@ The simulator and bridge can keep running.
 | S | Inverter settings problems, default mode | `set 0`, `set 217`, `mute` | Wrong device refused; cutoff mismatch logged but still protecting; unreadable settings: one reconnect, then monitoring, check retried later |
 | T | `strict_inverter_checks = true` | `set 217`, `mute` | Refuses on errors and on unreadable settings until fixed; never runs unchecked |
 | U | Sagging grid | `grid 150`, then `relay 0`, `soc 25`, `relay 1`, `restore` | 150 V with the relay closed: nothing. Relay open: counts as outage, shutdown fires. Relay closed again: recovery starts |
+| V | Comms loss on battery | `outage`, wait for `OnBattery`, Ctrl+C simulator | Timed out readings; after 5 s fail-safe shutdown fires; restarts on recovery |
+| W | Windows shutdown error 1190 | `ssh-already-scheduled` file, `outage`, `soc 25` | ws-1 reports error 1190; treated as accepted without retry; sequence completes cleanly |
 
 #### Step 8 -- finish
 

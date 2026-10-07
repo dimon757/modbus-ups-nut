@@ -19,6 +19,7 @@ stagger_secs = 2                 # test timing: 2s
 wol_resend_count = 3             # 4 rounds total (1 initial + 3 resends)
 wol_resend_interval_secs = 5     # 5s interval
 ssh_connect_retry_secs = 6
+comms_loss_shutdown_secs = 5
 
 # Endpoint 1: Windows 11
 [[endpoints]]
