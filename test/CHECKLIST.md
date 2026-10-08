@@ -491,6 +491,34 @@ bridge, `rm /tmp/mub-test/ssh-fail`, **stop the simulator**, start the bridge ag
 
 ---
 
+## Y. Restart mid-sequence with grid up, then comms lost -- waiting endpoint spared
+
+**Do:** `./setup.sh reset`; write `# shutdown sequence in progress\ndispatched: ws-1\ndispatched: ws-2\n` to `/tmp/mub-test/shutdown_fired`; run simulator (`restore`, `soc 80`); run the bridge. Wait for `grid currently up; holding 1 remaining shutdown(s)`. **Stop the simulator** (inverter goes silent) before recovery debounce completes; wait 8 s. Then start simulator (`restore`, `soc 80`).
+
+**Expect:**
+- [ ] `indicates incomplete shutdown: 2 endpoint(s) already dispatched, 1 remaining: ["proxmox"]`
+- [ ] `grid currently up; holding 1 remaining shutdown(s) pending recovery confirmation`
+- [ ] inverter silence does NOT trigger `inverter silent: resuming shutdown sequence`: `proxmox` is spared
+- [ ] simulator restored: `state: RecoveryDebouncing -> Idle`
+- [ ] `recovery confirmed: 1 remaining endpoint(s) were spared from shutdown`
+- [ ] Wake-on-LAN rounds run and clear the marker; `10.99.0.3` is never contacted
+
+---
+
+## Z. Late endpoint command acceptance after recovery -- marker write skipped, not resurrected
+
+**Do:** `./setup.sh reset`; `echo 28 > /tmp/mub-test/ssh-delay-10.99.0.1`; run simulator (`restore`, `soc 80`); run the bridge; `outage`; wait for `OnBattery`; `soc 25`. When `shutting down ws-1` logs, immediately `restore` and `soc 80`. Wait for recovery to confirm and Wake-on-LAN round 4/4 to complete and clear the marker.
+
+**Expect:**
+- [ ] `recovery confirmed -- stopping the rest of the shutdown sequence`
+- [ ] `Wake-on-LAN round 1/4` ... `round 4/4` clears the marker
+- [ ] delayed `ws-1: shutdown command accepted` finishes after recovery and does NOT recreate the marker
+- [ ] `recovery confirmed -- not starting the remaining endpoints`: `ws-2` and `proxmox` are spared
+- [ ] `/tmp/mub-test/shutdown_fired` does not exist after recovery completes
+- [ ] bridge restart sees clean state without residual marker
+
+---
+
 ## What this does and doesn't prove
 
 **Proves:** the decision logic running on the real clock; the Modbus RTU

@@ -93,7 +93,7 @@ class AllLevel2Runner:
                 os.remove(p)
         if os.path.exists(DIR):
             for f in os.listdir(DIR):
-                if f.startswith("ssh-booting-") or f.startswith("ssh-flaky-") or f.startswith("ssh-already-scheduled-"):
+                if f.startswith("ssh-booting-") or f.startswith("ssh-flaky-") or f.startswith("ssh-already-scheduled-") or f.startswith("ssh-delay-"):
                     try:
                         os.remove(os.path.join(DIR, f))
                     except Exception:
@@ -1512,6 +1512,127 @@ class AllLevel2Runner:
         self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
         log("--> SCENARIO X: PASSED", Color.GREEN + Color.BOLD)
 
+    def test_scenario_y(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO Y: Restart mid-sequence, grid up then inverter silent -- waiting endpoint spared", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+
+        # Simulate marker created when ws-1 and ws-2 were dispatched, 1 remaining (proxmox)
+        with open(f"{DIR}/shutdown_fired", "w") as f:
+            f.write("# shutdown sequence in progress\ndispatched: ws-1\ndispatched: ws-2\n")
+
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.start_bridge()
+        line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 2 endpoint\(s\) already dispatched, 1 remaining", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        line = self.wait_for_bridge_log(r"grid currently up; holding 1 remaining shutdown\(s\) pending (?:recovery )?confirmation", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        # Before recovery debounce (10 s) completes, kill the simulator.
+        # The inverter is now silent, but the last reading saw the grid was UP.
+        # The comms loss fail-safe must NOT fire for the waiting endpoint!
+        if self.sim_proc:
+            self.sim_proc.kill()
+            self.sim_proc.wait()
+            self.sim_proc = None
+
+        self.wait_for_bridge_log(r"modbus poll failed: .* -- reconnecting", timeout=10)
+
+        # Sleep well past comms_loss_shutdown_secs (5 s in test config)
+        time.sleep(8)
+
+        # Verify no shutdown command was issued during this silence
+        with open(f"{DIR}/ssh.log") as f:
+            ssh_content = f.read()
+        assert "10.99.0.3" not in ssh_content, "proxmox must not be dispatched when last reading saw grid up"
+
+        for b_line in self.bridge_logs:
+            assert "inverter silent: resuming shutdown sequence" not in b_line, "fail-safe must not fire when grid was up"
+        log("  [OK] Waiting endpoint spared despite inverter silence because grid was seen up", Color.GREEN)
+
+        # Inverter comes back with grid up: normal recovery completes and spares the endpoint
+        self.start_simulator()
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        line = self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=20)
+        log(f"  [OK] {line}", Color.GREEN)
+        line = self.wait_for_bridge_log(r"recovery confirmed: 1 remaining endpoint\(s\) were spared from shutdown", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+        self.wait_for_bridge_log(r"Wake-on-LAN round 4/4", timeout=25)
+        time.sleep(1)
+        assert not os.path.exists(f"{DIR}/shutdown_fired"), "marker file must be cleared after recovery"
+
+        with open(f"{DIR}/ssh.log") as f:
+            assert "10.99.0.3" not in f.read(), "proxmox was never dispatched"
+        log("--> SCENARIO Y: PASSED", Color.GREEN + Color.BOLD)
+
+    def test_scenario_z(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO Z: Endpoint finishes shutdown after recovery confirmed -- marker write skipped", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+
+        # Configure ws-1 to delay in SSH by 28s so it completes after recovery and WOL clear the marker
+        with open(f"{DIR}/ssh-delay-10.99.0.1", "w") as f:
+            f.write("28\n")
+
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.start_bridge()
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
+
+        self.send_sim_cmd("outage")
+        self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
+        self.send_sim_cmd("soc 25")
+        self.wait_for_bridge_log(r"firing shutdown sequence", timeout=5)
+        self.wait_for_bridge_log(r"shutting down ws-1 \(10\.99\.0\.1\) via Windows", timeout=5)
+
+        # Restore grid immediately while ws-1 is still sleeping in ssh (28 s delay)
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.wait_for_bridge_log(r"state: ShutdownLatched -> RecoveryDebouncing", timeout=8)
+        self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
+
+        line = self.wait_for_bridge_log(r"recovery confirmed -- stopping the rest of the shutdown sequence", timeout=5)
+        log(f"  [OK] {line}", Color.GREEN)
+        self.wait_for_bridge_log(r"Wake-on-LAN round 1/4", timeout=5)
+
+        # Wait for Wake-on-LAN rounds to complete and clear the marker
+        self.wait_for_bridge_log(r"Wake-on-LAN round 4/4", timeout=25)
+        time.sleep(1)
+
+        # Now ws-1's delayed SSH completes after recovery was confirmed and marker was cleared
+        line = self.wait_for_bridge_log(r"ws-1: shutdown command accepted", timeout=15)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        line = self.wait_for_bridge_log(r"recovery confirmed -- not starting the remaining endpoints", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        time.sleep(1)
+
+        # Assert marker file does NOT exist and was not resurrected
+        assert not os.path.exists(f"{DIR}/shutdown_fired"), "marker file must not be resurrected after recovery"
+        log("  [OK] Marker file was not resurrected by late endpoint completion", Color.GREEN)
+
+        # Further endpoints were spared
+        with open(f"{DIR}/ssh.log") as f:
+            ssh_content = f.read()
+        assert "10.99.0.2" not in ssh_content, "ws-2 must not be contacted"
+        assert "10.99.0.3" not in ssh_content, "proxmox must not be contacted"
+
+        # Restart bridge to confirm clean state
+        self.stop_bridge()
+        self.start_bridge()
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V", timeout=10)
+        for b_line in self.bridge_logs:
+            assert "indicates incomplete shutdown" not in b_line, "bridge must not see residual marker"
+        log("--> SCENARIO Z: PASSED", Color.GREEN + Color.BOLD)
+
     def run(self, targets=None):
         all_scenarios = [
             ("a", "Scenario A", self.test_scenario_a),
@@ -1544,6 +1665,8 @@ class AllLevel2Runner:
             ("v", "Scenario V", self.test_scenario_v),
             ("w", "Scenario W", self.test_scenario_w),
             ("x", "Scenario X", self.test_scenario_x),
+            ("y", "Scenario Y", self.test_scenario_y),
+            ("z", "Scenario Z", self.test_scenario_z),
         ]
 
         if targets:

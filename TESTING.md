@@ -18,9 +18,9 @@ procedures: [docs/register-verification.md](docs/register-verification.md)
 (Proxmox shutdown command).
 
 **Status (2026-10-07).** Level 1: 83 tests, all passing on Debian 13 (82 on
-Windows, where the one Linux-only test is skipped). Level 2: all 32 scenarios
+Windows, where the one Linux-only test is skipped). Level 2: all 34 scenarios
 (A-M plus the 60 s SSH timeout, F2 for mid-sequence restart resumption, F3 for grid flicker during restart, F4 for failed endpoint retry & Proxmox timing, F5 for failed endpoint retry after sequence finishes, N1-N5 for the Proxmox method
-`vms_then_poweroff` against simulated VMs, O for host booting without head-of-line blocking, P for server booting with per-endpoint retry budget, Q for restarting a VM that was still shutting down when the grid returned, R for dropped VM shutdown logins, S/T for inverter-settings handling in default and strict mode, U for a sagging grid with the grid relay open, V for inverter comms loss fail-safe while on battery, and W for Windows error 1190 already-scheduled shutdown handling) passing on Debian 13 under WSL2.
+`vms_then_poweroff` against simulated VMs, O for host booting without head-of-line blocking, P for server booting with per-endpoint retry budget, Q for restarting a VM that was still shutting down when the grid returned, R for dropped VM shutdown logins, S/T for inverter-settings handling in default and strict mode, U for a sagging grid with the grid relay open, V for inverter comms loss fail-safe while on battery, W for Windows error 1190 already-scheduled shutdown handling, X for restart mid-sequence with inverter silent, Y for restart mid-sequence with grid up then inverter silent, and Z for endpoint finishing shutdown after recovery without resurrecting the marker) passing on Debian 13 under WSL2.
 Earlier runs found and fixed a serial-port lock that stopped the bridge
 reconnecting, `setup.sh` hanging when its output was piped, misleading
 log lines, and SSH connection drop handling on Proxmox poweroff. Level 3
@@ -477,6 +477,8 @@ The simulator and bridge can keep running.
 | V | Comms loss on battery | `outage`, wait for `OnBattery`, Ctrl+C simulator | Timed out readings; after 5 s fail-safe shutdown fires; restarts on recovery |
 | W | Windows shutdown error 1190 | `ssh-already-scheduled` file, `outage`, `soc 25` | ws-1 reports error 1190; treated as accepted without retry; sequence completes cleanly |
 | X | Restart mid-sequence, inverter silent | `ssh-fail`, stop the simulator before restarting | The endpoint the previous run never reached is shut down after `comms_loss_shutdown_secs`, without any reading |
+| Y | Restart mid-sequence, grid up then comms lost | Incomplete marker, `restore`, kill simulator before recovery | Last reading saw grid up; waiting endpoint spared despite silence; recovery wakes endpoints cleanly |
+| Z | Late endpoint command acceptance after recovery | `ssh-delay` file, `restore` mid-sequence | Endpoint completes command after recovery confirmed; marker write skipped; marker file not resurrected |
 
 #### Step 8 -- finish
 

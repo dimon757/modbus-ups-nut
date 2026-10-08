@@ -43,7 +43,7 @@ reset_esxi() {
 
 reset() {
     : > "$DIR/ssh.log"
-    rm -f "$DIR/ssh-fail" "$DIR/ssh-hang" "$DIR/shutdown_fired"
+    rm -f "$DIR/ssh-fail" "$DIR/ssh-hang" "$DIR/shutdown_fired" "$DIR"/ssh-delay-* 2>/dev/null || true
     reset_proxmox
     reset_esxi
 }

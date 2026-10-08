@@ -385,8 +385,8 @@ Full explanation and step-by-step instructions: [TESTING.md](TESTING.md).
    simulator on a virtual serial cable, with a fake `ssh` and a local
    Wake-on-LAN listener, on any Linux machine (including the N2840 before
    it goes to site). Needs no root and can't shut down anything. Start with
-   `test/setup.sh`, then follow the 32 scenarios in
-   [`test/CHECKLIST.md`](test/CHECKLIST.md) (30 automated in `test/auto_level2.py`).
+   `test/setup.sh`, then follow the 34 scenarios in
+   [`test/CHECKLIST.md`](test/CHECKLIST.md) (32 automated in `test/auto_level2.py`).
 3. **On site** -- the real inverter and machines: step 8 of the deployment
    sketch below, after [docs/register-verification.md](docs/register-verification.md)
    (inverter) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)
