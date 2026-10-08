@@ -462,7 +462,7 @@ keys, watchdog, logs, starting, updating -- is
    keys are pinned, so the bridge only talks to endpoints recorded there;
    it logs an error at startup for each one missing. For the workstations,
    `ssh-keyscan` records the key without logging in
-   (docs/installation.md, step 8).
+   (docs/installation.md, step 11).
 5. Enable the systemd service: `systemctl enable --now modbus-ups-bridge`,
    and check `journalctl -u modbus-ups-bridge` shows
    `inverter: device type 0x0300` and no errors.
