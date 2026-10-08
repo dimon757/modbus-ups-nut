@@ -92,6 +92,7 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
         wake_task: None,
         winding_down: None,
         pending_resume_endpoints,
+        grid_lost_at_last_reading: None,
     };
 
     let poll_interval = Duration::from_secs(cfg.modbus.poll_interval_secs);
@@ -176,6 +177,7 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
             status.low_battery
         );
 
+        sup.grid_lost_at_last_reading = Some(status.grid_lost);
         sup.resume_if_grid_down(status.grid_lost, status.grid_lost_confirmed);
         sup.handle(action);
 
@@ -201,6 +203,10 @@ struct Supervisor<'a> {
     /// After a restart mid-sequence: the endpoints not yet dispatched. Sent
     /// once the grid is confirmed down, dropped once recovery is confirmed.
     pending_resume_endpoints: Option<Vec<Endpoint>>,
+    /// What the last valid reading said about the grid (None: no reading yet
+    /// since this process started). The comms-loss fail-safe for waiting
+    /// endpoints must not fire when the last reading said the grid was up.
+    grid_lost_at_last_reading: Option<bool>,
 }
 
 impl Supervisor<'_> {
@@ -267,6 +273,7 @@ impl Supervisor<'_> {
             self.cfg.thresholds.comms_loss_shutdown_secs,
             since_last_reading,
             self.pending_resume_endpoints.is_some(),
+            self.grid_lost_at_last_reading != Some(false),
         ) {
             log::error!(
                 "no valid inverter reading for {} s after a restart that interrupted a shutdown -- \
@@ -428,9 +435,19 @@ fn unreadable_action(strict: bool, unreadable_in_a_row: u32) -> UnreadableAction
 }
 
 /// Whether the endpoints a restart left waiting should be shut down now
-/// because the inverter has been silent for the comms-loss limit.
-fn comms_resume_due(limit_secs: u64, since_last_reading: Duration, has_pending: bool) -> bool {
-    has_pending && limit_secs > 0 && since_last_reading >= Duration::from_secs(limit_secs)
+/// because the inverter has been silent for the comms-loss limit. Never when
+/// the last reading said the grid was up (grid_not_seen_up false): then the
+/// machines are spared, as the state machine's own fail-safe also does.
+fn comms_resume_due(
+    limit_secs: u64,
+    since_last_reading: Duration,
+    has_pending: bool,
+    grid_not_seen_up: bool,
+) -> bool {
+    has_pending
+        && grid_not_seen_up
+        && limit_secs > 0
+        && since_last_reading >= Duration::from_secs(limit_secs)
 }
 
 /// What one connection attempt led to.
@@ -628,12 +645,14 @@ mod tests {
     #[test]
     fn comms_resume_is_due_only_with_waiting_endpoints_and_the_limit_passed() {
         let limit = 300;
-        assert!(!comms_resume_due(limit, Duration::from_secs(299), true));
-        assert!(comms_resume_due(limit, Duration::from_secs(300), true));
-        assert!(comms_resume_due(limit, Duration::from_secs(3600), true));
+        assert!(!comms_resume_due(limit, Duration::from_secs(299), true, true));
+        assert!(comms_resume_due(limit, Duration::from_secs(300), true, true));
+        assert!(comms_resume_due(limit, Duration::from_secs(3600), true, true));
         // Nothing waiting, or the fail-safe switched off: never.
-        assert!(!comms_resume_due(limit, Duration::from_secs(3600), false));
-        assert!(!comms_resume_due(0, Duration::from_secs(3600), true));
+        assert!(!comms_resume_due(limit, Duration::from_secs(3600), false, true));
+        assert!(!comms_resume_due(0, Duration::from_secs(3600), true, true));
+        // The last reading said the grid was up: spared, however long the silence.
+        assert!(!comms_resume_due(limit, Duration::from_secs(3600), true, false));
     }
 
     #[test]

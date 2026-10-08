@@ -183,8 +183,12 @@ pub async fn run_shutdown_sequence(
             match ssh_exec_timeout(&ep, &opts, &cmd, SSH_TIMEOUT).await {
                 Ok(_) => {
                     log::info!("{}: shutdown command accepted", ep.name);
-                    if let Some(ref m) = marker {
-                        m.record_dispatched(&ep.name);
+                    // Not after recovery: the Wake-on-LAN round may already have
+                    // cleared the marker, and this would bring it back.
+                    if !*stop.borrow() {
+                        if let Some(ref m) = marker {
+                            m.record_dispatched(&ep.name);
+                        }
                     }
                     foreground_successes += 1;
                     need_stagger = true;
