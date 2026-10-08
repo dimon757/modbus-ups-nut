@@ -1469,6 +1469,49 @@ class AllLevel2Runner:
         self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
         log("--> SCENARIO W: PASSED", Color.GREEN + Color.BOLD)
 
+    def test_scenario_x(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO X: Restart mid-sequence, inverter silent -- remaining endpoint still shut down", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+        with open(f"{DIR}/ssh-fail", "w") as f:
+            f.write("10.99.0.2\n")
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.start_bridge()
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
+        self.send_sim_cmd("outage")
+        self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
+        self.send_sim_cmd("soc 25")
+        self.wait_for_bridge_log(r"shutdown sequence finished: 2/3 endpoint\(s\) succeeded; marker left incomplete for retry on restart", timeout=45)
+
+        # The bridge restarts (watchdog, power blip) and the inverter does not answer:
+        # nothing can confirm that the grid is down, so the waiting endpoint must go
+        # after comms_loss_shutdown_secs (5 s in the test config), not never.
+        self.stop_bridge()
+        os.remove(f"{DIR}/ssh-fail")
+        if self.sim_proc:
+            self.sim_proc.kill()
+            self.sim_proc.wait()
+            self.sim_proc = None
+        self.start_bridge()
+        line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 2 endpoint\(s\) already dispatched, 1 remaining", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+        line = self.wait_for_bridge_log(r"no valid inverter reading for \d+ s after a restart that interrupted a shutdown", timeout=20)
+        log(f"  [OK] {line}", Color.GREEN)
+        line = self.wait_for_bridge_log(r"inverter silent: resuming shutdown sequence for 1 remaining endpoint\(s\)", timeout=5)
+        log(f"  [OK] {line}", Color.GREEN)
+        self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=15)
+        self.wait_for_bridge_log(r"shutdown sequence complete: all 1 endpoint\(s\) succeeded", timeout=10)
+        log("  [OK] The endpoint the previous run never reached was shut down without any reading", Color.GREEN)
+
+        # Inverter comes back with the grid up: normal recovery.
+        self.start_simulator()
+        self.wait_for_bridge_log(r"state: ShutdownLatched -> RecoveryDebouncing", timeout=20)
+        self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
+        log("--> SCENARIO X: PASSED", Color.GREEN + Color.BOLD)
+
     def run(self, targets=None):
         all_scenarios = [
             ("a", "Scenario A", self.test_scenario_a),
@@ -1500,6 +1543,7 @@ class AllLevel2Runner:
             ("u", "Scenario U", self.test_scenario_u),
             ("v", "Scenario V", self.test_scenario_v),
             ("w", "Scenario W", self.test_scenario_w),
+            ("x", "Scenario X", self.test_scenario_x),
         ]
 
         if targets:

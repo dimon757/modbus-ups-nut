@@ -45,9 +45,10 @@ flowchart TD
     start(["Bridge starts"]) --> marker{"Shutdown marker<br/>state on SSD?"}
     marker -- "not set" --> poll
     marker -- "completed" --> latched
-    marker -- "incomplete manifest" --> m_grid{"Grid still down?"}
-    m_grid -- "yes: on battery" --> resume["Resume sequence for<br/>remaining endpoints"] --> done_seq["Mark completed"] --> latched
-    m_grid -- "no: grid flickered back" --> hold_wait["Hold remaining sequence<br/>pending recovery confirmation"] --> recover
+    marker -- "incomplete manifest" --> m_grid{"Inverter status<br/>after restart?"}
+    m_grid -- "grid down confirmed" --> resume["Resume sequence for<br/>remaining endpoints"] --> done_seq["Mark completed"] --> latched
+    m_grid -- "silent for 300 s<br/><i>comms_loss_shutdown_secs</i>" --> resume
+    m_grid -- "grid flickered back" --> hold_wait["Hold remaining sequence<br/>pending recovery confirmation"] --> recover
 
     poll["Poll the inverter every 5 s<br/>SOC · grid voltage · grid relay · load · battery power"] --> lost{"Grid lost?<br/>voltage below 100 V<br/>or grid relay open<br/><i>grid_lost_voltage · use_grid_relay</i>"}
     lost -- "no" --> poll
@@ -98,16 +99,16 @@ Around the whole loop: the watchdog is fed on every poll (and during
 reconnection cycles), so if the bridge hangs the box reboots itself.
 If the inverter stops answering while the grid is healthy, the bridge
 logs the error and keeps retrying without shutting down; if communication
-is lost while already on battery, `comms_loss_shutdown_secs` acts as a
-fail-safe and fires the shutdown sequence before the battery drains
-unobserved into the inverter's cutoff.
+is lost while already on battery (or following an interrupted shutdown restart),
+`comms_loss_shutdown_secs` acts as a fail-safe and fires (or resumes) the shutdown
+sequence before the battery drains unobserved into the inverter's cutoff.
 
 ### State machine (`src/state.rs`)
 
 ```mermaid
 stateDiagram-v2
     [*] --> Idle : no marker
-    [*] --> ShutdownLatched : marker found at startup (resumes remaining if incomplete & on battery)
+    [*] --> ShutdownLatched : marker found at startup (resumes remaining if incomplete & on battery or inverter silent)
     Idle --> GridLostDebouncing : grid lost
     GridLostDebouncing --> Idle : grid back
     GridLostDebouncing --> OnBattery : still lost (debounce)
@@ -227,6 +228,11 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
     If the grid drops back down before `recovery_debounce_secs` (3 minutes), the remaining
     sequence resumes immediately. If the grid stays healthy, remaining endpoints are
     spared and Wake-on-LAN follows.
+  - If the bridge restarts mid-sequence and the inverter is silent (cable fault, dead comms):
+    no reading arrives to confirm whether the grid is down, and the battery is draining unseen.
+    If no valid reading arrives for `comms_loss_shutdown_secs` (default 300 s), the fail-safe
+    resumes the sequence (`inverter silent: resuming shutdown sequence`), shutting down the
+    remaining endpoints before the inverter's hard hardware cutoff drops them ungracefully.
   - The marker file is removed only after the final Wake-on-LAN round finishes.
   Delete the file by hand only if you've brought the endpoints back yourself and don't
   want the wake-up round.
@@ -238,6 +244,7 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
   If an SSH retry to a Windows machine occurs after a call that timed out client-side but actually initiated shutdown remotely, Windows returns `ERROR_SHUTDOWN_IN_PROGRESS` (1190: *"A system shutdown has already been scheduled"*). The bridge recognises the `(1190)` error suffix in any system language and treats the endpoint as successfully dispatched without retrying.
 - **Fail-safe shutdown on losing inverter communication mid-outage (`comms_loss_shutdown_secs`).**
   If the inverter stops answering over RS485 (adapter unplugged, cable fault, serial driver issue) while the last valid reading indicated grid loss, the battery is draining unobserved. If no valid reading arrives for `comms_loss_shutdown_secs` (default 300 s / 5 minutes; 0 to disable), the bridge triggers the graceful shutdown sequence rather than letting the battery drain into the inverter's hard hardware cutoff. If the inverter went silent while the grid was healthy, it merely logs errors and retries indefinitely.
+  This fail-safe also protects a restart that interrupted a shutdown: if the inverter stays silent for `comms_loss_shutdown_secs` after a restart with an incomplete manifest, the endpoints the previous run never reached are shut down automatically.
 - **If the inverter cuts output on its own hardware protection instead**
   (bridge missed the window, misconfiguration, whatever) -- there's no
   standby power on the endpoints' NICs, so WOL can't reach them. That path
@@ -306,7 +313,9 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
    after the voltage does. If register 194 turns out wrong on your unit
    (reads open with the grid on), set `use_grid_relay = false` and rely on
    the voltage; if it shows `relay=n/a`, the firmware doesn't answer for it
-   and the bridge already falls back to the voltage alone.
+   and the bridge already falls back to the voltage alone (all standard Modbus
+   exception responses from the inverter are treated as register unreadable,
+   rather than transport faults, preventing reconnect loops on unsupported registers).
 
 The bridge checks at startup, and refuses to start on, a wrong SOC range,
 a `grid_lost_voltage` outside 1.0-400.0 V, a poll interval outside 1-10 s
@@ -376,8 +385,8 @@ Full explanation and step-by-step instructions: [TESTING.md](TESTING.md).
    simulator on a virtual serial cable, with a fake `ssh` and a local
    Wake-on-LAN listener, on any Linux machine (including the N2840 before
    it goes to site). Needs no root and can't shut down anything. Start with
-   `test/setup.sh`, then follow the 29 scenarios in
-   [`test/CHECKLIST.md`](test/CHECKLIST.md) (27 automated in `test/auto_level2.py`).
+   `test/setup.sh`, then follow the 32 scenarios in
+   [`test/CHECKLIST.md`](test/CHECKLIST.md) (30 automated in `test/auto_level2.py`).
 3. **On site** -- the real inverter and machines: step 8 of the deployment
    sketch below, after [docs/register-verification.md](docs/register-verification.md)
    (inverter) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)

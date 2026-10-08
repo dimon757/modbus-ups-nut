@@ -214,12 +214,22 @@ pub struct InverterSettings {
 /// Checks whether a Modbus error string indicates a standard protocol exception response
 /// (e.g. Illegal Function, Illegal Data Address) rather than a transport/framing error.
 fn is_modbus_exception_error(err_str: &str) -> bool {
-    err_str.contains("illegal")
+    // tokio-modbus renders every exception response as
+    // "Modbus function N: <description>" -- Illegal function / data address /
+    // data value, Server device failure / busy, Acknowledge, Memory parity
+    // error, Gateway path unavailable, Gateway target device failed to
+    // respond. The prefix covers all of them, so a firmware that answers
+    // an unsupported register with an unusual code is still "not available"
+    // (voltage-only fallback) and not a reason to reconnect on every poll.
+    // The keywords are a safety net for other library versions.
+    err_str.starts_with("modbus function")
+        || err_str.contains("illegal")
         || err_str.contains("exception")
         || err_str.contains("not supported")
-        || err_str.contains("acknowledged")
-        || err_str.contains("server device busy")
-        || err_str.contains("negative acknowledge")
+        || err_str.contains("acknowledge")
+        || err_str.contains("server device")
+        || err_str.contains("memory parity")
+        || err_str.contains("gateway")
 }
 
 /// Register 194 -> relay state. Only 0 and 1 are defined; anything else is
@@ -417,6 +427,37 @@ mod tests {
         assert!(s.contains("0x0102 (1.2)"), "{s}");
         assert!(s.contains("reg 54 0"), "{s}");
         assert!(s.contains("grid relay (reg 194) 1"), "{s}");
+    }
+
+    #[test]
+    fn every_modbus_exception_text_counts_as_register_not_available() {
+        for msg in [
+            "Modbus function 3: Illegal function",
+            "Modbus function 3: Illegal data address",
+            "Modbus function 3: Illegal data value",
+            "Modbus function 3: Server device failure",
+            "Modbus function 3: Acknowledge",
+            "Modbus function 3: Server device busy",
+            "Modbus function 3: Memory parity error",
+            "Modbus function 3: Gateway path unavailable",
+            "Modbus function 3: Gateway target device failed to respond",
+        ] {
+            assert!(is_modbus_exception_error(&msg.to_lowercase()), "{msg}");
+        }
+    }
+
+    #[test]
+    fn transport_and_framing_errors_are_not_exceptions() {
+        for msg in [
+            "Broken pipe (os error 32)",
+            "Input/output error (os error 5)",
+            "unexpected end of file",
+            "invalid response",
+            "Connection reset by peer",
+            "No such file or directory (os error 2)",
+        ] {
+            assert!(!is_modbus_exception_error(&msg.to_lowercase()), "{msg}");
+        }
     }
 
     #[test]

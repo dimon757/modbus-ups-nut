@@ -213,7 +213,7 @@ sudo systemctl start modbus-ups-bridge
 | `[0]` isn't 768 | Not the Sunsynk storage inverter on that port, or a different model | Check which device is wired to the port |
 | SOC appears at `[185]` instead of `[184]`, or values look shifted | Off by one | Make sure `-0` is in the command. If it is, the firmware counts differently -- see below |
 | Values match the display only roughly | Normal for power (it changes every second) | Compare over a few reads |
-| An error mentioning "Illegal data address" | That register doesn't exist on this firmware | Note it; see below |
+| An error mentioning "Illegal data address" (or Modbus function exception) | That register doesn't exist on this firmware (the bridge treats Modbus exception responses as unreadable rather than connection failures) | Note it; see below |
 
 ## If a register is wrong
 

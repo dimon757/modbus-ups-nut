@@ -477,6 +477,20 @@ Then `outage`; wait for `OnBattery`; `soc 25`.
 
 ---
 
+## X. Restart mid-sequence while the inverter is silent -- the waiting endpoint is still shut down
+
+**Do:** `./setup.sh reset`; `echo 10.99.0.2 > /tmp/mub-test/ssh-fail`; run the bridge; `outage`; wait for
+`OnBattery`; `soc 25`; wait for `shutdown sequence finished: 2/3 ... marker left incomplete`. Stop the
+bridge, `rm /tmp/mub-test/ssh-fail`, **stop the simulator**, start the bridge again.
+
+**Expect:**
+- [ ] `indicates incomplete shutdown: 2 endpoint(s) already dispatched, 1 remaining: ["ws-2"]`
+- [ ] after `comms_loss_shutdown_secs`: `no valid inverter reading for N s after a restart that interrupted a shutdown -- battery state unknown`
+- [ ] `inverter silent: resuming shutdown sequence for 1 remaining endpoint(s)`, then `ws-2: shutdown command accepted`
+- [ ] start the simulator again (grid up): `ShutdownLatched -> RecoveryDebouncing -> Idle`
+
+---
+
 ## What this does and doesn't prove
 
 **Proves:** the decision logic running on the real clock; the Modbus RTU

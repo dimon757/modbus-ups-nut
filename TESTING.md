@@ -17,8 +17,8 @@ procedures: [docs/register-verification.md](docs/register-verification.md)
 (inverter registers) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)
 (Proxmox shutdown command).
 
-**Status (2026-10-07).** Level 1: 80 tests, all passing on Debian 13 (79 on
-Windows, where the one Linux-only test is skipped). Level 2: all 31 scenarios
+**Status (2026-10-07).** Level 1: 83 tests, all passing on Debian 13 (82 on
+Windows, where the one Linux-only test is skipped). Level 2: all 32 scenarios
 (A-M plus the 60 s SSH timeout, F2 for mid-sequence restart resumption, F3 for grid flicker during restart, F4 for failed endpoint retry & Proxmox timing, F5 for failed endpoint retry after sequence finishes, N1-N5 for the Proxmox method
 `vms_then_poweroff` against simulated VMs, O for host booting without head-of-line blocking, P for server booting with per-endpoint retry budget, Q for restarting a VM that was still shutting down when the grid returned, R for dropped VM shutdown logins, S/T for inverter-settings handling in default and strict mode, U for a sagging grid with the grid relay open, V for inverter comms loss fail-safe while on battery, and W for Windows error 1190 already-scheduled shutdown handling) passing on Debian 13 under WSL2.
 Earlier runs found and fixed a serial-port lock that stopped the bridge
@@ -79,7 +79,7 @@ on immediately. A wait of **3600 s** can never pass during the test, so the
 state is guaranteed to stay put. That's also the main limit: the tests
 can't check exact timings ("fires at 60 s, not at 59 s").
 
-### The 74 tests
+### The 83 tests
 
 **State machine -- `src/state.rs`**
 
@@ -135,6 +135,8 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `protocol_summary_survives_unreadable_registers` | Firmware that doesn't answer for register 2, 54 or 194 gives `unreadable`, not an error |
 | `decode_grid_relay_accepts_only_0_and_1` | Register 194: 0 = open, 1 = closed, any other value or no answer = unknown |
 | `unreadable_grid_relay_warns_only_when_it_is_used` | A missing/odd register 194 logs a warning (voltage-only detection), unless `use_grid_relay = false` |
+| `every_modbus_exception_text_counts_as_register_not_available` | All nine Modbus exception messages of the library ("Modbus function N: ...") mean "register not available" (voltage-only fallback), not a transport fault |
+| `transport_and_framing_errors_are_not_exceptions` | Broken pipe, I/O error, EOF, invalid response and the like still make the caller reconnect |
 
 **Other modules**
 
@@ -160,6 +162,7 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `tests::non_strict_mode_keeps_running_on_no_battery_mode` (main.rs) | The same for "no battery" mode |
 | `tests::unreadable_settings_get_one_clean_reconnect_then_monitoring_goes_ahead` (main.rs) | Unreadable settings: reconnect once, then monitor without the check |
 | `tests::strict_mode_never_runs_without_the_settings_check` (main.rs) | In strict mode unreadable settings are retried forever |
+| `tests::comms_resume_is_due_only_with_waiting_endpoints_and_the_limit_passed` (main.rs) | After a restart that interrupted a shutdown, the waiting endpoints are shut down once the inverter has been silent for `comms_loss_shutdown_secs` -- never when nothing is waiting or the fail-safe is off |
 | `remote_shutdown::distinguishes_timeout_from_guest_refusal` | Error classification accurately separates VM shutdown timeouts from guest agent refusals |
 | `remote_shutdown::identifies_transient_connection_errors` | Distinguishes transient connection errors (connection refused, timed out, 255) from permanent auth or command failures |
 | `remote_shutdown::stop_signal_resolves_on_true_but_not_on_a_dropped_sender` | Confirmed recovery stops the sequence from starting more endpoints, but a replaced sequence doesn't skip its stagger delays |
@@ -473,6 +476,7 @@ The simulator and bridge can keep running.
 | U | Sagging grid | `grid 150`, then `relay 0`, `soc 25`, `relay 1`, `restore` | 150 V with the relay closed: nothing. Relay open: counts as outage, shutdown fires. Relay closed again: recovery starts |
 | V | Comms loss on battery | `outage`, wait for `OnBattery`, Ctrl+C simulator | Timed out readings; after 5 s fail-safe shutdown fires; restarts on recovery |
 | W | Windows shutdown error 1190 | `ssh-already-scheduled` file, `outage`, `soc 25` | ws-1 reports error 1190; treated as accepted without retry; sequence completes cleanly |
+| X | Restart mid-sequence, inverter silent | `ssh-fail`, stop the simulator before restarting | The endpoint the previous run never reached is shut down after `comms_loss_shutdown_secs`, without any reading |
 
 #### Step 8 -- finish
 

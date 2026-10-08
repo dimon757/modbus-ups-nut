@@ -92,6 +92,9 @@ ssh_connect_retry_secs = 300      # seconds; default 300 (0 to disable)
 # while the last valid reading said the grid was lost, fire the shutdown
 # sequence after this long without a valid reading -- the battery is
 # draining unseen. Never fires if the grid was up at the last reading.
+# Also covers a restart that interrupted a shutdown: if the inverter stays
+# silent this long after the restart, the endpoints the previous run never
+# reached are shut down too.
 comms_loss_shutdown_secs = 300    # seconds; default 300 (0 to disable)
 
 # Wake-on-LAN is sent once on recovery, then resent this many times, this

@@ -64,8 +64,12 @@ inverter: protocol version (reg 2) 0x0102 (1.2), reg 54 0, grid relay (reg 194) 
 ```
 
 Any of the three shows `unreadable` if the firmware doesn't answer for it;
-the cutoff checks carry on regardless. An unreadable register 194 also logs
-a warning, because grid-loss detection then rests on the voltage alone.
+the cutoff checks carry on regardless. The bridge treats all standard Modbus
+protocol exception responses (Illegal function, Illegal data address, Server device
+failure/busy, Acknowledge, Memory parity, Gateway errors) as "register not available"
+rather than a serial transport failure, so unsupported registers do not trigger
+reconnection loops on every poll. An unreadable register 194 also logs a warning,
+because grid-loss detection then rests on the voltage alone.
 
 **On delivery day:** note both values here, and compare `load=` in the
 debug log (`RUST_LOG=debug`) with the load on the inverter's display. If

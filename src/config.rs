@@ -154,7 +154,9 @@ pub struct Thresholds {
     /// the grid was lost and no valid reading has come in for this long, the
     /// shutdown sequence fires anyway -- the battery is draining unseen, and
     /// the inverter's hard cutoff would otherwise take everything down
-    /// ungracefully. 0 disables it.
+    /// ungracefully. Also applies after a restart that interrupted a
+    /// shutdown: if the inverter stays silent this long, the endpoints the
+    /// previous run never reached are shut down. 0 disables it.
     #[serde(default = "default_comms_loss_shutdown_secs")]
     pub comms_loss_shutdown_secs: u64,
 }

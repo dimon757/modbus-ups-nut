@@ -137,7 +137,7 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
                     wdt.feed();
                 }
                 ConnectOutcome::Retry(pause) => {
-                    sup.handle(sm.comms_lost(last_reading_at.elapsed()));
+                    sup.on_comms_lost(&mut sm, last_reading_at.elapsed());
                     tokio::time::sleep(pause).await;
                     continue;
                 }
@@ -152,7 +152,7 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
                 modbus_client = None;
                 recheck_delay = SETTINGS_FIRST_RECHECK;
                 unreadable_in_a_row = 0;
-                sup.handle(sm.comms_lost(last_reading_at.elapsed()));
+                sup.on_comms_lost(&mut sm, last_reading_at.elapsed());
                 tokio::time::sleep(poll_interval).await;
                 continue;
             }
@@ -236,16 +236,44 @@ impl Supervisor<'_> {
             }
             return;
         }
+        self.resume_remaining("grid still down");
+    }
+
+    /// Sends the shutdown to the endpoints a previous run never reached (or
+    /// marks the shutdown complete if there are none). `why` starts the log line.
+    fn resume_remaining(&mut self, why: &str) {
         let remaining = self.pending_resume_endpoints.take().unwrap_or_default();
         if remaining.is_empty() {
             log::info!("all endpoints were already dispatched; marking shutdown complete");
             self.marker.mark_completed();
         } else {
             log::warn!(
-                "grid still down: resuming shutdown sequence for {} remaining endpoint(s)",
+                "{}: resuming shutdown sequence for {} remaining endpoint(s)",
+                why,
                 remaining.len()
             );
             self.spawn_shutdown(remaining);
+        }
+    }
+
+    /// One cycle without a valid inverter reading. Feeds the state machine's
+    /// comms-loss fail-safe and, after a restart that interrupted a shutdown,
+    /// the same fail-safe for the endpoints still waiting: with the inverter
+    /// silent nothing will ever confirm that the grid is down, and the
+    /// battery is draining unseen.
+    fn on_comms_lost(&mut self, sm: &mut StateMachine, since_last_reading: Duration) {
+        self.handle(sm.comms_lost(since_last_reading));
+        if comms_resume_due(
+            self.cfg.thresholds.comms_loss_shutdown_secs,
+            since_last_reading,
+            self.pending_resume_endpoints.is_some(),
+        ) {
+            log::error!(
+                "no valid inverter reading for {} s after a restart that interrupted a shutdown -- \
+                 battery state unknown",
+                since_last_reading.as_secs()
+            );
+            self.resume_remaining("inverter silent");
         }
     }
 
@@ -397,6 +425,12 @@ fn unreadable_action(strict: bool, unreadable_in_a_row: u32) -> UnreadableAction
     } else {
         UnreadableAction::RunWithoutCheck
     }
+}
+
+/// Whether the endpoints a restart left waiting should be shut down now
+/// because the inverter has been silent for the comms-loss limit.
+fn comms_resume_due(limit_secs: u64, since_last_reading: Duration, has_pending: bool) -> bool {
+    has_pending && limit_secs > 0 && since_last_reading >= Duration::from_secs(limit_secs)
 }
 
 /// What one connection attempt led to.
@@ -589,6 +623,17 @@ mod tests {
         assert_eq!(unreadable_action(false, 1), UnreadableAction::Reconnect);
         assert_eq!(unreadable_action(false, 2), UnreadableAction::RunWithoutCheck);
         assert_eq!(unreadable_action(false, 7), UnreadableAction::RunWithoutCheck);
+    }
+
+    #[test]
+    fn comms_resume_is_due_only_with_waiting_endpoints_and_the_limit_passed() {
+        let limit = 300;
+        assert!(!comms_resume_due(limit, Duration::from_secs(299), true));
+        assert!(comms_resume_due(limit, Duration::from_secs(300), true));
+        assert!(comms_resume_due(limit, Duration::from_secs(3600), true));
+        // Nothing waiting, or the fail-safe switched off: never.
+        assert!(!comms_resume_due(limit, Duration::from_secs(3600), false));
+        assert!(!comms_resume_due(0, Duration::from_secs(3600), true));
     }
 
     #[test]
