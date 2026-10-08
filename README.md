@@ -47,7 +47,7 @@ flowchart TD
     marker -- "completed" --> latched
     marker -- "incomplete manifest" --> m_grid{"Inverter status<br/>after restart?"}
     m_grid -- "grid down confirmed" --> resume["Resume sequence for<br/>remaining endpoints"] --> done_seq["Mark completed"] --> latched
-    m_grid -- "silent for 300 s<br/><i>comms_loss_shutdown_secs</i>" --> resume
+    m_grid -- "silent for 300 s<br/>(grid not seen up)<br/><i>comms_loss_shutdown_secs</i>" --> resume
     m_grid -- "grid flickered back" --> hold_wait["Hold remaining sequence<br/>pending recovery confirmation"] --> recover
 
     poll["Poll the inverter every 5 s<br/>SOC · grid voltage · grid relay · load · battery power"] --> lost{"Grid lost?<br/>voltage below 100 V<br/>or grid relay open<br/><i>grid_lost_voltage · use_grid_relay</i>"}
@@ -64,7 +64,7 @@ flowchart TD
     low -- "no" --> onbatt
     low -- "yes" --> write
 
-    write --> seq["SSH shutdown sequence<br/>(cancels any previous in-flight task)<br/>record successfully dispatched endpoint in manifest<br/>(failed endpoints & mid-flight VMs omitted for retry)<br/>concurrent background retries for booting hosts<br/>immediate advance for subsequent endpoints (stagger_secs on success)<br/>(default 300 s retry budget, or per-endpoint override)"]
+    write --> seq["SSH shutdown sequence<br/>(cancels any previous in-flight task)<br/>record successfully dispatched endpoint in manifest<br/>(skip marker write if recovery confirmed)<br/>(failed endpoints & mid-flight VMs omitted for retry)<br/>concurrent background retries for booting hosts<br/>immediate advance for subsequent endpoints (stagger_secs on success)<br/>(default 300 s retry budget, or per-endpoint override)"]
     seq --> win["Windows<br/>shutdown /s /t 60<br/><i>(error 1190 already-scheduled<br/>treated as accepted)</i>"]
     seq --> pve["Proxmox VE<br/>poweroff (pve-guests)<br/>or vms_then_poweroff<br/>(parallel qm shutdown --timeout)"]
     win --> done_seq
@@ -99,16 +99,18 @@ Around the whole loop: the watchdog is fed on every poll (and during
 reconnection cycles), so if the bridge hangs the box reboots itself.
 If the inverter stops answering while the grid is healthy, the bridge
 logs the error and keeps retrying without shutting down; if communication
-is lost while already on battery (or following an interrupted shutdown restart),
-`comms_loss_shutdown_secs` acts as a fail-safe and fires (or resumes) the shutdown
-sequence before the battery drains unobserved into the inverter's cutoff.
+is lost while already on battery (or following an interrupted shutdown restart
+without the grid having been seen up), `comms_loss_shutdown_secs` acts as a fail-safe
+and fires (or resumes) the shutdown sequence before the battery drains unobserved
+into the inverter's cutoff. If the grid was seen healthy before comms dropped,
+waiting endpoints are spared from shutdown.
 
 ### State machine (`src/state.rs`)
 
 ```mermaid
 stateDiagram-v2
     [*] --> Idle : no marker
-    [*] --> ShutdownLatched : marker found at startup (resumes remaining if incomplete & on battery or inverter silent)
+    [*] --> ShutdownLatched : marker found at startup (resumes remaining if incomplete & on battery or inverter silent without grid up)
     Idle --> GridLostDebouncing : grid lost
     GridLostDebouncing --> Idle : grid back
     GridLostDebouncing --> OnBattery : still lost (debounce)

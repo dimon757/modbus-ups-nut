@@ -307,14 +307,14 @@ anything: the fake `ssh` never connects, Wake-on-LAN only goes to
 | `setup.sh` | Prepares everything: checks tools, creates a Python environment with the pinned pymodbus, verifies the simulator, starts the virtual cable. Also `reset`, `stop`, `clean` |
 | `inverter_sim.py` | The fake Sunsynk: Modbus RTU slave 1 at 9600 8N1, with the real register addresses; values editable while it runs |
 | `self_check.py` | Reads every simulator register back with a real Modbus client, to catch an address shifted by one before it confuses a test |
-| `bin/ssh` | The fake `ssh`: logs what would have been run; can pretend an endpoint is unreachable or hanging; for the fake Proxmox hosts, executes the bridge's `qm`/`systemctl` commands |
+| `bin/ssh` | The fake `ssh`: logs what would have been run; can pretend an endpoint is unreachable, delayed, or hanging; for the fake Proxmox hosts, executes the bridge's `qm`/`systemctl` commands |
 | `pve-bin/qm`, `pve-bin/systemctl` | The fake Proxmox tools: simulated VMs that shut down after a few seconds, hang, or have no QEMU guest agent, supporting `--timeout` and accurately simulating blocking Proxmox shutdown semantics; a `systemctl` that can refuse poweroff to test the `/sbin/poweroff` fallback |
 | `wol_listen.py` | Prints each Wake-on-LAN packet and the MAC it targets, grouped into rounds |
 | `bridge-test.toml` | The test config (short waits, local addresses, own marker and `known_hosts`, no watchdog), Proxmox method `poweroff` |
 | `bridge-test-vms.toml` | The same, with Proxmox method `vms_then_poweroff` and a 15 s VM timeout -- for scenarios N (`./run-bridge.sh vms`) |
 | `run-bridge.sh` | Builds the bridge and starts it with the test config, the fake `ssh` first on `PATH`, and debug logging |
 | `requirements.txt` | pymodbus 3.15.0 and pyserial 3.5, pinned -- pymodbus changes its API between versions |
-| `CHECKLIST.md` | The 31 scenarios (A-M, F2, F3, F4, F5, N1-N5, O, P, Q, R, S, T, U, V, W), with the exact log lines to expect |
+| `CHECKLIST.md` | The 34 scenarios (A-M, F2-F5, N1-N5, O, P, Q, R, S, T, U, V, W, X, Y, Z), with the exact log lines to expect |
 
 ### How to run it
 
