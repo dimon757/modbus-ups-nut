@@ -48,13 +48,17 @@ pub fn is_transient_connection_error(err: &anyhow::Error) -> bool {
     {
         return false;
     }
+    // Match concrete connection problems only. Do not treat a bare exit code
+    // 255 as transient: ssh uses 255 for many permanent failures (auth, host
+    // key, missing key file) that are already filtered above when their
+    // message text is present. A 255 with no recognisable phrase is unknown
+    // and must not burn the retry budget.
     s.contains("connection refused")
         || s.contains("timed out")
         || s.contains("timeout")
         || s.contains("no route to host")
         || s.contains("network is unreachable")
         || s.contains("connection reset")
-        || s.contains("exited some(255)")
 }
 
 /// ssh itself could not reach (or was turned away by) the host, as opposed to
@@ -851,13 +855,16 @@ fn is_timeout(err_str: &str) -> bool {
     s.contains("timed out") || s.contains("timeout")
 }
 
+/// Guest-side refusal to shut down (no agent, agent error, unsupported).
+/// Deliberately narrow: bare "not running" is too broad and can match
+/// unrelated qm messages. Agent phrases and "not supported" / "refused"
+/// cover the cases that should skip the soft-wait and go straight to hard stop.
 fn is_guest_refusal(err_str: &str) -> bool {
     let s = err_str.to_lowercase();
     s.contains("no guest agent")
         || s.contains("agent is not running")
         || s.contains("agent not running")
         || s.contains("agent error")
-        || s.contains("not running")
         || s.contains("not supported")
         || s.contains("refused")
 }
@@ -1084,6 +1091,8 @@ mod tests {
         assert!(is_guest_refusal("QEMU guest agent is not running"));
         assert!(is_guest_refusal("VM 108 qmp command 'guest-ping' failed - got timeout\nQEMU guest agent is not running"));
         assert!(!is_guest_refusal("VM 109 shutdown timed out"));
+        // Bare "not running" without agent context is not a guest refusal.
+        assert!(!is_guest_refusal("VM 100 not running"));
         assert!(is_timeout("VM 109 shutdown timed out"));
         assert!(is_timeout("ssh to 10.99.0.3 timed out after 30s"));
         assert!(!is_timeout("QEMU guest agent is not running"));
@@ -1141,6 +1150,15 @@ mod tests {
 
         let err_bad_opt = anyhow!("ssh to 10.99.0.1 exited Some(255): stderr=Bad configuration option: invalidoption");
         assert!(!is_transient_connection_error(&err_bad_opt));
+
+        // Bare exit 255 with no recognisable connection phrase must NOT be
+        // treated as transient (would otherwise retry permanent failures).
+        let err_bare_255 = anyhow!("ssh to 10.99.0.1 exited Some(255): stderr=");
+        assert!(!is_transient_connection_error(&err_bare_255));
+
+        // qm-style failure that happens to exit 255 is not a connection error.
+        let err_qm = anyhow!("ssh to 10.99.0.1 exited Some(255): stderr=VM 100 quit/powerdown failed");
+        assert!(!is_transient_connection_error(&err_qm));
     }
 }
 

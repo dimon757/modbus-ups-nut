@@ -1,7 +1,7 @@
 use crate::config::Endpoint;
 use anyhow::{bail, Context, Result};
-use std::net::UdpSocket;
 use std::time::Duration;
+use tokio::net::UdpSocket;
 
 /// Sends Wake-on-LAN magic packets to every endpoint. Called once the state
 /// machine confirms recovery: grid restored, healthy past the recovery
@@ -14,9 +14,9 @@ use std::time::Duration;
 /// protection cut output first (no standby power, so no WOL listener), this
 /// does nothing -- those machines instead depend on each one's own BIOS
 /// "Power On after AC Loss" setting once the inverter's output returns.
-pub fn wake_all(endpoints: &[Endpoint], broadcast_addr: &str) {
+pub async fn wake_all(endpoints: &[Endpoint], broadcast_addr: &str) {
     for ep in endpoints {
-        if let Err(e) = wake_one(&ep.mac_address, broadcast_addr) {
+        if let Err(e) = wake_one(&ep.mac_address, broadcast_addr).await {
             log::error!("WOL failed for {} ({}): {:#}", ep.name, ep.mac_address, e);
         } else {
             log::info!("WOL sent to {} ({})", ep.name, ep.mac_address);
@@ -44,11 +44,13 @@ pub async fn wake_all_repeated(
             tokio::time::sleep(resend_interval).await;
         }
         log::info!("Wake-on-LAN round {}/{}", round + 1, resend_count + 1);
-        wake_all(endpoints, broadcast_addr);
+        wake_all(endpoints, broadcast_addr).await;
     }
 }
 
-fn wake_one(mac: &str, broadcast_addr: &str) -> Result<()> {
+/// Async so the current_thread runtime is not blocked while the UDP send
+/// waits on the kernel. Uses tokio's UdpSocket rather than std::net.
+async fn wake_one(mac: &str, broadcast_addr: &str) -> Result<()> {
     let mac_bytes = parse_mac(mac)?;
 
     let mut packet = Vec::with_capacity(6 + 16 * 6);
@@ -57,12 +59,15 @@ fn wake_one(mac: &str, broadcast_addr: &str) -> Result<()> {
         packet.extend_from_slice(&mac_bytes);
     }
 
-    let socket = UdpSocket::bind("0.0.0.0:0").context("binding UDP socket for WOL")?;
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .context("binding UDP socket for WOL")?;
     socket
         .set_broadcast(true)
         .context("enabling SO_BROADCAST")?;
     socket
         .send_to(&packet, broadcast_addr)
+        .await
         .with_context(|| format!("sending magic packet to {}", broadcast_addr))?;
 
     Ok(())
@@ -116,7 +121,9 @@ mod tests {
 
     #[tokio::test]
     async fn sends_first_round_plus_resends() {
-        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // Receiver stays on std::net so the test does not need a second
+        // runtime task just to read packets.
+        let rx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let addr = rx.local_addr().unwrap().to_string();
         let eps = [endpoint("AA:BB:CC:DD:EE:01"), endpoint("AA-BB-CC-DD-EE-02")];

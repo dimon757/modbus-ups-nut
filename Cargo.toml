@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.77"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process", "signal", "net"] }
 tokio-serial = "5"
 tokio-modbus = { version = "0.11", default-features = false, features = ["rtu"] }
 serde = { version = "1", features = ["derive"] }
