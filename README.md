@@ -271,7 +271,7 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
    | 2 | protocol version (logged only) | e.g. 0x0102 = 1.2 |
    | 54 | V119 "AC power ratio" / V117 "EEPROM initial" (logged only, never written) | -- |
    | 150 | grid side voltage L1-N (decides grid lost, together with 194) | 0.1 V |
-   | 178 | load side total power | 1 W, signed |
+   | 178 | load side total power | 1 W, unsigned |
    | 184 | battery SOC | 1 %, 0-100 |
    | 190 | battery output power | 1 W, signed |
    | 194 | grid side relay status: 0 open (off grid) / 1 closed (on grid) -- with 150, decides grid lost | -- |
@@ -321,7 +321,8 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
 
 The bridge checks at startup, and refuses to start on, a wrong SOC range,
 a `grid_lost_voltage` outside 1.0-400.0 V, a poll interval outside 1-10 s
-(the watchdog margin), a malformed `wol_broadcast_addr` or MAC address,
+(the watchdog margin), a malformed `wol_broadcast_addr` (or global `255.255.255.255`),
+`wol_resend_count` > 100, `wol_resend_interval_secs` > 3600, a malformed MAC address,
 duplicate endpoint names, and (when `vms_then_poweroff` is selected) a WOL
 window shorter than `vm_shutdown_timeout_secs`. SSH key files that are missing
 or readable by others are logged as errors (ssh refuses such keys).

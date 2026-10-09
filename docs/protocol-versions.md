@@ -29,7 +29,7 @@ line, plus all the registers the bridge reads.
 | 213 | Battery-mode check | 0 voltage / 1 capacity / 2 none | same | None |
 | 217 | Inverter's own SOC cutoff check | 1 % | same | None |
 | 220 | Inverter's own voltage cutoff | 0.01 V | same | None |
-| 178 | Load power (**logged only**) | 1 W, signed | 1 W -- or **10 W** depending on register 54 | Optional (see below) |
+| 178 | Load power (**logged only**) | 1 W, unsigned | 1 W -- or **10 W** depending on register 54 | Optional (see below) |
 | 190 | Battery power (**logged only**) | 1 W, signed | same entry, but listed under register 54 | Optional (see below) |
 | 54 | Protocol hint (**logged only**) | "EEPROM initial enabled" -- a command register | **"AC power ratio"**: whether registers 167-172, 176-179, 185 and 190 are in 1 W or 10 W units | Optional (see below) |
 

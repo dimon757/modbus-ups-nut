@@ -104,8 +104,8 @@ comms_loss_shutdown_secs = 300    # seconds; default 300 (0 to disable)
 # count x interval comfortably longer than your slowest shutdown.
 # When using vms_then_poweroff, count * interval must be at least
 # vm_shutdown_timeout_secs (checked at startup).
-wol_resend_count = 8             # default 8
-wol_resend_interval_secs = 120   # default 120 -> rounds over ~16 minutes
+wol_resend_count = 8             # default 8 (max 100)
+wol_resend_interval_secs = 120   # default 120 -> rounds over ~16 minutes (max 3600)
 
 # Shutdown order: top to bottom. Workstations first, then Proxmox hosts, is a
 # reasonable default -- adjust to taste.

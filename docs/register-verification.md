@@ -118,7 +118,7 @@ healthy-looking voltage. Step 6 checks both without grid.
 
 ## Step 4 -- Power (registers 178 and 190)
 
-These are signed, so use `int16`:
+Register 190 is signed (charging is negative, discharging is positive), so use `int16`:
 
 ```bash
 mbpoll -m rtu -a 1 -b 9600 -P none -t 4:int16 -0 -1 -r 178,190 /dev/ttyS0
