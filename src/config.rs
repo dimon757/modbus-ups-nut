@@ -283,6 +283,18 @@ impl Config {
                 t.comms_loss_shutdown_secs
             );
         }
+        if t.wol_resend_count > 100 {
+            bail!(
+                "thresholds.wol_resend_count is {} -- must be <= 100",
+                t.wol_resend_count
+            );
+        }
+        if t.wol_resend_interval_secs > 3600 {
+            bail!(
+                "thresholds.wol_resend_interval_secs is {} s -- must be <= 3600",
+                t.wol_resend_interval_secs
+            );
+        }
         // The watchdog must be fed more often than its timeout (30 s for the
         // N2840's iTCO_wdt). The longest gap between feeds is one poll
         // interval plus settings reads at a (re)connect (four required
@@ -297,12 +309,19 @@ impl Config {
         }
         // Checked now, not at the first real recovery -- a typo here would
         // otherwise only show up as a failed wake-up after an outage.
-        self.wol_broadcast_addr.parse::<std::net::SocketAddr>().map_err(|_| {
+        let wol_sock: std::net::SocketAddr = self.wol_broadcast_addr.parse().map_err(|_| {
             anyhow::anyhow!(
                 "wol_broadcast_addr {:?} is not an IP:port, e.g. \"192.168.1.255:9\"",
                 self.wol_broadcast_addr
             )
         })?;
+        if wol_sock.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::BROADCAST) {
+            bail!(
+                "wol_broadcast_addr {:?} uses 255.255.255.255 (global broadcast) -- use the endpoints' \
+                 subnet broadcast (e.g. \"192.168.1.255:9\") so packets route to the correct network interface",
+                self.wol_broadcast_addr
+            );
+        }
         if !(10..=1800).contains(&self.proxmox.vm_shutdown_timeout_secs) {
             bail!(
                 "proxmox.vm_shutdown_timeout_secs is {} -- must be 10-1800",
@@ -310,7 +329,7 @@ impl Config {
             );
         }
         if self.proxmox.method == ProxmoxMethod::VmsThenPoweroff {
-            let total_wol_window = u64::from(t.wol_resend_count) * t.wol_resend_interval_secs;
+            let total_wol_window = u64::from(t.wol_resend_count).saturating_mul(t.wol_resend_interval_secs);
             if total_wol_window < self.proxmox.vm_shutdown_timeout_secs {
                 bail!(
                     "WOL window ({} resends x {}s = {}s) is shorter than proxmox.vm_shutdown_timeout_secs ({}s) -- \
@@ -474,6 +493,21 @@ mod tests {
     fn wol_address_without_port_is_rejected_at_startup() {
         let err = validate_err(&example_with("\"192.168.1.255:9\"", "\"192.168.1.255\""));
         assert!(err.contains("wol_broadcast_addr"), "{err}");
+    }
+
+    #[test]
+    fn wol_global_broadcast_address_is_rejected() {
+        let err = validate_err(&example_with("\"192.168.1.255:9\"", "\"255.255.255.255:9\""));
+        assert!(err.contains("255.255.255.255"), "{err}");
+    }
+
+    #[test]
+    fn wol_resend_count_and_interval_limits() {
+        let err_count = validate_err(&example_with("wol_resend_count = 8", "wol_resend_count = 101"));
+        assert!(err_count.contains("wol_resend_count"), "{err_count}");
+
+        let err_interval = validate_err(&example_with("wol_resend_interval_secs = 120", "wol_resend_interval_secs = 3601"));
+        assert!(err_interval.contains("wol_resend_interval_secs"), "{err_interval}");
     }
 
     #[test]

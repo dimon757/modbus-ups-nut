@@ -52,7 +52,7 @@ const GRID_VOLTAGE_SCALE: f64 = 10.0;
 /// falls back to the voltage alone.
 const REG_GRID_RELAY: u16 = 194;
 
-/// Load side total power, 1 W, signed int.
+/// Load side total power, 1 W, unsigned int.
 const REG_LOAD_POWER: u16 = 178;
 
 /// Battery capacity (SOC), 1 %, range 0-100.
@@ -144,7 +144,7 @@ impl ModbusClient {
             battery_soc_pct: soc_raw as f64,
             grid_voltage: grid_raw as f64 / GRID_VOLTAGE_SCALE,
             grid_relay_closed: decode_grid_relay(relay_raw),
-            load_power_w: load_raw as i16 as f64,
+            load_power_w: load_raw as f64,
             battery_power_w: batt_raw as i16 as f64,
         })
     }

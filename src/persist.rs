@@ -39,16 +39,15 @@ impl ShutdownMarker {
         Self { path: path.into() }
     }
 
+    #[allow(dead_code)]
     pub fn is_set(&self) -> bool {
         self.path.exists()
     }
 
     pub fn state(&self) -> ShutdownState {
-        if !self.is_set() {
-            return ShutdownState::NotSet;
-        }
         let content = match fs::read_to_string(&self.path) {
             Ok(c) => c,
+            Err(e) if e.kind() == ErrorKind::NotFound => return ShutdownState::NotSet,
             Err(e) => {
                 log::error!("failed to read shutdown marker {:?}: {}", self.path, e);
                 return ShutdownState::Completed;
