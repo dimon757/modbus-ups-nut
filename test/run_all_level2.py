@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automated runner for ALL Level 2 test scenarios (A through P).
+"""Automated runner for ALL Level 2 test scenarios (A through Z, 34 scenarios).
 Configuration:
   - 2 Windows 11 endpoints (ws-1: 10.99.0.1, ws-2: 10.99.0.2)
   - 1 Proxmox endpoint (proxmox: 10.99.0.3, method: vms_then_poweroff)
@@ -87,6 +87,9 @@ class AllLevel2Runner:
     def reset_env(self):
         with open(f"{DIR}/ssh.log", "w") as f:
             f.truncate(0)
+        if os.path.exists(f"{DIR}/wol.log"):
+            with open(f"{DIR}/wol.log", "w") as f:
+                f.truncate(0)
         for f in ["ssh-fail", "ssh-hang", "shutdown_fired"]:
             p = f"{DIR}/{f}"
             if os.path.exists(p):
@@ -120,7 +123,7 @@ class AllLevel2Runner:
 
     def start_wol_listener(self):
         log("--> Starting Wake-on-LAN listener on 127.0.0.1:40009...", Color.CYAN)
-        wol_log = open(f"{DIR}/wol.log", "w")
+        wol_log = open(f"{DIR}/wol.log", "a")
         self.wol_proc = subprocess.Popen(
             ["python3", f"{TEST_DIR}/wol_listen.py", "40009"],
             stdout=wol_log,
@@ -216,7 +219,7 @@ class AllLevel2Runner:
                 self.wol_proc.kill()
         self.stop_existing()
 
-    # --- ALL 22 SCENARIOS ---
+    # --- ALL 34 SCENARIOS ---
 
     def test_scenario_a(self):
         log("\n=======================================================", Color.BOLD)
@@ -239,6 +242,11 @@ class AllLevel2Runner:
 
         assert os.path.getsize(f"{DIR}/ssh.log") == 0
         assert not os.path.exists(f"{DIR}/shutdown_fired")
+        if os.path.exists(f"{DIR}/wol.log"):
+            with open(f"{DIR}/wol.log") as f:
+                wol_lines = [l for l in f.read().splitlines() if "WOL ->" in l]
+                assert not wol_lines, f"Expected no WOL packets in Scenario A, got: {wol_lines}"
+        assert not [l for l in self.bridge_logs if "Wake-on-LAN round" in l], "No WOL rounds expected in Scenario A"
         log("--> SCENARIO A: PASSED", Color.GREEN + Color.BOLD)
 
     def test_scenario_b(self):
@@ -261,6 +269,11 @@ class AllLevel2Runner:
 
         assert os.path.getsize(f"{DIR}/ssh.log") == 0
         assert not os.path.exists(f"{DIR}/shutdown_fired")
+        if os.path.exists(f"{DIR}/wol.log"):
+            with open(f"{DIR}/wol.log") as f:
+                wol_lines = [l for l in f.read().splitlines() if "WOL ->" in l]
+                assert not wol_lines, f"Expected no WOL packets in Scenario B, got: {wol_lines}"
+        assert not [l for l in self.bridge_logs if "state:" in l and "OnBattery" in l], "Must never enter OnBattery in Scenario B"
         log("--> SCENARIO B: PASSED", Color.GREEN + Color.BOLD)
 
     def test_scenario_c(self):
@@ -288,6 +301,11 @@ class AllLevel2Runner:
 
         assert os.path.getsize(f"{DIR}/ssh.log") == 0
         assert not os.path.exists(f"{DIR}/shutdown_fired")
+        if os.path.exists(f"{DIR}/wol.log"):
+            with open(f"{DIR}/wol.log") as f:
+                wol_lines = [l for l in f.read().splitlines() if "WOL ->" in l]
+                assert not wol_lines, f"Expected no WOL packets in Scenario C, got: {wol_lines}"
+        assert not [l for l in self.bridge_logs if "Wake-on-LAN round" in l], "No WOL rounds expected in Scenario C"
         log("--> SCENARIO C: PASSED", Color.GREEN + Color.BOLD)
 
     def test_scenario_d(self):
@@ -712,6 +730,60 @@ class AllLevel2Runner:
         self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
         log("--> SCENARIO H: PASSED", Color.GREEN + Color.BOLD)
 
+    def test_scenario_i(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO I: Inverter Cutoff Leaves No Margin -- Logged as Error", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.send_sim_cmd("set 217 30")
+        self.start_bridge()
+
+        line = self.wait_for_bridge_log(r"inverter settings: inverter cuts its output at 30% SOC, but low_battery_soc is 30%", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        line = self.wait_for_bridge_log(r"inverter settings: config inverter_cutoff_soc is 20% but the inverter is set to 30%", timeout=5)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        line = self.wait_for_bridge_log(r"inverter settings have errors .* monitoring continues anyway", timeout=5)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        line = self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V", timeout=10)
+        log(f"  [OK] Monitoring continues despite errors: {line}", Color.GREEN)
+
+        self.stop_bridge()
+        self.send_sim_cmd("set 217 20")
+
+        assert os.path.getsize(f"{DIR}/ssh.log") == 0
+        assert not os.path.exists(f"{DIR}/shutdown_fired")
+        log("--> SCENARIO I: PASSED", Color.GREEN + Color.BOLD)
+
+    def test_scenario_j(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO J: Inverter in Voltage Mode -- Warning Logged", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.send_sim_cmd("set 213 0")
+        self.start_bridge()
+
+        line = self.wait_for_bridge_log(r"inverter settings: inverter manages the battery by VOLTAGE", timeout=10)
+        log(f"  [OK] {line}", Color.GREEN)
+
+        line = self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V", timeout=10)
+        log(f"  [OK] Monitoring continues in voltage mode: {line}", Color.GREEN)
+
+        self.stop_bridge()
+        self.send_sim_cmd("set 213 1")
+
+        assert os.path.getsize(f"{DIR}/ssh.log") == 0
+        assert not os.path.exists(f"{DIR}/shutdown_fired")
+        log("--> SCENARIO J: PASSED", Color.GREEN + Color.BOLD)
+
     def test_scenario_k(self):
         log("\n=======================================================", Color.BOLD)
         log("RUNNING SCENARIO K: New outage during WOL rounds -- rounds cancelled", Color.BOLD)
@@ -739,12 +811,15 @@ class AllLevel2Runner:
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
         self.send_sim_cmd("soc 25")
 
-        line = self.wait_for_bridge_log(r"cancelling pending Wake-on-LAN resends|firing shutdown sequence", timeout=10)
+        line = self.wait_for_bridge_log(r"cancelling pending Wake-on-LAN resends", timeout=10)
         log(f"  [OK] {line}", Color.GREEN)
 
         self.wait_for_bridge_log(r"shutdown sequence complete", timeout=25)
         assert os.path.exists(f"{DIR}/shutdown_fired")
         log("  [OK] Marker file re-created", Color.GREEN)
+
+        post_cancel_rounds = [l for l in self.bridge_logs[self.log_cursor:] if "Wake-on-LAN round" in l]
+        assert not post_cancel_rounds, f"Expected no WOL rounds after cancellation, found: {post_cancel_rounds}"
 
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
@@ -829,7 +904,9 @@ class AllLevel2Runner:
         log(f"  [OK] {line}", Color.GREEN)
 
         log("    Waiting for ws-2 SSH 60s timeout to elapse...", Color.CYAN)
-        line = self.wait_for_bridge_log(r"recovery confirmed -- not starting the remaining endpoints", timeout=80)
+        line = self.wait_for_bridge_log(r"failed to shut down ws-2: ssh to 10\.99\.0\.2 timed out after 60s", timeout=80)
+        log(f"  [OK] {line}", Color.GREEN)
+        line = self.wait_for_bridge_log(r"recovery confirmed -- not starting the remaining endpoints", timeout=10)
         log(f"  [OK] {line}", Color.GREEN)
 
         with open(f"{DIR}/ssh.log") as f:
@@ -1647,6 +1724,8 @@ class AllLevel2Runner:
             ("f5", "Scenario F5", self.test_scenario_f5),
             ("g", "Scenario G", self.test_scenario_g),
             ("h", "Scenario H", self.test_scenario_h),
+            ("i", "Scenario I", self.test_scenario_i),
+            ("j", "Scenario J", self.test_scenario_j),
             ("k", "Scenario K", self.test_scenario_k),
             ("l", "Scenario L", self.test_scenario_l),
             ("m", "Scenario M", self.test_scenario_m),
