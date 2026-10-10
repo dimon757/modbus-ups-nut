@@ -305,16 +305,21 @@ anything: the fake `ssh` never connects, Wake-on-LAN only goes to
 | File | Role |
 |---|---|
 | `setup.sh` | Prepares everything: checks tools, creates a Python environment with the pinned pymodbus, verifies the simulator, starts the virtual cable. Also `reset`, `stop`, `clean` |
+| `auto_level2.py` | Automated runner for all Level 2 scenarios (35 scenarios for 3 endpoints, 27 for single Windows 11). Also available as `run_all_level2.py` |
+| `bridge.toml` | Active test configuration (default: 2 Windows 11 endpoints + 1 Proxmox host with `vms_then_poweroff`) |
+| `bridge-1win.toml` | Test configuration for 1 Windows 11 endpoint (`ws-1`, no Proxmox) |
+| `bridge-3endpoints.toml` | Reference configuration for 2 Windows 11 endpoints + 1 Proxmox host |
+| `switch-config.sh` / `.bat` | One-command switcher between `1win` and `3ep` topologies (also `switch_config.py`) |
 | `inverter_sim.py` | The fake Sunsynk: Modbus RTU slave 1 at 9600 8N1, with the real register addresses; values editable while it runs |
 | `self_check.py` | Reads every simulator register back with a real Modbus client, to catch an address shifted by one before it confuses a test |
 | `bin/ssh` | The fake `ssh`: logs what would have been run; can pretend an endpoint is unreachable, delayed, or hanging; for the fake Proxmox hosts, executes the bridge's `qm`/`systemctl` commands |
 | `pve-bin/qm`, `pve-bin/systemctl` | The fake Proxmox tools: simulated VMs that shut down after a few seconds, hang, or have no QEMU guest agent, supporting `--timeout` and accurately simulating blocking Proxmox shutdown semantics; a `systemctl` that can refuse poweroff to test the `/sbin/poweroff` fallback |
 | `wol_listen.py` | Prints each Wake-on-LAN packet and the MAC it targets, grouped into rounds |
-| `bridge-test.toml` | The test config (short waits, local addresses, own marker and `known_hosts`, no watchdog), Proxmox method `poweroff` |
+| `bridge-test.toml` | Legacy test config (short waits, local addresses, own marker and `known_hosts`, no watchdog), Proxmox method `poweroff` |
 | `bridge-test-vms.toml` | The same, with Proxmox method `vms_then_poweroff` and a 15 s VM timeout -- for scenarios N (`./run-bridge.sh vms`) |
 | `run-bridge.sh` | Builds the bridge and starts it with the test config, the fake `ssh` first on `PATH`, and debug logging |
 | `requirements.txt` | pymodbus 3.15.0 and pyserial 3.5, pinned -- pymodbus changes its API between versions |
-| `CHECKLIST.md` | The 34 scenarios (A-M, F2-F5, N1-N5, O, P, Q, R, S, T, U, V, W, X, Y, Z), with the exact log lines to expect |
+| `CHECKLIST.md` | The 35 scenarios (A-M, F2-F5, N1-N5, O-Z, AA), with the exact log lines to expect |
 
 ### How to run it
 
@@ -494,6 +499,69 @@ the real service on the N2840 in step 1, start it again:
 ```bash
 sudo systemctl start modbus-ups-bridge
 ```
+
+### Automated Level 2 Test Runner (`auto_level2.py`)
+
+Instead of running four separate terminal panes manually, `test/auto_level2.py`
+automates the entire Level 2 suite end-to-end. It sets up the virtual serial cable,
+starts the Wake-on-LAN listener, drives the inverter simulator, launches the bridge
+binary, injects faults and scenario conditions, and asserts log lines, SSH command logs,
+and WOL packets.
+
+#### Topologies Supported
+
+1. **Default: 3 Endpoints (2 Windows 11 + 1 Proxmox `vms_then_poweroff`)**
+   - Config file: `test/bridge.toml`
+   - Endpoints: `ws-1` (10.99.0.1), `ws-2` (10.99.0.2), `proxmox` (10.99.0.3)
+   - Executes all **35 scenarios** (A–M, F2–F5, N1–N5, O–Z, AA), including Proxmox VM lifecycle and recovery.
+
+2. **Single Endpoint: 1 Windows 11 (`ws-1`)**
+   - Config file: `test/bridge-1win.toml`
+   - Endpoints: `ws-1` (10.99.0.1), no Proxmox endpoint
+   - Executes all **27 applicable scenarios** (automatically adapts assertions and skips Proxmox-specific VM scenarios N1–N5, P, Q, R).
+
+#### Running with CLI Flags (Zero Configuration Changes)
+
+You can run the suite in either mode on the fly without modifying configuration files:
+
+```bash
+cd test
+
+# Run all 35 scenarios with the default 3-endpoint topology:
+python3 auto_level2.py
+
+# Run all 27 scenarios with the 1 Windows 11 topology:
+python3 auto_level2.py --1win
+
+# Run specific scenarios (e.g. A, B, and C):
+python3 auto_level2.py a b c
+python3 auto_level2.py --1win a b c
+```
+
+#### Switching Active Configurations Globally
+
+To switch the active `test/bridge.toml` and root `bridge.toml` between topologies:
+
+- **Windows (PowerShell / Command Prompt)**:
+  ```cmd
+  .\switch-config.bat 1win      # Switch to 1 Windows 11 endpoint
+  .\switch-config.bat 3ep       # Switch to 2 Windows 11 + 1 Proxmox (default)
+  .\switch-config.bat status    # Display currently active configuration
+  ```
+
+- **Linux / WSL**:
+  ```bash
+  ./switch-config.sh 1win       # Switch to 1 Windows 11 endpoint
+  ./switch-config.sh 3ep        # Switch to 2 Windows 11 + 1 Proxmox (default)
+  ./switch-config.sh status     # Display currently active configuration
+  ```
+
+- **Cross-Platform Python**:
+  ```bash
+  python3 switch_config.py 1win
+  python3 switch_config.py 3ep
+  python3 switch_config.py status
+  ```
 
 ### Simulator commands
 

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 
 TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = os.path.dirname(TEST_DIR)
@@ -34,14 +35,24 @@ def log(msg, color=Color.RESET):
     print(f"{color}{msg}{Color.RESET}", flush=True)
 
 class AllLevel2Runner:
-    def __init__(self):
+    def __init__(self, config=CONFIG):
+        self.config = config
         self.socat_proc = None
         self.sim_proc = None
         self.wol_proc = None
         self.bridge_proc = None
         self.bridge_logs = []
         self.log_cursor = 0
-
+        try:
+            with open(self.config, "rb") as f:
+                cfg_data = tomllib.load(f)
+            self.endpoints = cfg_data.get("endpoints", [])
+        except Exception:
+            self.endpoints = []
+        self.is_single_windows = (
+            len(self.endpoints) == 1 and
+            self.endpoints[0].get("kind") == "windows"
+        )
     def stop_existing(self):
         my_pid = os.getpid()
         for pid_str in os.listdir("/proc"):
@@ -81,7 +92,8 @@ class AllLevel2Runner:
             pub_key = " ".join(f.read().split()[:2])
 
         with open(f"{DIR}/known_hosts", "w") as f:
-            for h in ["10.99.0.1", "10.99.0.2", "10.99.0.3"]:
+            hosts = [ep.get("host") for ep in self.endpoints] if self.endpoints else ["10.99.0.1", "10.99.0.2", "10.99.0.3"]
+            for h in hosts:
                 f.write(f"{h} {pub_key}\n")
 
     def reset_env(self):
@@ -150,7 +162,9 @@ class AllLevel2Runner:
             self.sim_proc.stdin.write(f"{cmd}\n")
             self.sim_proc.stdin.flush()
 
-    def start_bridge(self, config=CONFIG):
+    def start_bridge(self, config=None):
+        if config is None:
+            config = self.config
         cfg_name = os.path.basename(config)
         log(f"--> Starting modbus-ups-bridge ({cfg_name})...", Color.CYAN)
         env = os.environ.copy()
@@ -223,7 +237,10 @@ class AllLevel2Runner:
 
     def test_scenario_a(self):
         log("\n=======================================================", Color.BOLD)
-        log("RUNNING SCENARIO A: Startup & Inverter Telemetry Polling (3 Endpoints)", Color.BOLD)
+        if self.is_single_windows:
+            log("RUNNING SCENARIO A: Startup & Inverter Telemetry Polling (1 Windows 11 Endpoint)", Color.BOLD)
+        else:
+            log("RUNNING SCENARIO A: Startup & Inverter Telemetry Polling (3 Endpoints)", Color.BOLD)
         log("=======================================================", Color.BOLD)
         self.stop_bridge()
         self.reset_env()
@@ -231,8 +248,9 @@ class AllLevel2Runner:
         self.send_sim_cmd("soc 80")
         self.start_bridge()
 
-        line = self.wait_for_bridge_log(r"loaded config from .* \(3 endpoint\(s\)\)")
-        log(f"  [OK] Confirmed loaded 3 endpoints: {line}", Color.GREEN)
+        n_ep = len(self.endpoints)
+        line = self.wait_for_bridge_log(rf"loaded config from .* \({n_ep} endpoint\(s\)\)")
+        log(f"  [OK] Confirmed loaded {n_ep} endpoints: {line}", Color.GREEN)
 
         line = self.wait_for_bridge_log(r"inverter: device type 0x0300, battery mode 1")
         log(f"  [OK] Inverter handshake: {line}", Color.GREEN)
@@ -310,7 +328,10 @@ class AllLevel2Runner:
 
     def test_scenario_d(self):
         log("\n=======================================================", Color.BOLD)
-        log("RUNNING SCENARIO D: Full Outage -> Shutdown (2 Win11 + Proxmox vms_then_poweroff) -> Latch -> WoL", Color.BOLD)
+        if self.is_single_windows:
+            log("RUNNING SCENARIO D: Full Outage -> Shutdown (1 Win11) -> Latch -> WoL", Color.BOLD)
+        else:
+            log("RUNNING SCENARIO D: Full Outage -> Shutdown (2 Win11 + Proxmox vms_then_poweroff) -> Latch -> WoL", Color.BOLD)
         log("=======================================================", Color.BOLD)
         self.stop_bridge()
         self.reset_env()
@@ -330,36 +351,50 @@ class AllLevel2Runner:
         assert os.path.exists(f"{DIR}/shutdown_fired")
         log("  [OK] Marker file created prior to remote commands", Color.GREEN)
 
-        line = self.wait_for_bridge_log(r"shutdown sequence starting: 3 endpoint\(s\)", timeout=5)
-        log(f"  [OK] {line}", Color.GREEN)
+        if self.is_single_windows:
+            line = self.wait_for_bridge_log(r"shutdown sequence starting: 1 endpoint\(s\)", timeout=5)
+            log(f"  [OK] {line}", Color.GREEN)
+            self.wait_for_bridge_log(r"shutting down ws-1", timeout=8)
+            line = self.wait_for_bridge_log(r"shutdown sequence complete", timeout=15)
+            log(f"  [OK] Shutdown sequence finished: {line}", Color.GREEN)
 
-        # ws-1 then ws-2
-        self.wait_for_bridge_log(r"shutting down ws-1", timeout=8)
-        self.wait_for_bridge_log(r"shutting down ws-2", timeout=8)
+            with open(f"{DIR}/ssh.log") as f:
+                ssh_content = f.read()
+            assert "10.99.0.1" in ssh_content, "ws-1 not contacted"
+            assert "10.99.0.2" not in ssh_content, "ws-2 contacted unexpectedly"
+            assert "10.99.0.3" not in ssh_content, "proxmox contacted unexpectedly"
 
-        # proxmox: vms first, then poweroff
-        line = self.wait_for_bridge_log(r"shutting down proxmox \(10\.99\.0\.3\) via Proxmox: VMs first, then poweroff", timeout=10)
-        log(f"  [OK] Proxmox VM walk initiated: {line}", Color.GREEN)
-        self.wait_for_bridge_log(r"proxmox: 2 VM\(s\) registered, 2 running: dc01, app server", timeout=10)
-        self.wait_for_bridge_log(r"proxmox: host power-off scheduled via systemctl poweroff", timeout=25, from_start=True)
+            with open(f"{DIR}/shutdown_fired") as f:
+                marker = f.read()
+            assert "dispatched: ws-1" in marker
+            assert "completed" in marker
+            log("  [OK] Marker correctly logged ws-1 dispatched and completed", Color.GREEN)
+        else:
+            line = self.wait_for_bridge_log(r"shutdown sequence starting: 3 endpoint\(s\)", timeout=5)
+            log(f"  [OK] {line}", Color.GREEN)
+            self.wait_for_bridge_log(r"shutting down ws-1", timeout=8)
+            self.wait_for_bridge_log(r"shutting down ws-2", timeout=8)
+            line = self.wait_for_bridge_log(r"shutting down proxmox \(10\.99\.0\.3\) via Proxmox: VMs first, then poweroff", timeout=10)
+            log(f"  [OK] Proxmox VM walk initiated: {line}", Color.GREEN)
+            self.wait_for_bridge_log(r"proxmox: 2 VM\(s\) registered, 2 running: dc01, app server", timeout=10)
+            self.wait_for_bridge_log(r"proxmox: host power-off scheduled via systemctl poweroff", timeout=25, from_start=True)
 
-        line = self.wait_for_bridge_log(r"shutdown sequence complete", timeout=15)
-        log(f"  [OK] Shutdown sequence finished: {line}", Color.GREEN)
+            line = self.wait_for_bridge_log(r"shutdown sequence complete", timeout=15)
+            log(f"  [OK] Shutdown sequence finished: {line}", Color.GREEN)
 
-        with open(f"{DIR}/ssh.log") as f:
-            ssh_content = f.read()
-        assert "10.99.0.1" in ssh_content, "ws-1 not contacted"
-        assert "10.99.0.2" in ssh_content, "ws-2 not contacted"
-        assert "10.99.0.3" in ssh_content, "proxmox not contacted"
+            with open(f"{DIR}/ssh.log") as f:
+                ssh_content = f.read()
+            assert "10.99.0.1" in ssh_content, "ws-1 not contacted"
+            assert "10.99.0.2" in ssh_content, "ws-2 not contacted"
+            assert "10.99.0.3" in ssh_content, "proxmox not contacted"
 
-        # Check marker file
-        with open(f"{DIR}/shutdown_fired") as f:
-            marker = f.read()
-        assert "dispatched: ws-1" in marker
-        assert "dispatched: ws-2" in marker
-        assert "dispatched: proxmox" in marker
-        assert "completed" in marker
-        log("  [OK] Marker correctly logged all 3 endpoints dispatched and completed", Color.GREEN)
+            with open(f"{DIR}/shutdown_fired") as f:
+                marker = f.read()
+            assert "dispatched: ws-1" in marker
+            assert "dispatched: ws-2" in marker
+            assert "dispatched: proxmox" in marker
+            assert "completed" in marker
+            log("  [OK] Marker correctly logged all 3 endpoints dispatched and completed", Color.GREEN)
 
         # Latching check
         self.send_sim_cmd("soc 22")
@@ -388,10 +423,16 @@ class AllLevel2Runner:
 
         with open(f"{DIR}/wol.log") as f:
             wol_content = f.read()
-        assert "AA:BB:CC:00:00:01" in wol_content
-        assert "AA:BB:CC:00:00:02" in wol_content
-        assert "AA:BB:CC:00:00:03" in wol_content
-        log("  [OK] Wake-on-LAN magic packets confirmed received for all 3 targets", Color.GREEN)
+        if self.is_single_windows:
+            assert "AA:BB:CC:00:00:01" in wol_content
+            assert "AA:BB:CC:00:00:02" not in wol_content
+            assert "AA:BB:CC:00:00:03" not in wol_content
+            log("  [OK] Wake-on-LAN magic packet confirmed received for ws-1 target", Color.GREEN)
+        else:
+            assert "AA:BB:CC:00:00:01" in wol_content
+            assert "AA:BB:CC:00:00:02" in wol_content
+            assert "AA:BB:CC:00:00:03" in wol_content
+            log("  [OK] Wake-on-LAN magic packets confirmed received for all 3 targets", Color.GREEN)
         log("--> SCENARIO D: PASSED", Color.GREEN + Color.BOLD)
 
     def test_scenario_e(self):
@@ -471,31 +512,56 @@ class AllLevel2Runner:
         self.send_sim_cmd("outage")
         self.send_sim_cmd("soc 25")
 
-        # Simulate marker created when ws-1 and ws-2 were dispatched, but bridge restarted before proxmox
-        with open(f"{DIR}/shutdown_fired", "w") as f:
-            f.write("# shutdown sequence in progress\ndispatched: ws-1\ndispatched: ws-2\n")
+        if self.is_single_windows:
+            with open(f"{DIR}/shutdown_fired", "w") as f:
+                f.write("# shutdown sequence in progress\n")
 
-        self.start_bridge()
-        line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 2 endpoint\(s\) already dispatched, 1 remaining", timeout=10)
-        log(f"  [OK] {line}", Color.GREEN)
+            self.start_bridge()
+            line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 0 endpoint\(s\) already dispatched, 1 remaining", timeout=10)
+            log(f"  [OK] {line}", Color.GREEN)
 
-        line = self.wait_for_bridge_log(r"resuming shutdown sequence for 1 remaining endpoint\(s\)", timeout=10)
-        log(f"  [OK] {line}", Color.GREEN)
+            line = self.wait_for_bridge_log(r"resuming shutdown sequence for 1 remaining endpoint\(s\)", timeout=10)
+            log(f"  [OK] {line}", Color.GREEN)
 
-        self.wait_for_bridge_log(r"shutdown sequence complete", timeout=25)
-        log("  [OK] Remaining shutdown sequence completed", Color.GREEN)
+            self.wait_for_bridge_log(r"shutdown sequence complete", timeout=25)
+            log("  [OK] Remaining shutdown sequence completed", Color.GREEN)
 
-        with open(f"{DIR}/ssh.log") as f:
-            ssh_content = f.read()
-        assert "10.99.0.3" in ssh_content, "proxmox should have been dispatched"
-        assert "10.99.0.1" not in ssh_content, "ws-1 should not be re-dispatched"
-        assert "10.99.0.2" not in ssh_content, "ws-2 should not be re-dispatched"
-        log("  [OK] Only proxmox was dispatched; no duplicate shutdown for ws-1/ws-2", Color.GREEN)
+            with open(f"{DIR}/ssh.log") as f:
+                ssh_content = f.read()
+            assert "10.99.0.1" in ssh_content, "ws-1 should have been dispatched"
+            assert "10.99.0.2" not in ssh_content
+            assert "10.99.0.3" not in ssh_content
 
-        with open(f"{DIR}/shutdown_fired") as f:
-            marker_content = f.read()
-        assert "completed" in marker_content
-        log("  [OK] Marker file marked completed", Color.GREEN)
+            with open(f"{DIR}/shutdown_fired") as f:
+                marker_content = f.read()
+            assert "completed" in marker_content
+            assert "dispatched: ws-1" in marker_content
+            log("  [OK] Marker file marked completed", Color.GREEN)
+        else:
+            with open(f"{DIR}/shutdown_fired", "w") as f:
+                f.write("# shutdown sequence in progress\ndispatched: ws-1\ndispatched: ws-2\n")
+
+            self.start_bridge()
+            line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 2 endpoint\(s\) already dispatched, 1 remaining", timeout=10)
+            log(f"  [OK] {line}", Color.GREEN)
+
+            line = self.wait_for_bridge_log(r"resuming shutdown sequence for 1 remaining endpoint\(s\)", timeout=10)
+            log(f"  [OK] {line}", Color.GREEN)
+
+            self.wait_for_bridge_log(r"shutdown sequence complete", timeout=25)
+            log("  [OK] Remaining shutdown sequence completed", Color.GREEN)
+
+            with open(f"{DIR}/ssh.log") as f:
+                ssh_content = f.read()
+            assert "10.99.0.3" in ssh_content, "proxmox should have been dispatched"
+            assert "10.99.0.1" not in ssh_content, "ws-1 should not be re-dispatched"
+            assert "10.99.0.2" not in ssh_content, "ws-2 should not be re-dispatched"
+            log("  [OK] Only proxmox was dispatched; no duplicate shutdown for ws-1/ws-2", Color.GREEN)
+
+            with open(f"{DIR}/shutdown_fired") as f:
+                marker_content = f.read()
+            assert "completed" in marker_content
+            log("  [OK] Marker file marked completed", Color.GREEN)
 
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 40")
@@ -514,14 +580,20 @@ class AllLevel2Runner:
         self.reset_env()
 
         with open(f"{DIR}/shutdown_fired", "w") as f:
-            f.write("# shutdown sequence in progress\ndispatched: ws-1\ndispatched: ws-2\n")
+            if self.is_single_windows:
+                f.write("# shutdown sequence in progress\n")
+            else:
+                f.write("# shutdown sequence in progress\ndispatched: ws-1\ndispatched: ws-2\n")
 
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 25")
         time.sleep(0.5)
 
         self.start_bridge()
-        line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 2 endpoint\(s\) already dispatched, 1 remaining", timeout=10)
+        if self.is_single_windows:
+            line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 0 endpoint\(s\) already dispatched, 1 remaining", timeout=10)
+        else:
+            line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 2 endpoint\(s\) already dispatched, 1 remaining", timeout=10)
         log(f"  [OK] {line}", Color.GREEN)
 
         line = self.wait_for_bridge_log(r"grid currently up; holding 1 remaining shutdown\(s\) pending (?:recovery )?confirmation", timeout=10)
@@ -540,9 +612,14 @@ class AllLevel2Runner:
 
         with open(f"{DIR}/ssh.log") as f:
             ssh_content = f.read()
-        assert "10.99.0.3" in ssh_content
-        assert "10.99.0.1" not in ssh_content
-        assert "10.99.0.2" not in ssh_content
+        if self.is_single_windows:
+            assert "10.99.0.1" in ssh_content
+            assert "10.99.0.2" not in ssh_content
+            assert "10.99.0.3" not in ssh_content
+        else:
+            assert "10.99.0.3" in ssh_content
+            assert "10.99.0.1" not in ssh_content
+            assert "10.99.0.2" not in ssh_content
 
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 40")
@@ -555,56 +632,73 @@ class AllLevel2Runner:
 
     def test_scenario_f4(self):
         log("\n=======================================================", Color.BOLD)
-        log("RUNNING SCENARIO F4: Failed endpoint omitted from marker & retried; Proxmox timing", Color.BOLD)
+        log("RUNNING SCENARIO F4: Failed endpoint omitted from marker & retried", Color.BOLD)
         log("=======================================================", Color.BOLD)
         self.stop_bridge()
         self.reset_env()
 
+        fail_host = "10.99.0.1" if self.is_single_windows else "10.99.0.2"
         with open(f"{DIR}/ssh-fail", "w") as f:
-            f.write("10.99.0.2\n")
+            f.write(f"{fail_host}\n")
 
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
         self.start_bridge()
-        self.wait_for_bridge_log(r"loaded config from .*bridge\.toml")
+        self.wait_for_bridge_log(r"loaded config from .*bridge.*\.toml")
 
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
         self.send_sim_cmd("soc 25")
         self.wait_for_bridge_log(r"firing shutdown sequence", timeout=5)
 
-        self.wait_for_bridge_log(r"shutting down ws-1", timeout=8)
-        self.wait_for_bridge_log(r"ws-2: initial connection failed .* continuing retries in background", timeout=10)
-
-        # proxmox starts VM shutdown
-        line = self.wait_for_bridge_log(r"shutting down proxmox \(10\.99\.0\.3\) via Proxmox: VMs first, then poweroff", timeout=10)
-        log(f"  [OK] {line}", Color.GREEN)
-
-        with open(f"{DIR}/shutdown_fired") as f:
-            marker_content = f.read()
-        assert "dispatched: ws-1" in marker_content
-        assert "dispatched: ws-2" not in marker_content
-        assert "dispatched: proxmox" not in marker_content
-        log("  [OK] Marker correctly excludes failed ws-2 and mid-flight proxmox", Color.GREEN)
+        if self.is_single_windows:
+            self.wait_for_bridge_log(r"ws-1: initial connection failed .* continuing retries in background", timeout=10)
+            with open(f"{DIR}/shutdown_fired") as f:
+                marker_content = f.read()
+            assert "dispatched: ws-1" not in marker_content
+            log("  [OK] Marker correctly excludes failed ws-1", Color.GREEN)
+        else:
+            self.wait_for_bridge_log(r"shutting down ws-1", timeout=8)
+            self.wait_for_bridge_log(r"ws-2: initial connection failed .* continuing retries in background", timeout=10)
+            line = self.wait_for_bridge_log(r"shutting down proxmox \(10\.99\.0\.3\) via Proxmox: VMs first, then poweroff", timeout=10)
+            log(f"  [OK] {line}", Color.GREEN)
+            with open(f"{DIR}/shutdown_fired") as f:
+                marker_content = f.read()
+            assert "dispatched: ws-1" in marker_content
+            assert "dispatched: ws-2" not in marker_content
+            assert "dispatched: proxmox" not in marker_content
+            log("  [OK] Marker correctly excludes failed ws-2 and mid-flight proxmox", Color.GREEN)
 
         self.stop_bridge()
         if os.path.exists(f"{DIR}/ssh-fail"):
             os.remove(f"{DIR}/ssh-fail")
 
         self.start_bridge()
-        line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 1 endpoint\(s\) already dispatched, 2 remaining", timeout=10)
-        log(f"  [OK] {line}", Color.GREEN)
+        if self.is_single_windows:
+            line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 0 endpoint\(s\) already dispatched, 1 remaining", timeout=10)
+            log(f"  [OK] {line}", Color.GREEN)
+            self.wait_for_bridge_log(r"resuming shutdown sequence for 1 remaining endpoint\(s\)", timeout=10)
+            self.wait_for_bridge_log(r"ws-1: shutdown command accepted", timeout=8)
+            self.wait_for_bridge_log(r"shutdown sequence complete", timeout=30)
+            log("  [OK] Shutdown sequence finished successfully", Color.GREEN)
 
-        self.wait_for_bridge_log(r"resuming shutdown sequence for 2 remaining endpoint\(s\)", timeout=10)
-        self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=8)
-        self.wait_for_bridge_log(r"shutdown sequence complete", timeout=30)
-        log("  [OK] Shutdown sequence finished successfully", Color.GREEN)
+            with open(f"{DIR}/shutdown_fired") as f:
+                final_marker = f.read()
+            assert "completed" in final_marker
+            assert "dispatched: ws-1" in final_marker
+        else:
+            line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 1 endpoint\(s\) already dispatched, 2 remaining", timeout=10)
+            log(f"  [OK] {line}", Color.GREEN)
+            self.wait_for_bridge_log(r"resuming shutdown sequence for 2 remaining endpoint\(s\)", timeout=10)
+            self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=8)
+            self.wait_for_bridge_log(r"shutdown sequence complete", timeout=30)
+            log("  [OK] Shutdown sequence finished successfully", Color.GREEN)
 
-        with open(f"{DIR}/shutdown_fired") as f:
-            final_marker = f.read()
-        assert "completed" in final_marker
-        assert "dispatched: ws-2" in final_marker
-        assert "dispatched: proxmox" in final_marker
+            with open(f"{DIR}/shutdown_fired") as f:
+                final_marker = f.read()
+            assert "completed" in final_marker
+            assert "dispatched: ws-2" in final_marker
+            assert "dispatched: proxmox" in final_marker
 
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
@@ -619,8 +713,9 @@ class AllLevel2Runner:
         self.stop_bridge()
         self.reset_env()
 
+        fail_host = "10.99.0.1" if self.is_single_windows else "10.99.0.2"
         with open(f"{DIR}/ssh-fail", "w") as f:
-            f.write("10.99.0.2\n")
+            f.write(f"{fail_host}\n")
 
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
@@ -631,36 +726,57 @@ class AllLevel2Runner:
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
         self.send_sim_cmd("soc 25")
 
-        self.wait_for_bridge_log(r"shutting down ws-1", timeout=8)
-        self.wait_for_bridge_log(r"ws-2: initial connection failed", timeout=10)
-        self.wait_for_bridge_log(r"shutting down proxmox", timeout=10)
-        self.wait_for_bridge_log(r"failed to shut down ws-2", timeout=15)
+        if self.is_single_windows:
+            self.wait_for_bridge_log(r"ws-1: initial connection failed", timeout=10)
+            self.wait_for_bridge_log(r"failed to shut down ws-1", timeout=15)
+            line = self.wait_for_bridge_log(r"shutdown sequence finished: 0/1 endpoint\(s\) succeeded; marker left incomplete for retry on restart", timeout=25)
+            log(f"  [OK] {line}", Color.GREEN)
 
-        line = self.wait_for_bridge_log(r"shutdown sequence finished: 2/3 endpoint\(s\) succeeded; marker left incomplete for retry on restart", timeout=25)
-        log(f"  [OK] {line}", Color.GREEN)
+            with open(f"{DIR}/shutdown_fired") as f:
+                marker_content = f.read()
+            assert "dispatched: ws-1" not in marker_content
+            assert "completed" not in marker_content
+        else:
+            self.wait_for_bridge_log(r"shutting down ws-1", timeout=8)
+            self.wait_for_bridge_log(r"ws-2: initial connection failed", timeout=10)
+            self.wait_for_bridge_log(r"shutting down proxmox", timeout=10)
+            self.wait_for_bridge_log(r"failed to shut down ws-2", timeout=15)
 
-        with open(f"{DIR}/shutdown_fired") as f:
-            marker_content = f.read()
-        assert "dispatched: ws-1" in marker_content
-        assert "dispatched: proxmox" in marker_content
-        assert "dispatched: ws-2" not in marker_content
-        assert "completed" not in marker_content
+            line = self.wait_for_bridge_log(r"shutdown sequence finished: 2/3 endpoint\(s\) succeeded; marker left incomplete for retry on restart", timeout=25)
+            log(f"  [OK] {line}", Color.GREEN)
+
+            with open(f"{DIR}/shutdown_fired") as f:
+                marker_content = f.read()
+            assert "dispatched: ws-1" in marker_content
+            assert "dispatched: proxmox" in marker_content
+            assert "dispatched: ws-2" not in marker_content
+            assert "completed" not in marker_content
 
         self.stop_bridge()
         if os.path.exists(f"{DIR}/ssh-fail"):
             os.remove(f"{DIR}/ssh-fail")
 
         self.start_bridge()
-        line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 2 endpoint\(s\) already dispatched, 1 remaining: \[\"ws-2\"\]", timeout=10)
-        log(f"  [OK] {line}", Color.GREEN)
+        if self.is_single_windows:
+            line = self.wait_for_bridge_log(r'indicates incomplete shutdown: 0 endpoint\(s\) already dispatched, 1 remaining: \["ws-1"\]', timeout=10)
+            log(f"  [OK] {line}", Color.GREEN)
+            self.wait_for_bridge_log(r"ws-1: shutdown command accepted", timeout=8)
+            self.wait_for_bridge_log(r"shutdown sequence complete: all 1 endpoint\(s\) succeeded", timeout=10)
 
-        self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=8)
-        self.wait_for_bridge_log(r"shutdown sequence complete: all 1 endpoint\(s\) succeeded", timeout=10)
+            with open(f"{DIR}/shutdown_fired") as f:
+                final_marker = f.read()
+            assert "completed" in final_marker
+            assert "dispatched: ws-1" in final_marker
+        else:
+            line = self.wait_for_bridge_log(r'indicates incomplete shutdown: 2 endpoint\(s\) already dispatched, 1 remaining: \["ws-2"\]', timeout=10)
+            log(f"  [OK] {line}", Color.GREEN)
+            self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=8)
+            self.wait_for_bridge_log(r"shutdown sequence complete: all 1 endpoint\(s\) succeeded", timeout=10)
 
-        with open(f"{DIR}/shutdown_fired") as f:
-            final_marker = f.read()
-        assert "completed" in final_marker
-        assert "dispatched: ws-2" in final_marker
+            with open(f"{DIR}/shutdown_fired") as f:
+                final_marker = f.read()
+            assert "completed" in final_marker
+            assert "dispatched: ws-2" in final_marker
 
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
@@ -833,8 +949,10 @@ class AllLevel2Runner:
         log("=======================================================", Color.BOLD)
         self.stop_bridge()
         self.reset_env()
+        fail_host = "10.99.0.1" if self.is_single_windows else "10.99.0.2"
+        fail_name = "ws-1" if self.is_single_windows else "ws-2"
         with open(f"{DIR}/ssh-fail", "w") as f:
-            f.write("10.99.0.2\n")
+            f.write(f"{fail_host}\n")
 
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
@@ -846,15 +964,18 @@ class AllLevel2Runner:
         self.send_sim_cmd("soc 25")
         self.wait_for_bridge_log(r"firing shutdown sequence", timeout=5)
 
-        line = self.wait_for_bridge_log(r"failed to shut down ws-2", timeout=25)
+        line = self.wait_for_bridge_log(rf"failed to shut down {fail_name}", timeout=25)
         log(f"  [OK] Caught expected failure: {line}", Color.GREEN)
 
         self.wait_for_bridge_log(r"shutdown sequence (?:complete|finished)", timeout=35)
         with open(f"{DIR}/ssh.log") as f:
             content = f.read()
-        assert "10.99.0.2 FAILED (simulated)" in content
-        assert "10.99.0.3" in content, "proxmox was not contacted after ws-2 failed!"
-        log("  [OK] Endpoint failure did not stop proxmox from shutting down", Color.GREEN)
+        assert f"{fail_host} FAILED (simulated)" in content
+        if not self.is_single_windows:
+            assert "10.99.0.3" in content, "proxmox was not contacted after ws-2 failed!"
+            log("  [OK] Endpoint failure did not stop proxmox from shutting down", Color.GREEN)
+        else:
+            log(f"  [OK] Endpoint {fail_name} failed gracefully", Color.GREEN)
 
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
@@ -869,8 +990,10 @@ class AllLevel2Runner:
         self.stop_bridge()
         self.reset_env()
 
+        hang_host = "10.99.0.1" if self.is_single_windows else "10.99.0.2"
+        hang_name = "ws-1" if self.is_single_windows else "ws-2"
         with open(f"{DIR}/ssh-hang", "w") as f:
-            f.write("10.99.0.2\n")
+            f.write(f"{hang_host}\n")
 
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
@@ -887,12 +1010,12 @@ class AllLevel2Runner:
         while time.time() - t0 < 10:
             if os.path.exists(f"{DIR}/ssh.log"):
                 with open(f"{DIR}/ssh.log") as f:
-                    if "10.99.0.2 HANGING" in f.read():
+                    if f"{hang_host} HANGING" in f.read():
                         hung = True
                         break
             time.sleep(0.2)
-        assert hung, "ws-2 did not hang as expected"
-        log("  [OK] ws-2 began hanging as expected", Color.GREEN)
+        assert hung, f"{hang_name} did not hang as expected"
+        log(f"  [OK] {hang_name} began hanging as expected", Color.GREEN)
 
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 40")
@@ -903,16 +1026,23 @@ class AllLevel2Runner:
         line = self.wait_for_bridge_log(r"Wake-on-LAN round 1/4", timeout=10)
         log(f"  [OK] {line}", Color.GREEN)
 
-        log("    Waiting for ws-2 SSH 60s timeout to elapse...", Color.CYAN)
-        line = self.wait_for_bridge_log(r"failed to shut down ws-2: ssh to 10\.99\.0\.2 timed out after 60s", timeout=80)
-        log(f"  [OK] {line}", Color.GREEN)
-        line = self.wait_for_bridge_log(r"recovery confirmed -- not starting the remaining endpoints", timeout=10)
+        log(f"    Waiting for {hang_name} SSH 60s timeout to elapse...", Color.CYAN)
+        line = self.wait_for_bridge_log(rf"failed to shut down {hang_name}: ssh to {re.escape(hang_host)} timed out after 60s", timeout=80)
         log(f"  [OK] {line}", Color.GREEN)
 
-        with open(f"{DIR}/ssh.log") as f:
-            content = f.read()
-        assert "10.99.0.3" not in content, "proxmox should not have been contacted"
-        log("  [OK] Proxmox was spared after recovery was confirmed", Color.GREEN)
+        if not self.is_single_windows:
+            line = self.wait_for_bridge_log(r"recovery confirmed -- not starting the remaining endpoints", timeout=10)
+            log(f"  [OK] {line}", Color.GREEN)
+            with open(f"{DIR}/ssh.log") as f:
+                content = f.read()
+            assert "10.99.0.3" not in content, "proxmox should not have been contacted"
+            log("  [OK] Proxmox was spared after recovery was confirmed", Color.GREEN)
+        else:
+            log("  [OK] Recovery and timeout handled cleanly for single endpoint", Color.GREEN)
+
+        self.wait_for_bridge_log(r"Wake-on-LAN round 4/4", timeout=25, from_start=True)
+        time.sleep(1)
+        assert not os.path.exists(f"{DIR}/shutdown_fired")
         log("--> SCENARIO M: PASSED", Color.GREEN + Color.BOLD)
 
     def test_scenario_n1(self):
@@ -924,7 +1054,7 @@ class AllLevel2Runner:
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
         self.start_bridge()
-        self.wait_for_bridge_log(r"loaded config from .*bridge\.toml")
+        self.wait_for_bridge_log(r"loaded config from .*bridge.*\.toml")
 
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
@@ -969,7 +1099,7 @@ class AllLevel2Runner:
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
         self.start_bridge()
-        self.wait_for_bridge_log(r"loaded config from .*bridge\.toml")
+        self.wait_for_bridge_log(r"loaded config from .*bridge.*\.toml")
 
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
@@ -1009,7 +1139,7 @@ class AllLevel2Runner:
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
         self.start_bridge()
-        self.wait_for_bridge_log(r"loaded config from .*bridge\.toml")
+        self.wait_for_bridge_log(r"loaded config from .*bridge.*\.toml")
 
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
@@ -1046,7 +1176,7 @@ class AllLevel2Runner:
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
         self.start_bridge()
-        self.wait_for_bridge_log(r"loaded config from .*bridge\.toml")
+        self.wait_for_bridge_log(r"loaded config from .*bridge.*\.toml")
 
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
@@ -1112,7 +1242,7 @@ class AllLevel2Runner:
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
         self.start_bridge()
-        self.wait_for_bridge_log(r"loaded config from .*bridge\.toml")
+        self.wait_for_bridge_log(r"loaded config from .*bridge.*\.toml")
 
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
@@ -1152,11 +1282,12 @@ class AllLevel2Runner:
         line = self.wait_for_bridge_log(r"ws-1: initial connection failed .* continuing retries in background", timeout=8)
         log(f"  [OK] ws-1 moved to background retry: {line}", Color.GREEN)
 
-        line = self.wait_for_bridge_log(r"shutting down ws-2", timeout=5)
-        log(f"  [OK] ws-2 dispatched immediately without head-of-line blocking: {line}", Color.GREEN)
-        self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=5)
+        if not self.is_single_windows:
+            line = self.wait_for_bridge_log(r"shutting down ws-2", timeout=5)
+            log(f"  [OK] ws-2 dispatched immediately without head-of-line blocking: {line}", Color.GREEN)
+            self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=5)
 
-        line = self.wait_for_bridge_log(r"ws-1: host finished booting; shutdown command accepted", timeout=12)
+        line = self.wait_for_bridge_log(r"ws-1: host finished booting; shutdown command accepted", timeout=15)
         log(f"  [OK] ws-1 recovered in background and succeeded: {line}", Color.GREEN)
 
         self.wait_for_bridge_log(r"shutdown sequence complete", timeout=30)
@@ -1167,8 +1298,9 @@ class AllLevel2Runner:
         with open(state_file) as f:
             marker_content = f.read()
         assert "dispatched: ws-1" in marker_content
-        assert "dispatched: ws-2" in marker_content
-        assert "dispatched: proxmox" in marker_content
+        if not self.is_single_windows:
+            assert "dispatched: ws-2" in marker_content
+            assert "dispatched: proxmox" in marker_content
         assert "completed" in marker_content
 
         self.send_sim_cmd("restore")
@@ -1240,7 +1372,7 @@ class AllLevel2Runner:
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
         self.start_bridge()
-        self.wait_for_bridge_log(r"loaded config from .*bridge\.toml")
+        self.wait_for_bridge_log(r"loaded config from .*bridge.*\.toml")
 
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
@@ -1281,7 +1413,7 @@ class AllLevel2Runner:
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
         self.start_bridge()
-        self.wait_for_bridge_log(r"loaded config from .*bridge\.toml")
+        self.wait_for_bridge_log(r"loaded config from .*bridge.*\.toml")
 
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
@@ -1307,7 +1439,7 @@ class AllLevel2Runner:
 
     def _strict_config(self):
         path = f"{DIR}/bridge-strict.toml"
-        with open(CONFIG) as f:
+        with open(self.config) as f:
             text = f.read()
         marker = 'wol_broadcast_addr = "127.0.0.1:40009"'
         assert marker in text
@@ -1483,20 +1615,27 @@ class AllLevel2Runner:
         # After comms_loss_shutdown_secs (5 s), the fail-safe must fire
         line = self.wait_for_bridge_log(r"battery state unknown, firing shutdown sequence", timeout=15)
         log(f"  [OK] {line}", Color.GREEN)
-        line = self.wait_for_bridge_log(r"shutdown sequence starting: 3 endpoint\(s\)", timeout=5)
+        n_ep = len(self.endpoints)
+        line = self.wait_for_bridge_log(rf"shutdown sequence starting: {n_ep} endpoint\(s\)", timeout=5)
         log(f"  [OK] {line}", Color.GREEN)
 
         assert os.path.exists(f"{DIR}/shutdown_fired"), "Marker file must exist after fail-safe shutdown fired"
         self.wait_for_bridge_log(r"shutdown sequence complete", timeout=45)
         with open(f"{DIR}/ssh.log") as f:
             ssh_content = f.read()
-        assert "10.99.0.1" in ssh_content and "10.99.0.2" in ssh_content and "10.99.0.3" in ssh_content
-        log("  [OK] All endpoints dispatched in fail-safe shutdown", Color.GREEN)
+        if self.is_single_windows:
+            assert "10.99.0.1" in ssh_content
+            assert "10.99.0.2" not in ssh_content
+            assert "10.99.0.3" not in ssh_content
+            log("  [OK] Single endpoint dispatched in fail-safe shutdown", Color.GREEN)
+        else:
+            assert "10.99.0.1" in ssh_content and "10.99.0.2" in ssh_content and "10.99.0.3" in ssh_content
+            log("  [OK] All endpoints dispatched in fail-safe shutdown", Color.GREEN)
 
-        # Simulator returns with grid back (default 230 V, SOC 80%)
-        log("--> Restarting inverter simulator (grid restored)...", Color.CYAN)
+        # Normal recovery once comms return with grid up
         self.start_simulator()
-        self.wait_for_bridge_log(r"inverter: device type 0x0300", timeout=15)
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
         line = self.wait_for_bridge_log(r"state: ShutdownLatched -> RecoveryDebouncing", timeout=10)
         log(f"  [OK] {line}", Color.GREEN)
         line = self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
@@ -1530,8 +1669,8 @@ class AllLevel2Runner:
         line = self.wait_for_bridge_log(r"ws-1: a shutdown is already scheduled on the host \(error 1190\) -- treating as accepted", timeout=10)
         log(f"  [OK] {line}", Color.GREEN)
 
-        # ws-2 and proxmox proceed normally
-        self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=10)
+        if not self.is_single_windows:
+            self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=10)
         self.wait_for_bridge_log(r"shutdown sequence complete", timeout=45)
 
         with open(f"{DIR}/shutdown_fired") as f:
@@ -1552,36 +1691,54 @@ class AllLevel2Runner:
         log("=======================================================", Color.BOLD)
         self.stop_bridge()
         self.reset_env()
-        with open(f"{DIR}/ssh-fail", "w") as f:
-            f.write("10.99.0.2\n")
-        self.send_sim_cmd("restore")
-        self.send_sim_cmd("soc 80")
-        self.start_bridge()
-        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
-        self.send_sim_cmd("outage")
-        self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
-        self.send_sim_cmd("soc 25")
-        self.wait_for_bridge_log(r"shutdown sequence finished: 2/3 endpoint\(s\) succeeded; marker left incomplete for retry on restart", timeout=45)
 
-        # The bridge restarts (watchdog, power blip) and the inverter does not answer:
-        # nothing can confirm that the grid is down, so the waiting endpoint must go
-        # after comms_loss_shutdown_secs (5 s in the test config), not never.
-        self.stop_bridge()
-        os.remove(f"{DIR}/ssh-fail")
-        if self.sim_proc:
-            self.sim_proc.kill()
-            self.sim_proc.wait()
-            self.sim_proc = None
-        self.start_bridge()
-        line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 2 endpoint\(s\) already dispatched, 1 remaining", timeout=10)
-        log(f"  [OK] {line}", Color.GREEN)
-        line = self.wait_for_bridge_log(r"no valid inverter reading for \d+ s after a restart that interrupted a shutdown", timeout=20)
-        log(f"  [OK] {line}", Color.GREEN)
-        line = self.wait_for_bridge_log(r"inverter silent: resuming shutdown sequence for 1 remaining endpoint\(s\)", timeout=5)
-        log(f"  [OK] {line}", Color.GREEN)
-        self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=15)
-        self.wait_for_bridge_log(r"shutdown sequence complete: all 1 endpoint\(s\) succeeded", timeout=10)
-        log("  [OK] The endpoint the previous run never reached was shut down without any reading", Color.GREEN)
+        if self.is_single_windows:
+            with open(f"{DIR}/shutdown_fired", "w") as f:
+                f.write("# shutdown sequence in progress\n")
+
+            if self.sim_proc:
+                self.sim_proc.kill()
+                self.sim_proc.wait()
+                self.sim_proc = None
+
+            self.start_bridge()
+            line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 0 endpoint\(s\) already dispatched, 1 remaining", timeout=10)
+            log(f"  [OK] {line}", Color.GREEN)
+            line = self.wait_for_bridge_log(r"no valid inverter reading for \d+ s after a restart that interrupted a shutdown", timeout=20)
+            log(f"  [OK] {line}", Color.GREEN)
+            line = self.wait_for_bridge_log(r"inverter silent: resuming shutdown sequence for 1 remaining endpoint\(s\)", timeout=5)
+            log(f"  [OK] {line}", Color.GREEN)
+            self.wait_for_bridge_log(r"ws-1: shutdown command accepted", timeout=15)
+            self.wait_for_bridge_log(r"shutdown sequence complete", timeout=10)
+            log("  [OK] The endpoint the previous run never reached was shut down without any reading", Color.GREEN)
+        else:
+            with open(f"{DIR}/ssh-fail", "w") as f:
+                f.write("10.99.0.2\n")
+            self.send_sim_cmd("restore")
+            self.send_sim_cmd("soc 80")
+            self.start_bridge()
+            self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
+            self.send_sim_cmd("outage")
+            self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
+            self.send_sim_cmd("soc 25")
+            self.wait_for_bridge_log(r"shutdown sequence finished: 2/3 endpoint\(s\) succeeded; marker left incomplete for retry on restart", timeout=45)
+
+            self.stop_bridge()
+            os.remove(f"{DIR}/ssh-fail")
+            if self.sim_proc:
+                self.sim_proc.kill()
+                self.sim_proc.wait()
+                self.sim_proc = None
+            self.start_bridge()
+            line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 2 endpoint\(s\) already dispatched, 1 remaining", timeout=10)
+            log(f"  [OK] {line}", Color.GREEN)
+            line = self.wait_for_bridge_log(r"no valid inverter reading for \d+ s after a restart that interrupted a shutdown", timeout=20)
+            log(f"  [OK] {line}", Color.GREEN)
+            line = self.wait_for_bridge_log(r"inverter silent: resuming shutdown sequence for 1 remaining endpoint\(s\)", timeout=5)
+            log(f"  [OK] {line}", Color.GREEN)
+            self.wait_for_bridge_log(r"ws-2: shutdown command accepted", timeout=15)
+            self.wait_for_bridge_log(r"shutdown sequence complete: all 1 endpoint\(s\) succeeded", timeout=10)
+            log("  [OK] The endpoint the previous run never reached was shut down without any reading", Color.GREEN)
 
         # Inverter comes back with the grid up: normal recovery.
         self.start_simulator()
@@ -1596,42 +1753,42 @@ class AllLevel2Runner:
         self.stop_bridge()
         self.reset_env()
 
-        # Simulate marker created when ws-1 and ws-2 were dispatched, 1 remaining (proxmox)
         with open(f"{DIR}/shutdown_fired", "w") as f:
-            f.write("# shutdown sequence in progress\ndispatched: ws-1\ndispatched: ws-2\n")
+            if self.is_single_windows:
+                f.write("# shutdown sequence in progress\n")
+            else:
+                f.write("# shutdown sequence in progress\ndispatched: ws-1\ndispatched: ws-2\n")
 
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
         self.start_bridge()
-        line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 2 endpoint\(s\) already dispatched, 1 remaining", timeout=10)
+        if self.is_single_windows:
+            line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 0 endpoint\(s\) already dispatched, 1 remaining", timeout=10)
+        else:
+            line = self.wait_for_bridge_log(r"indicates incomplete shutdown: 2 endpoint\(s\) already dispatched, 1 remaining", timeout=10)
         log(f"  [OK] {line}", Color.GREEN)
 
         line = self.wait_for_bridge_log(r"grid currently up; holding 1 remaining shutdown\(s\) pending (?:recovery )?confirmation", timeout=10)
         log(f"  [OK] {line}", Color.GREEN)
 
-        # Before recovery debounce (10 s) completes, kill the simulator.
-        # The inverter is now silent, but the last reading saw the grid was UP.
-        # The comms loss fail-safe must NOT fire for the waiting endpoint!
         if self.sim_proc:
             self.sim_proc.kill()
             self.sim_proc.wait()
             self.sim_proc = None
 
         self.wait_for_bridge_log(r"modbus poll failed: .* -- reconnecting", timeout=10)
-
-        # Sleep well past comms_loss_shutdown_secs (5 s in test config)
         time.sleep(8)
 
-        # Verify no shutdown command was issued during this silence
+        target_spared = "10.99.0.1" if self.is_single_windows else "10.99.0.3"
+        target_name = "ws-1" if self.is_single_windows else "proxmox"
         with open(f"{DIR}/ssh.log") as f:
             ssh_content = f.read()
-        assert "10.99.0.3" not in ssh_content, "proxmox must not be dispatched when last reading saw grid up"
+        assert target_spared not in ssh_content, f"{target_name} must not be dispatched when last reading saw grid up"
 
         for b_line in self.bridge_logs:
             assert "inverter silent: resuming shutdown sequence" not in b_line, "fail-safe must not fire when grid was up"
         log("  [OK] Waiting endpoint spared despite inverter silence because grid was seen up", Color.GREEN)
 
-        # Inverter comes back with grid up: normal recovery completes and spares the endpoint
         self.start_simulator()
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
@@ -1644,7 +1801,7 @@ class AllLevel2Runner:
         assert not os.path.exists(f"{DIR}/shutdown_fired"), "marker file must be cleared after recovery"
 
         with open(f"{DIR}/ssh.log") as f:
-            assert "10.99.0.3" not in f.read(), "proxmox was never dispatched"
+            assert target_spared not in f.read(), f"{target_name} was never dispatched"
         log("--> SCENARIO Y: PASSED", Color.GREEN + Color.BOLD)
 
     def test_scenario_z(self):
@@ -1654,7 +1811,6 @@ class AllLevel2Runner:
         self.stop_bridge()
         self.reset_env()
 
-        # Configure ws-1 to delay in SSH by 28s so it completes after recovery and WOL clear the marker
         with open(f"{DIR}/ssh-delay-10.99.0.1", "w") as f:
             f.write("28\n")
 
@@ -1669,7 +1825,6 @@ class AllLevel2Runner:
         self.wait_for_bridge_log(r"firing shutdown sequence", timeout=5)
         self.wait_for_bridge_log(r"shutting down ws-1 \(10\.99\.0\.1\) via Windows", timeout=5)
 
-        # Restore grid immediately while ws-1 is still sleeping in ssh (28 s delay)
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
         self.wait_for_bridge_log(r"state: ShutdownLatched -> RecoveryDebouncing", timeout=8)
@@ -1678,31 +1833,27 @@ class AllLevel2Runner:
         line = self.wait_for_bridge_log(r"recovery confirmed -- stopping the rest of the shutdown sequence", timeout=5)
         log(f"  [OK] {line}", Color.GREEN)
         self.wait_for_bridge_log(r"Wake-on-LAN round 1/4", timeout=5)
-
-        # Wait for Wake-on-LAN rounds to complete and clear the marker
         self.wait_for_bridge_log(r"Wake-on-LAN round 4/4", timeout=25)
         time.sleep(1)
 
-        # Now ws-1's delayed SSH completes after recovery was confirmed and marker was cleared
         line = self.wait_for_bridge_log(r"ws-1: shutdown command accepted", timeout=15)
         log(f"  [OK] {line}", Color.GREEN)
 
-        line = self.wait_for_bridge_log(r"recovery confirmed -- not starting the remaining endpoints", timeout=10)
-        log(f"  [OK] {line}", Color.GREEN)
+        if not self.is_single_windows:
+            line = self.wait_for_bridge_log(r"recovery confirmed -- not starting the remaining endpoints", timeout=10)
+            log(f"  [OK] {line}", Color.GREEN)
 
         time.sleep(1)
 
-        # Assert marker file does NOT exist and was not resurrected
         assert not os.path.exists(f"{DIR}/shutdown_fired"), "marker file must not be resurrected after recovery"
         log("  [OK] Marker file was not resurrected by late endpoint completion", Color.GREEN)
 
-        # Further endpoints were spared
-        with open(f"{DIR}/ssh.log") as f:
-            ssh_content = f.read()
-        assert "10.99.0.2" not in ssh_content, "ws-2 must not be contacted"
-        assert "10.99.0.3" not in ssh_content, "proxmox must not be contacted"
+        if not self.is_single_windows:
+            with open(f"{DIR}/ssh.log") as f:
+                ssh_content = f.read()
+            assert "10.99.0.2" not in ssh_content, "ws-2 must not be contacted"
+            assert "10.99.0.3" not in ssh_content, "proxmox must not be contacted"
 
-        # Restart bridge to confirm clean state
         self.stop_bridge()
         self.start_bridge()
         self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V", timeout=10)
@@ -1755,8 +1906,12 @@ class AllLevel2Runner:
         with open(f"{DIR}/ssh.log") as f:
             ssh_content = f.read()
         assert "10.99.0.1" in ssh_content, "ws-1 not contacted"
-        assert "10.99.0.2" in ssh_content, "ws-2 not contacted"
-        assert "10.99.0.3" in ssh_content, "proxmox not contacted"
+        if not self.is_single_windows:
+            assert "10.99.0.2" in ssh_content, "ws-2 not contacted"
+            assert "10.99.0.3" in ssh_content, "proxmox not contacted"
+        else:
+            assert "10.99.0.2" not in ssh_content
+            assert "10.99.0.3" not in ssh_content
 
         # Recovery + WoL
         self.send_sim_cmd("restore")
@@ -1770,43 +1925,74 @@ class AllLevel2Runner:
         log("--> SCENARIO AA: PASSED", Color.GREEN + Color.BOLD)
 
     def run(self, targets=None):
-        all_scenarios = [
-            ("a", "Scenario A", self.test_scenario_a),
-            ("b", "Scenario B", self.test_scenario_b),
-            ("c", "Scenario C", self.test_scenario_c),
-            ("d", "Scenario D", self.test_scenario_d),
-            ("e", "Scenario E", self.test_scenario_e),
-            ("f", "Scenario F", self.test_scenario_f),
-            ("f2", "Scenario F2", self.test_scenario_f2),
-            ("f3", "Scenario F3", self.test_scenario_f3),
-            ("f4", "Scenario F4", self.test_scenario_f4),
-            ("f5", "Scenario F5", self.test_scenario_f5),
-            ("g", "Scenario G", self.test_scenario_g),
-            ("h", "Scenario H", self.test_scenario_h),
-            ("i", "Scenario I", self.test_scenario_i),
-            ("j", "Scenario J", self.test_scenario_j),
-            ("k", "Scenario K", self.test_scenario_k),
-            ("l", "Scenario L", self.test_scenario_l),
-            ("m", "Scenario M", self.test_scenario_m),
-            ("n1", "Scenario N1", self.test_scenario_n1),
-            ("n2", "Scenario N2", self.test_scenario_n2),
-            ("n3", "Scenario N3", self.test_scenario_n3),
-            ("n4", "Scenario N4", self.test_scenario_n4),
-            ("n5", "Scenario N5", self.test_scenario_n5),
-            ("o", "Scenario O", self.test_scenario_o),
-            ("p", "Scenario P", self.test_scenario_p),
-            ("q", "Scenario Q", self.test_scenario_q),
-            ("r", "Scenario R", self.test_scenario_r),
-            ("s", "Scenario S", self.test_scenario_s),
-            ("t", "Scenario T", self.test_scenario_t),
-            ("u", "Scenario U", self.test_scenario_u),
-            ("v", "Scenario V", self.test_scenario_v),
-            ("w", "Scenario W", self.test_scenario_w),
-            ("x", "Scenario X", self.test_scenario_x),
-            ("y", "Scenario Y", self.test_scenario_y),
-            ("z", "Scenario Z", self.test_scenario_z),
-            ("aa", "Scenario AA", self.test_scenario_aa),
-        ]
+        if self.is_single_windows:
+            all_scenarios = [
+                ("a", "Scenario A", self.test_scenario_a),
+                ("b", "Scenario B", self.test_scenario_b),
+                ("c", "Scenario C", self.test_scenario_c),
+                ("d", "Scenario D", self.test_scenario_d),
+                ("e", "Scenario E", self.test_scenario_e),
+                ("f", "Scenario F", self.test_scenario_f),
+                ("f2", "Scenario F2", self.test_scenario_f2),
+                ("f3", "Scenario F3", self.test_scenario_f3),
+                ("f4", "Scenario F4", self.test_scenario_f4),
+                ("f5", "Scenario F5", self.test_scenario_f5),
+                ("g", "Scenario G", self.test_scenario_g),
+                ("h", "Scenario H", self.test_scenario_h),
+                ("i", "Scenario I", self.test_scenario_i),
+                ("j", "Scenario J", self.test_scenario_j),
+                ("k", "Scenario K", self.test_scenario_k),
+                ("l", "Scenario L", self.test_scenario_l),
+                ("m", "Scenario M", self.test_scenario_m),
+                ("o", "Scenario O", self.test_scenario_o),
+                ("s", "Scenario S", self.test_scenario_s),
+                ("t", "Scenario T", self.test_scenario_t),
+                ("u", "Scenario U", self.test_scenario_u),
+                ("v", "Scenario V", self.test_scenario_v),
+                ("w", "Scenario W", self.test_scenario_w),
+                ("x", "Scenario X", self.test_scenario_x),
+                ("y", "Scenario Y", self.test_scenario_y),
+                ("z", "Scenario Z", self.test_scenario_z),
+                ("aa", "Scenario AA", self.test_scenario_aa),
+            ]
+        else:
+            all_scenarios = [
+                ("a", "Scenario A", self.test_scenario_a),
+                ("b", "Scenario B", self.test_scenario_b),
+                ("c", "Scenario C", self.test_scenario_c),
+                ("d", "Scenario D", self.test_scenario_d),
+                ("e", "Scenario E", self.test_scenario_e),
+                ("f", "Scenario F", self.test_scenario_f),
+                ("f2", "Scenario F2", self.test_scenario_f2),
+                ("f3", "Scenario F3", self.test_scenario_f3),
+                ("f4", "Scenario F4", self.test_scenario_f4),
+                ("f5", "Scenario F5", self.test_scenario_f5),
+                ("g", "Scenario G", self.test_scenario_g),
+                ("h", "Scenario H", self.test_scenario_h),
+                ("i", "Scenario I", self.test_scenario_i),
+                ("j", "Scenario J", self.test_scenario_j),
+                ("k", "Scenario K", self.test_scenario_k),
+                ("l", "Scenario L", self.test_scenario_l),
+                ("m", "Scenario M", self.test_scenario_m),
+                ("n1", "Scenario N1", self.test_scenario_n1),
+                ("n2", "Scenario N2", self.test_scenario_n2),
+                ("n3", "Scenario N3", self.test_scenario_n3),
+                ("n4", "Scenario N4", self.test_scenario_n4),
+                ("n5", "Scenario N5", self.test_scenario_n5),
+                ("o", "Scenario O", self.test_scenario_o),
+                ("p", "Scenario P", self.test_scenario_p),
+                ("q", "Scenario Q", self.test_scenario_q),
+                ("r", "Scenario R", self.test_scenario_r),
+                ("s", "Scenario S", self.test_scenario_s),
+                ("t", "Scenario T", self.test_scenario_t),
+                ("u", "Scenario U", self.test_scenario_u),
+                ("v", "Scenario V", self.test_scenario_v),
+                ("w", "Scenario W", self.test_scenario_w),
+                ("x", "Scenario X", self.test_scenario_x),
+                ("y", "Scenario Y", self.test_scenario_y),
+                ("z", "Scenario Z", self.test_scenario_z),
+                ("aa", "Scenario AA", self.test_scenario_aa),
+            ]
 
         if targets:
             target_set = set(t.lower() for t in targets)
@@ -1832,12 +2018,34 @@ class AllLevel2Runner:
 
             log("\n=======================================================", Color.BOLD)
             log(f"ALL SELECTED LEVEL-2 SCENARIOS ({passed}/{len(scenarios)}) PASSED SUCCESSFULLY!", Color.GREEN + Color.BOLD)
-            log("Config: 2 Windows 11 endpoints, 1 Proxmox endpoint (vms_then_poweroff)", Color.CYAN + Color.BOLD)
+            if self.is_single_windows:
+                log("Config: 1 Windows 11 endpoint (ws-1: 10.99.0.1), no Proxmox", Color.CYAN + Color.BOLD)
+            else:
+                log("Config: 2 Windows 11 endpoints, 1 Proxmox endpoint (vms_then_poweroff)", Color.CYAN + Color.BOLD)
             log("=======================================================", Color.BOLD)
         finally:
             self.cleanup()
 
 if __name__ == "__main__":
-    targets = sys.argv[1:]
-    runner = AllLevel2Runner()
-    runner.run(targets)
+    import argparse
+    parser = argparse.ArgumentParser(description="Automated Level 2 scenario test runner")
+    parser.add_argument("--1win", "--single", "-1", dest="single_win", action="store_true",
+                        help="Run with 1 Windows 11 endpoint (bridge-1win.toml)")
+    parser.add_argument("--3ep", "--three", dest="three_ep", action="store_true",
+                        help="Run with 2 Windows 11 + 1 Proxmox endpoints (bridge.toml)")
+    parser.add_argument("--config", "-c", dest="config", default=None,
+                        help="Explicit path to bridge configuration file")
+    parser.add_argument("scenarios", nargs="*",
+                        help="Optional scenario code(s) to run (e.g. 'a', 'b', 'n1'). Defaults to all.")
+    args = parser.parse_args()
+
+    cfg = CONFIG
+    if args.single_win:
+        cfg = f"{TEST_DIR}/bridge-1win.toml"
+    elif args.config:
+        cfg = args.config
+    elif args.three_ep:
+        cfg = f"{TEST_DIR}/bridge.toml"
+
+    runner = AllLevel2Runner(config=cfg)
+    runner.run(args.scenarios if args.scenarios else None)

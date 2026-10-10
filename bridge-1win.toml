@@ -1,4 +1,4 @@
-# bridge.toml: 2 Windows 11 endpoints, 1 Proxmox endpoint (vms_then_poweroff)
+# bridge-1win.toml: 1 Windows 11 endpoint, no Proxmox endpoint
 wol_broadcast_addr = "127.0.0.1:40009"      # wol_listen.py, not the LAN
 state_file = "/tmp/mub-test/shutdown_fired" # test run marker
 ssh_known_hosts_file = "/tmp/mub-test/known_hosts"
@@ -31,28 +31,3 @@ ssh_user = "ups-shutdown"
 ssh_key_path = "/tmp/mub-test/fake_key"
 shutdown_delay_secs = 60
 mac_address = "AA:BB:CC:00:00:01"
-
-# Endpoint 2: Windows 11
-[[endpoints]]
-name = "ws-2"
-kind = "windows"
-host = "10.99.0.2"
-ssh_user = "ups-shutdown"
-ssh_key_path = "/tmp/mub-test/fake_key"
-shutdown_delay_secs = 60
-mac_address = "AA:BB:CC:00:00:02"
-
-# Endpoint 3: Proxmox
-[[endpoints]]
-name = "proxmox"
-kind = "proxmox"
-host = "10.99.0.3"
-ssh_user = "root"
-ssh_key_path = "/tmp/mub-test/fake_key"
-shutdown_delay_secs = 10
-mac_address = "AA:BB:CC:00:00:03"
-ssh_connect_retry_secs = 12
-
-[proxmox]
-method = "vms_then_poweroff"
-vm_shutdown_timeout_secs = 15

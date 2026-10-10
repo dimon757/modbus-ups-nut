@@ -390,15 +390,17 @@ or readable by others are logged as errors (ssh refuses such keys).
 
 Full explanation and step-by-step instructions: [TESTING.md](TESTING.md).
 
-1. **Unit tests** -- `cargo test` (53 tests). The decision logic, config parsing, the
+1. **Unit tests** -- `cargo test` (94 tests). The decision logic, config parsing, the
    inverter-settings check, the Proxmox commands, the marker file manifest, SSH connection
-   retries for booting hosts, and Wake-on-LAN rounds, in under a second with no hardware.
+   retries for booting hosts, Wake-on-LAN rounds, and debounce timers, in under a second with no hardware.
 2. **Simulated site** -- `test/`: the real binary against an inverter
    simulator on a virtual serial cable, with a fake `ssh` and a local
    Wake-on-LAN listener, on any Linux machine (including the N2840 before
    it goes to site). Needs no root and can't shut down anything. Start with
-   `test/setup.sh`, then follow the 34 scenarios in
-   [`test/CHECKLIST.md`](test/CHECKLIST.md) (32 automated in `test/auto_level2.py`).
+   `test/setup.sh`, then follow the 35 scenarios in
+   [`test/CHECKLIST.md`](test/CHECKLIST.md), or run the fully automated runner
+   `test/auto_level2.py` (35 scenarios for 2 Windows 11 + 1 Proxmox, 27 scenarios
+   for 1 Windows 11, with easy switching via `--1win` or `switch-config.bat` / `switch-config.sh`).
 3. **On site** -- the real inverter and machines: step 8 of the deployment
    sketch below, after [docs/register-verification.md](docs/register-verification.md)
    (inverter) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)

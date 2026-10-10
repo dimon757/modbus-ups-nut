@@ -43,6 +43,14 @@ simulated SSH failures. When done: `./setup.sh clean`.
 Timings below assume the test config: grid-lost wait **5 s**, recovery wait
 **10 s**, **2 s** between endpoints, Wake-on-LAN **4 rounds 5 s apart**.
 
+### Automated execution (`auto_level2.py`)
+
+All scenarios in this checklist can also be run fully automated:
+- `python3 auto_level2.py` — runs all 35 scenarios with the default 3-endpoint topology (2 Windows 11 + 1 Proxmox `vms_then_poweroff`).
+- `python3 auto_level2.py --1win` — runs all 27 applicable scenarios for the single Windows 11 topology (`ws-1`, no Proxmox).
+- `python3 auto_level2.py <scenario>` — runs specific scenario(s), e.g. `python3 auto_level2.py a` or `python3 auto_level2.py --1win c`.
+- Switch topologies globally: `./switch-config.sh [1win|3ep|status]` (or `.\switch-config.bat` on Windows).
+
 ---
 
 ## A. Startup and normal running
