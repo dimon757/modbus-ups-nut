@@ -120,6 +120,15 @@ pub struct Thresholds {
     pub use_grid_relay: bool,
     /// Grid must be lost for this long before we declare on_battery (seconds).
     pub on_battery_debounce_secs: u64,
+    /// If the battery is already low (at or below low_battery_soc) when the grid
+    /// drops, waiting the full on_battery_debounce_secs is pure delay while
+    /// the battery drains toward the inverter's cutoff. If
+    /// low_battery_fast_debounce_secs is set (> 0) and the battery is already
+    /// low, the bridge skips the rest of on_battery_debounce_secs after this
+    /// shorter wait and goes straight to the normal low-battery fire check.
+    /// 0 disables it.
+    #[serde(default = "default_low_battery_fast_debounce_secs")]
+    pub low_battery_fast_debounce_secs: u64,
     /// SOC (%) at or below which, while on_battery, we start the shutdown
     /// sequence -- once 2 of the last 3 readings are at or below it. MUST be set higher than `inverter_cutoff_soc` below --
     /// checked at startup -- so the graceful sequence has already finished
@@ -172,6 +181,10 @@ fn default_wol_resend_count() -> u32 {
 
 fn default_use_grid_relay() -> bool {
     true
+}
+
+fn default_low_battery_fast_debounce_secs() -> u64 {
+    15
 }
 
 fn default_wol_resend_interval_secs() -> u64 {
@@ -257,6 +270,12 @@ impl Config {
             bail!(
                 "thresholds.on_battery_debounce_secs is {} s -- must be <= 3600",
                 t.on_battery_debounce_secs
+            );
+        }
+        if t.low_battery_fast_debounce_secs > 3600 {
+            bail!(
+                "thresholds.low_battery_fast_debounce_secs is {} s -- must be <= 3600 (0 disables)",
+                t.low_battery_fast_debounce_secs
             );
         }
         if t.recovery_debounce_secs > 3600 {
@@ -687,6 +706,51 @@ mod tests {
         );
         let cfg2: Config = toml::from_str(&toml_modbus).unwrap();
         assert!(cfg2.strict_inverter_checks());
+    }
+
+    #[test]
+    fn low_battery_fast_debounce_secs_defaults_to_15() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config/bridge.toml.example");
+        let cfg = Config::load(path).unwrap();
+        assert_eq!(cfg.thresholds.low_battery_fast_debounce_secs, 15);
+
+        // Omitting it from a TOML keeps the default 15
+        let raw = std::fs::read_to_string(path).unwrap();
+        let without: String = raw
+            .lines()
+            .filter(|l| !l.starts_with("low_battery_fast_debounce_secs"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let cfg2: Config = toml::from_str(&without).unwrap();
+        assert_eq!(cfg2.thresholds.low_battery_fast_debounce_secs, 15);
+    }
+
+    #[test]
+    fn low_battery_fast_debounce_secs_can_be_configured_or_disabled() {
+        let text_custom = example_with(
+            "low_battery_fast_debounce_secs = 15",
+            "low_battery_fast_debounce_secs = 20",
+        );
+        let cfg: Config = toml::from_str(&text_custom).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.thresholds.low_battery_fast_debounce_secs, 20);
+
+        let text_zero = example_with(
+            "low_battery_fast_debounce_secs = 15",
+            "low_battery_fast_debounce_secs = 0",
+        );
+        let cfg_zero: Config = toml::from_str(&text_zero).unwrap();
+        cfg_zero.validate().unwrap();
+        assert_eq!(cfg_zero.thresholds.low_battery_fast_debounce_secs, 0);
+    }
+
+    #[test]
+    fn low_battery_fast_debounce_secs_beyond_limit_is_rejected() {
+        let err = validate_err(&example_with(
+            "low_battery_fast_debounce_secs = 15",
+            "low_battery_fast_debounce_secs = 3601",
+        ));
+        assert!(err.contains("low_battery_fast_debounce_secs"), "{err}");
     }
 }
 

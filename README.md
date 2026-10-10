@@ -52,7 +52,7 @@ flowchart TD
 
     poll["Poll the inverter every 5 s<br/>SOC · grid voltage · grid relay · load · battery power"] --> lost{"Grid lost?<br/>voltage below 100 V<br/>or grid relay open<br/><i>grid_lost_voltage · use_grid_relay</i>"}
     lost -- "no" --> poll
-    lost -- "yes" --> deb{"Still lost after 60 s?<br/><i>on_battery_debounce_secs</i>"}
+    lost -- "yes" --> deb{"Grid still lost?<br/>60 s normal debounce<br/><i>on_battery_debounce_secs</i><br/>(15 s if SOC ≤ 30 %<br/><i>low_battery_fast_debounce_secs</i>)"}
     deb -- "no, grid came back" --> poll
     deb -- "yes" --> onbatt["On battery"]
 
@@ -105,6 +105,14 @@ and fires (or resumes) the shutdown sequence before the battery drains unobserve
 into the inverter's cutoff. If the grid was seen healthy before comms dropped,
 waiting endpoints are spared from shutdown.
 
+When an outage begins, the bridge debounces for `on_battery_debounce_secs` (60 s)
+to filter short blips before declaring on-battery operation. If the battery is already
+low (SOC at or below `low_battery_soc`), waiting the full 60 s would needlessly drain
+the battery toward the inverter's cutoff; in this case, `low_battery_fast_debounce_secs`
+(default 15 s, 0 to disable) accelerates the transition to on-battery operation once
+the grid has remained down for that shorter wait, immediately evaluating the low-battery
+shutdown trigger. Short blips are still filtered by this shorter wait.
+
 ### State machine (`src/state.rs`)
 
 ```mermaid
@@ -113,7 +121,7 @@ stateDiagram-v2
     [*] --> ShutdownLatched : marker found at startup (resumes remaining if incomplete & on battery or inverter silent without grid up)
     Idle --> GridLostDebouncing : grid lost
     GridLostDebouncing --> Idle : grid back
-    GridLostDebouncing --> OnBattery : still lost (debounce)
+    GridLostDebouncing --> OnBattery : still lost (debounce or fast debounce if SOC low)
     OnBattery --> RecoveryDebouncing : grid back
     OnBattery --> ShutdownLatched : SOC low OR comms lost on battery, FIRE
     ShutdownLatched --> RecoveryDebouncing : grid back
@@ -124,7 +132,7 @@ stateDiagram-v2
 
 | Transition | Exact condition | Action |
 |---|---|---|
-| GridLostDebouncing → OnBattery | grid lost for `on_battery_debounce_secs` | -- |
+| GridLostDebouncing → OnBattery | grid lost for `on_battery_debounce_secs` (or `low_battery_fast_debounce_secs` if SOC ≤ `low_battery_soc` on 2 of the last 3 readings) | -- |
 | OnBattery → ShutdownLatched | SOC ≤ `low_battery_soc` on 2 of the last 3 readings OR RS485 comms lost for `comms_loss_shutdown_secs` while on battery | **fire** the shutdown sequence (aborts any previous in-flight task) |
 | ShutdownLatched → RecoveryDebouncing | grid back (whatever the SOC) | -- |
 | RecoveryDebouncing → ShutdownLatched | grid lost and the shutdown was already sent | -- (no second shutdown) |

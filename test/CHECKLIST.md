@@ -519,6 +519,24 @@ bridge, `rm /tmp/mub-test/ssh-fail`, **stop the simulator**, start the bridge ag
 
 ---
 
+## AA. Fast debounce on low battery (low_battery_fast_debounce_secs)
+
+**Do:** `./setup.sh reset`; run simulator (`restore`, `soc 25`); run the bridge.
+1. Short blip test: `outage`, wait 1 s (< 2 s fast debounce limit), then `restore`.
+2. Fast shutdown test: `outage`; keep grid down.
+
+**Expect:**
+- [ ] On startup: `soc=25.0% grid=230.0V`, bridge stays in `Idle` (no shutdown while grid is healthy)
+- [ ] Blip test: `state: Idle -> GridLostDebouncing`; on restore: `state: GridLostDebouncing -> Idle`
+- [ ] No SSH calls and no marker file created during filtered blip
+- [ ] Sustained outage: `state: GridLostDebouncing -> OnBattery` after ~2 s (`low_battery_fast_debounce_secs`), well before normal 5 s debounce
+- [ ] `firing shutdown sequence` triggers immediately upon entering OnBattery
+- [ ] Endpoints `ws-1`, `ws-2`, `proxmox` receive graceful shutdown commands
+- [ ] Marker `/tmp/mub-test/shutdown_fired` is created
+- [ ] Recovery (`restore`, `soc 80`): recovery debounces to `Idle`, Wake-on-LAN rounds 1-4 sent, marker cleanly removed
+
+---
+
 ## What this does and doesn't prove
 
 **Proves:** the decision logic running on the real clock; the Modbus RTU

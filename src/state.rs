@@ -21,7 +21,8 @@ pub struct BridgeStatus {
     /// threshold, or the inverter's grid relay open. Everything else in the
     /// bridge that needs to know "is the grid down?" uses this.
     pub grid_lost: bool,
-    /// `grid_lost` has held continuously for `on_battery_debounce_secs`.
+    /// `grid_lost` has held continuously for `on_battery_debounce_secs`
+    /// (or `low_battery_fast_debounce_secs` if the battery is already low).
     /// For decisions taken outside the phase machine (resuming a shutdown
     /// after a restart) that must not act on a single glitchy reading.
     pub grid_lost_confirmed: bool,
@@ -162,15 +163,22 @@ impl StateMachine {
         } else if self.grid_lost_since.is_none() {
             self.grid_lost_since = Some(Instant::now());
         }
-        let grid_lost_confirmed = self.grid_lost_since.is_some_and(|t| {
-            t.elapsed() >= Duration::from_secs(self.thresholds.on_battery_debounce_secs)
-        });
         if self.recent_soc_low.len() == LOW_SOC_WINDOW {
             self.recent_soc_low.pop_front();
         }
         self.recent_soc_low
             .push_back(reading.battery_soc_pct <= self.thresholds.low_battery_soc);
         let soc_low = self.recent_soc_low.iter().filter(|&&low| low).count() >= LOW_SOC_NEEDED;
+        let confirmed_debounce = if self.thresholds.low_battery_fast_debounce_secs > 0 && soc_low {
+            self.thresholds
+                .on_battery_debounce_secs
+                .min(self.thresholds.low_battery_fast_debounce_secs)
+        } else {
+            self.thresholds.on_battery_debounce_secs
+        };
+        let grid_lost_confirmed = self.grid_lost_since.is_some_and(|t| {
+            t.elapsed() >= Duration::from_secs(confirmed_debounce)
+        });
         let mut action = Action::None;
 
         match self.phase {
@@ -182,10 +190,20 @@ impl StateMachine {
             Phase::GridLostDebouncing => {
                 if !grid_lost {
                     self.enter(Phase::Idle);
-                } else if self.elapsed_in_phase()
-                    >= Duration::from_secs(self.thresholds.on_battery_debounce_secs)
-                {
-                    self.enter(Phase::OnBattery);
+                } else {
+                    let fast_limit = self.thresholds.low_battery_fast_debounce_secs;
+                    let fast_due = fast_limit > 0
+                        && soc_low
+                        && self.elapsed_in_phase() >= Duration::from_secs(fast_limit);
+                    let normal_due = self.elapsed_in_phase()
+                        >= Duration::from_secs(self.thresholds.on_battery_debounce_secs);
+
+                    if fast_due || normal_due {
+                        self.enter(Phase::OnBattery);
+                        if soc_low {
+                            action = self.fire_shutdown(&reading);
+                        }
+                    }
                 }
             }
             Phase::OnBattery => {
@@ -243,6 +261,18 @@ impl StateMachine {
 
         (status, action)
     }
+
+    #[cfg(test)]
+    pub(crate) fn backdate_phase_entered_at(&mut self, d: Duration) {
+        self.phase_entered_at -= d;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backdate_grid_lost_since(&mut self, d: Duration) {
+        if let Some(ref mut t) = self.grid_lost_since {
+            *t -= d;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -256,6 +286,7 @@ mod tests {
             grid_lost_voltage: 100.0,
             use_grid_relay: true,
             on_battery_debounce_secs: 0,
+            low_battery_fast_debounce_secs: 0,
             low_battery_soc: 30.0,
             inverter_cutoff_soc: 20.0,
             recovery_debounce_secs,
@@ -537,5 +568,110 @@ mod tests {
             assert!(status.grid_lost);
             assert!(!status.grid_lost_confirmed);
         }
+    }
+
+    #[test]
+    fn fast_debounce_fires_early_when_battery_already_low() {
+        let mut t = thresholds(3600);
+        t.on_battery_debounce_secs = 60;
+        t.low_battery_fast_debounce_secs = 15;
+        let mut sm = StateMachine::new(t, false);
+
+        // Outage starts with battery already low (28% <= 30%)
+        let (_, a1) = sm.observe(reading(GRID_DOWN, 28.0));
+        assert!(matches!(a1, Action::None)); // -> GridLostDebouncing, 1st low
+
+        // Advance 14s (less than 15s fast debounce)
+        sm.backdate_phase_entered_at(Duration::from_secs(14));
+        let (_, a2) = sm.observe(reading(GRID_DOWN, 28.0));
+        assert!(matches!(a2, Action::None), "must not fire before fast debounce limit");
+
+        // Advance past 15s: fast debounce expires and fires immediately
+        sm.backdate_phase_entered_at(Duration::from_secs(1));
+        let (status, a3) = sm.observe(reading(GRID_DOWN, 28.0));
+        assert!(is_shutdown(&a3), "must fire after low_battery_fast_debounce_secs");
+        assert!(status.low_battery);
+        assert!(status.on_battery);
+    }
+
+    #[test]
+    fn fast_debounce_filters_short_blip_with_low_battery() {
+        let mut t = thresholds(3600);
+        t.on_battery_debounce_secs = 60;
+        t.low_battery_fast_debounce_secs = 15;
+        let mut sm = StateMachine::new(t, false);
+
+        // Outage starts with low battery
+        sm.observe(reading(GRID_DOWN, 28.0));
+        sm.backdate_phase_entered_at(Duration::from_secs(10));
+        sm.observe(reading(GRID_DOWN, 28.0)); // 2nd low reading
+
+        // Grid returns after 10 s (shorter than 15 s)
+        let (status, a) = sm.observe(reading(GRID_UP, 28.0));
+        assert!(matches!(a, Action::None), "blip must be ignored");
+        assert!(!status.on_battery, "must return to Idle");
+        assert!(!status.grid_lost);
+    }
+
+    #[test]
+    fn fast_debounce_does_not_fire_when_battery_normal() {
+        let mut t = thresholds(3600);
+        t.on_battery_debounce_secs = 60;
+        t.low_battery_fast_debounce_secs = 15;
+        let mut sm = StateMachine::new(t, false);
+
+        // Outage starts with battery healthy (80%)
+        sm.observe(reading(GRID_DOWN, 80.0));
+        sm.backdate_phase_entered_at(Duration::from_secs(30)); // past 15s fast debounce
+        let (status, a) = sm.observe(reading(GRID_DOWN, 80.0));
+        assert!(matches!(a, Action::None), "must not fire while battery is healthy");
+        // Still in GridLostDebouncing because 60s has not elapsed
+        assert!(matches!(sm.phase, Phase::GridLostDebouncing));
+        assert!(!status.low_battery);
+
+        // Once 60s normal debounce elapses, enters OnBattery
+        sm.backdate_phase_entered_at(Duration::from_secs(30));
+        let (status, a) = sm.observe(reading(GRID_DOWN, 80.0));
+        assert!(matches!(a, Action::None));
+        assert!(matches!(sm.phase, Phase::OnBattery));
+        assert!(status.on_battery);
+    }
+
+    #[test]
+    fn fast_debounce_disabled_with_zero() {
+        let mut t = thresholds(3600);
+        t.on_battery_debounce_secs = 60;
+        t.low_battery_fast_debounce_secs = 0; // disabled
+        let mut sm = StateMachine::new(t, false);
+
+        // Outage with battery already low
+        sm.observe(reading(GRID_DOWN, 25.0));
+        sm.backdate_phase_entered_at(Duration::from_secs(30));
+        let (_, a) = sm.observe(reading(GRID_DOWN, 25.0));
+        assert!(matches!(a, Action::None), "fast debounce disabled -- must not fire early");
+        assert!(matches!(sm.phase, Phase::GridLostDebouncing));
+
+        // Waits for the full 60s normal debounce, then fires
+        sm.backdate_phase_entered_at(Duration::from_secs(30));
+        let (_, a) = sm.observe(reading(GRID_DOWN, 25.0));
+        assert!(is_shutdown(&a), "must fire once full debounce elapses");
+    }
+
+    #[test]
+    fn grid_lost_confirmed_respects_fast_debounce_on_low_battery() {
+        let mut t = thresholds(3600);
+        t.on_battery_debounce_secs = 60;
+        t.low_battery_fast_debounce_secs = 15;
+        let mut sm = StateMachine::new(t, true); // resume = true
+
+        // 1st low reading
+        sm.observe(reading(GRID_DOWN, 25.0));
+        sm.backdate_grid_lost_since(Duration::from_secs(10));
+        let (status, _) = sm.observe(reading(GRID_DOWN, 25.0)); // 2nd low reading
+        assert!(!status.grid_lost_confirmed, "not confirmed at 10s");
+
+        sm.backdate_grid_lost_since(Duration::from_secs(5));
+        let (status, _) = sm.observe(reading(GRID_DOWN, 25.0));
+        assert!(status.grid_lost_confirmed, "confirmed after 15s fast debounce with low battery");
     }
 }

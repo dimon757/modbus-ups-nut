@@ -12,6 +12,7 @@ poll_interval_secs = 1
 [thresholds]
 grid_lost_voltage = 100.0
 on_battery_debounce_secs = 5     # test timing: 5s
+low_battery_fast_debounce_secs = 2 # test timing: 2s
 low_battery_soc = 30.0
 inverter_cutoff_soc = 20.0
 recovery_debounce_secs = 10      # test timing: 10s

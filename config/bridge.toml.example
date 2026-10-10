@@ -58,6 +58,14 @@ use_grid_relay = true            # ALSO count "grid side relay open" (register 1
                                   # (docs/register-verification.md, steps 3 and 6).
 on_battery_debounce_secs = 60
 
+# If the battery is already low (at or below low_battery_soc) when the grid
+# drops, waiting the full 60 s debounce is pure delay while the battery keeps
+# draining toward the inverter's cutoff. If low_battery_fast_debounce_secs is
+# set (> 0) and the battery is already low, the bridge skips the rest of the
+# 60 s wait and goes straight to the normal low-battery shutdown trigger.
+# Short blips are still filtered by this shorter wait. Set to 0 to disable.
+low_battery_fast_debounce_secs = 15 # seconds; default 15 (0 disables)
+
 # low_battery_soc MUST be set higher than inverter_cutoff_soc -- the bridge
 # refuses to start otherwise (see config.rs validate()). Put the inverter's
 # own low-SOC shutdown setting ("Battery capacity ShutDown", register 217)

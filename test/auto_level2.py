@@ -1710,6 +1710,65 @@ class AllLevel2Runner:
             assert "indicates incomplete shutdown" not in b_line, "bridge must not see residual marker"
         log("--> SCENARIO Z: PASSED", Color.GREEN + Color.BOLD)
 
+    def test_scenario_aa(self):
+        log("\n=======================================================", Color.BOLD)
+        log("RUNNING SCENARIO AA: Fast debounce on low battery (low_battery_fast_debounce_secs)", Color.BOLD)
+        log("=======================================================", Color.BOLD)
+        self.stop_bridge()
+        self.reset_env()
+
+        # Start with grid up and battery already low (25% <= low_battery_soc 30%)
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 25")
+        self.start_bridge()
+        self.wait_for_bridge_log(r"soc=25\.0% grid=230\.0V")
+
+        # Part 1: Short blip (< fast debounce limit of 2s) is filtered out
+        self.send_sim_cmd("outage")
+        self.wait_for_bridge_log(r"state: Idle -> GridLostDebouncing")
+        # Restore after 1s (< 2s fast debounce)
+        time.sleep(1)
+        self.send_sim_cmd("restore")
+        line = self.wait_for_bridge_log(r"state: GridLostDebouncing -> Idle", timeout=8)
+        log(f"  [OK] Short blip with low battery filtered to Idle: {line}", Color.GREEN)
+        assert os.path.getsize(f"{DIR}/ssh.log") == 0, "no SSH shutdown during filtered blip"
+        assert not os.path.exists(f"{DIR}/shutdown_fired"), "marker must not be created during blip"
+
+        # Part 2: Sustained outage (> 2s) triggers fast debounce well before normal 5s debounce
+        t0 = time.time()
+        self.send_sim_cmd("outage")
+        self.wait_for_bridge_log(r"state: Idle -> GridLostDebouncing")
+        line_onbatt = self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=5)
+        t_fire = time.time() - t0
+        log(f"  [OK] Fast debounce transitioned to OnBattery in {t_fire:.1f}s: {line_onbatt}", Color.GREEN)
+        assert t_fire < 4.5, f"Expected fast debounce (< 4.5s), took {t_fire:.1f}s"
+
+        line_shut = self.wait_for_bridge_log(r"firing shutdown sequence", timeout=3)
+        log(f"  [OK] Shutdown sequence fired: {line_shut}", Color.GREEN)
+        self.wait_for_bridge_log(r"state: OnBattery -> ShutdownLatched", timeout=3)
+        assert os.path.exists(f"{DIR}/shutdown_fired"), "marker file must be created"
+
+        # Wait for shutdown sequence to complete
+        line_done = self.wait_for_bridge_log(r"shutdown sequence complete", timeout=25)
+        log(f"  [OK] {line_done}", Color.GREEN)
+
+        with open(f"{DIR}/ssh.log") as f:
+            ssh_content = f.read()
+        assert "10.99.0.1" in ssh_content, "ws-1 not contacted"
+        assert "10.99.0.2" in ssh_content, "ws-2 not contacted"
+        assert "10.99.0.3" in ssh_content, "proxmox not contacted"
+
+        # Recovery + WoL
+        self.send_sim_cmd("restore")
+        self.send_sim_cmd("soc 80")
+        self.wait_for_bridge_log(r"state: ShutdownLatched -> RecoveryDebouncing")
+        self.wait_for_bridge_log(r"state: RecoveryDebouncing -> Idle", timeout=15)
+        self.wait_for_bridge_log(r"Wake-on-LAN round 1/4", timeout=5)
+        self.wait_for_bridge_log(r"Wake-on-LAN round 4/4", timeout=25)
+        time.sleep(1)
+        assert not os.path.exists(f"{DIR}/shutdown_fired"), "marker file should be deleted after WOL"
+        log("--> SCENARIO AA: PASSED", Color.GREEN + Color.BOLD)
+
     def run(self, targets=None):
         all_scenarios = [
             ("a", "Scenario A", self.test_scenario_a),
@@ -1746,6 +1805,7 @@ class AllLevel2Runner:
             ("x", "Scenario X", self.test_scenario_x),
             ("y", "Scenario Y", self.test_scenario_y),
             ("z", "Scenario Z", self.test_scenario_z),
+            ("aa", "Scenario AA", self.test_scenario_aa),
         ]
 
         if targets:

@@ -225,7 +225,8 @@ impl Supervisor<'_> {
     }
 
     /// Resumes an interrupted shutdown once the grid is *confirmed* down --
-    /// lost for the full `on_battery_debounce_secs`, like the normal path --
+    /// lost for the full debounce (`on_battery_debounce_secs`, or
+    /// `low_battery_fast_debounce_secs` if SOC is low), like the normal path --
     /// so one glitchy reading right after a reboot can't shut down the
     /// endpoints the previous run never reached.
     fn resume_if_grid_down(&mut self, grid_lost: bool, grid_lost_confirmed: bool) {
