@@ -109,7 +109,7 @@ When an outage begins, the bridge debounces for `on_battery_debounce_secs` (60 s
 to filter short blips before declaring on-battery operation. If the battery is already
 low (SOC at or below `low_battery_soc`), waiting the full 60 s would needlessly drain
 the battery toward the inverter's cutoff; in this case, `low_battery_fast_debounce_secs`
-(default 15 s, 0 to disable) accelerates the transition to on-battery operation once
+(default 15 s, 0 to disable; must be ≤ `on_battery_debounce_secs`) accelerates the transition to on-battery operation once
 the grid has remained down for that shorter wait, immediately evaluating the low-battery
 shutdown trigger. Short blips are still filtered by this shorter wait.
 
@@ -329,7 +329,8 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
 
 The bridge checks at startup, and refuses to start on, a wrong SOC range,
 a `grid_lost_voltage` outside 1.0-400.0 V, a poll interval outside 1-10 s
-(the watchdog margin), a malformed `wol_broadcast_addr` (or global `255.255.255.255`),
+(the watchdog margin), a `low_battery_fast_debounce_secs` > `on_battery_debounce_secs`
+(or > 3600 s), a malformed `wol_broadcast_addr` (or global `255.255.255.255`),
 `wol_resend_count` > 100, `wol_resend_interval_secs` > 3600, a malformed MAC address,
 duplicate endpoint names, and (when `vms_then_poweroff` is selected) a WOL
 window shorter than `vm_shutdown_timeout_secs`. SSH key files that are missing

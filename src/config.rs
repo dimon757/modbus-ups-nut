@@ -126,7 +126,7 @@ pub struct Thresholds {
     /// low_battery_fast_debounce_secs is set (> 0) and the battery is already
     /// low, the bridge skips the rest of on_battery_debounce_secs after this
     /// shorter wait and goes straight to the normal low-battery fire check.
-    /// 0 disables it.
+    /// 0 disables it. Must be <= on_battery_debounce_secs.
     #[serde(default = "default_low_battery_fast_debounce_secs")]
     pub low_battery_fast_debounce_secs: u64,
     /// SOC (%) at or below which, while on_battery, we start the shutdown
@@ -276,6 +276,20 @@ impl Config {
             bail!(
                 "thresholds.low_battery_fast_debounce_secs is {} s -- must be <= 3600 (0 disables)",
                 t.low_battery_fast_debounce_secs
+            );
+        }
+        // Fast path must not be longer than the normal debounce. A larger
+        // value is confusing ("fast" that is slower) and has no effect: the
+        // normal wait still wins. 0 disables the feature and is always allowed.
+        if t.low_battery_fast_debounce_secs > 0
+            && t.low_battery_fast_debounce_secs > t.on_battery_debounce_secs
+        {
+            bail!(
+                "thresholds.low_battery_fast_debounce_secs ({} s) must be <= \
+                 thresholds.on_battery_debounce_secs ({} s) -- \"fast\" cannot \
+                 be longer than the normal grid-lost debounce (0 disables fast path)",
+                t.low_battery_fast_debounce_secs,
+                t.on_battery_debounce_secs
             );
         }
         if t.recovery_debounce_secs > 3600 {
@@ -751,6 +765,28 @@ mod tests {
             "low_battery_fast_debounce_secs = 3601",
         ));
         assert!(err.contains("low_battery_fast_debounce_secs"), "{err}");
+    }
+
+    #[test]
+    fn low_battery_fast_debounce_secs_must_not_exceed_normal_debounce() {
+        // fast > normal is refused
+        let err = validate_err(&example_with(
+            "low_battery_fast_debounce_secs = 15",
+            "low_battery_fast_debounce_secs = 90",
+        ));
+        assert!(
+            err.contains("low_battery_fast_debounce_secs") && err.contains("on_battery_debounce_secs"),
+            "{err}"
+        );
+
+        // equal is allowed (no faster path, but valid)
+        let text_eq = example_with(
+            "low_battery_fast_debounce_secs = 15",
+            "low_battery_fast_debounce_secs = 60",
+        );
+        let cfg: Config = toml::from_str(&text_eq).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.thresholds.low_battery_fast_debounce_secs, 60);
     }
 }
 
