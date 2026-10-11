@@ -4,24 +4,24 @@ This guide details how to configure a domain-joined or standalone Windows 10/11 
 
 ---
 
-## Architecture & Principles
+## Architecture & Security Principles
 
 1. **Dedicated Local Account (`UPS-shutdown`)**:
    - Creating a **local** account on the workstation (rather than an Active Directory domain account) ensures shutdown commands succeed even when domain controllers are unreachable or already offline during a power outage.
 2. **Low-Privilege Account**:
    - In Windows workstation editions (10/11 Pro & Enterprise), members of the local `Users` group are granted `SeShutdownPrivilege` ("Shut down the system") by default.
    - Standard accounts avoid the Windows OpenSSH quirk where members of `Administrators` are forced to use `C:\ProgramData\ssh\administrators_authorized_keys`.
-3. **Avoid Folder Collision (The Profile Rule)**:
+3. **Avoid Profile Collisions**:
    - **Never manually create `C:\Users\UPS-shutdown` before the user logs in.**
-   - If you pre-create the folder, Windows detects a collision during first login and names the active profile `C:\Users\UPS-shutdown.<COMPUTERNAME>`.
-   - Logging in once with password initializes the official Windows profile path cleanly.
-4. **Strict NTFS ACLs & ASCII Encoding**:
-   - OpenSSH strictly enforces permissions: inheritance must be stripped, and access must be restricted to `UPS-shutdown`, `SYSTEM`, and `Administrators`.
-   - Keys must be written in pure ASCII (or UTF-8 without BOM) to avoid parser errors.
+   - Pre-creating the directory causes Windows to create the active profile as `C:\Users\UPS-shutdown.<COMPUTERNAME>`, leading to path mismatches.
+   - Initializing the profile on first login ensures Windows creates and registers the profile cleanly.
+4. **Direct Transfer via SCP (Prevents Key Corruption)**:
+   - Copy-pasting public keys via terminal or clipboard frequently introduces line-breaks and leading indentation spaces, which corrupts the cryptographic base64 data.
+   - Transferring the public key file directly using `scp` guarantees an exact, byte-for-byte pristine single-line file.
 
 ---
 
-## Step 1: Install and Enable OpenSSH Server
+## Step 1: Install and Enable OpenSSH Server (Windows)
 
 On the Windows workstation, open **PowerShell as Administrator**:
 
@@ -39,74 +39,65 @@ Get-NetFirewallRule -Name *OpenSSH-Server* | Select-Object Name, Enabled, Direct
 
 ---
 
-## Step 2: Create the Local `UPS-shutdown` User
+## Step 2: Create the Local `UPS-shutdown` User (Windows)
 
 Run in **PowerShell (as Administrator)**:
 
 ```powershell
-# Prompt for password
-$Password = Read-Host -AsSecureString "Enter password for local user UPS-shutdown"
+# Prompt for a secure password
+$Password = Read-Host -AsSecureString "Enter password for UPS-shutdown"
 
-# Create local user with password that never expires
+# Create local user
 New-LocalUser -Name "UPS-shutdown" `
               -Password $Password `
               -PasswordNeverExpires `
-              -Description "Automated UPS shutdown service account"
+              -Description "Automated UPS shutdown account"
 ```
 
 > [!IMPORTANT]
-> Do **NOT** add this user to the `Administrators` group.
-> Do **NOT** manually create `C:\Users\UPS-shutdown` yet.
+> - Do **NOT** add this user to the `Administrators` group.
+> - Do **NOT** manually create any folder in `C:\Users`.
 
 ---
 
-## Step 3: Initialize the User Profile (Crucial Step)
+## Step 3: Initialize Profile and Transfer Key via SCP (Linux Bridge)
 
-Windows does not register a user's profile in the registry (`ProfileList`) until the account logs in for the first time.
+From your **Linux bridge terminal (`bridge@UPS-Bridge`)**:
 
-From your **Linux bridge terminal**, initiate a one-time login using password:
+### 1. Initialize the Windows profile & create `.ssh` folder
+```bash
+ssh UPS-shutdown@<WORKSTATION-IP> "powershell -Command New-Item -ItemType Directory -Path .ssh -Force"
+```
+*(Enter the password for `UPS-shutdown` when prompted. This logs in for the first time, registers the Windows profile, and creates the `.ssh` folder).*
+
+### 2. Copy the public key directly using SCP
+Transfer the public key file directly from Linux to Windows:
 
 ```bash
-ssh UPS-shutdown@<WORKSTATION-IP> "whoami"
+sudo scp /etc/modbus-ups-bridge/workstation_key.pub UPS-shutdown@<WORKSTATION-IP>:.ssh/authorized_keys
 ```
+*(Enter your Linux sudo password if prompted, then the Windows `UPS-shutdown` password).*
 
-Type the password you set in Step 2. When it outputs `<COMPUTERNAME>\ups-shutdown`, the Windows profile has been officially registered.
+> [!TIP]
+> Using `scp` transfers the key cleanly with no line-wrapping, no missing characters, and no clipboard indentation artifacts.
 
 ---
 
-## Step 4: Configure `authorized_keys` in the Active Profile
+## Step 4: Apply Strict NTFS ACLs (Windows)
 
-Now that the profile exists, detect its exact path dynamically and install the public key.
+Windows OpenSSH strictly verifies NTFS permissions. If permissions are inherited from parent folders, OpenSSH will silently reject the key.
 
 On the Windows workstation, run in **PowerShell (as Administrator)**:
 
 ```powershell
-# 1. Dynamically locate the official profile folder
+# 1. Automatically locate the active profile directory
 $ProfilePath = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*' | 
     Where-Object { $_.ProfileImagePath -like "*UPS-shutdown*" }).ProfileImagePath
-
-if (-not $ProfilePath) {
-    Write-Error "User profile not found! Make sure Step 3 (login once with password) succeeded."
-    return
-}
-
-Write-Host "Configuring SSH key in: $ProfilePath\.ssh" -ForegroundColor Cyan
 
 $SshDir = "$ProfilePath\.ssh"
 $AuthKeys = "$SshDir\authorized_keys"
 
-# 2. Create .ssh directory if needed
-if (-not (Test-Path $SshDir)) {
-    New-Item -ItemType Directory -Path $SshDir -Force | Out-Null
-}
-
-# 3. Paste your public key string below:
-$PublicKey = "ssh-rsa AAAA... modbus-ups-bridge-ws"
-
-# Write key in pure ASCII without BOM
-[System.IO.File]::WriteAllText($AuthKeys, "$($PublicKey.Trim())`n", [System.Text.Encoding]::ASCII)
-
-# 4. Apply strict NTFS permissions (Disable inheritance, allow User, SYSTEM, Administrators)
+# 2. Disable inheritance and grant exclusive access to User, SYSTEM, and Administrators
 icacls.exe $SshDir /inheritance:r
 icacls.exe $SshDir /grant:r "UPS-shutdown:(OI)(CI)F"
 icacls.exe $SshDir /grant:r "SYSTEM:(OI)(CI)F"
@@ -117,31 +108,18 @@ icacls.exe $AuthKeys /grant:r "UPS-shutdown:F"
 icacls.exe $AuthKeys /grant:r "SYSTEM:F"
 icacls.exe $AuthKeys /grant:r "Administrators:F"
 
-# 5. Set owner to the local user
+# 3. Set owner
 icacls.exe $SshDir /setowner "UPS-shutdown"
 icacls.exe $AuthKeys /setowner "UPS-shutdown"
 
-Write-Host "===> Public key and ACLs successfully installed!" -ForegroundColor Green
+Write-Host "===> Permissions configured successfully!" -ForegroundColor Green
 ```
 
 ---
 
-## Step 5: Verify User Rights Assignment (Shutdown Privilege)
+## Step 5: Test Key-Based Login (Linux Bridge)
 
-1. Open **Local Security Policy** (`secpol.msc`).
-2. Navigate to: **Security Settings** → **Local Policies** → **User Rights Assignment**.
-3. Check the policy **Shut down the system**:
-   - By default, it contains `Administrators` and `Users`.
-   - If your domain Group Policy (GPO) restricts this, explicitly add the local user `UPS-shutdown`.
-
----
-
-## Step 6: Test Public Key Authentication from Linux
-
-From your **Linux bridge terminal**, test key-based login.
-
-> [!NOTE]
-> Because private keys in `/etc/modbus-ups-bridge/` are owned by `root` with `0600` permissions, run test commands with `sudo`:
+From the **Linux bridge terminal**, test the connection using the private key:
 
 ```bash
 sudo ssh -i /etc/modbus-ups-bridge/workstation_key UPS-shutdown@<WORKSTATION-IP> "whoami"
@@ -151,35 +129,35 @@ sudo ssh -i /etc/modbus-ups-bridge/workstation_key UPS-shutdown@<WORKSTATION-IP>
 ```text
 <COMPUTERNAME>\ups-shutdown
 ```
-*(Connected without prompting for any Windows password!)*
+*(Logs in immediately without asking for a Windows password!)*
 
 ---
 
-## Step 7: Lock Down with `ForceCommand` (Production Hardening)
+## Step 6: Hardening with `ForceCommand` (Windows)
 
-To ensure the private key cannot be used for an interactive shell or arbitrary commands, restrict the key in `C:\ProgramData\ssh\sshd_config` on the workstation:
+To guarantee that a compromised key can only execute the shutdown command and cannot open an interactive shell, lock it down in `C:\ProgramData\ssh\sshd_config`:
 
 1. Open `C:\ProgramData\ssh\sshd_config` (Notepad as Administrator).
-2. Append to the **very end** of the file:
+2. Append this block to the **very end** of the file:
 
 ```text
 Match User ups-shutdown
     ForceCommand shutdown /s /t 60 /c "Inverter battery low, grid still down -- shutting down."
 ```
 
-3. Restart the SSH service in PowerShell:
+3. Restart the OpenSSH service in PowerShell:
 ```powershell
 Restart-Service sshd
 ```
 
-> [!IMPORTANT]
-> `ForceCommand` overrides whatever command the client sends. Any SSH connection using this user will initiate a 60-second shutdown countdown.
+> [!NOTE]
+> `ForceCommand` overrides any command sent over SSH. When configured, any SSH connection by `UPS-shutdown` triggers a 60-second shutdown countdown.
 
 ---
 
-## Step 8: Configure in `bridge.toml`
+## Step 7: Configure in `bridge.toml`
 
-Add the workstation endpoint to your `bridge.toml`:
+Add the Windows workstation to your `bridge.toml` configuration on the bridge:
 
 ```toml
 [[endpoints]]
@@ -198,9 +176,9 @@ mac_address = "AA:BB:CC:DD:EE:FF"  # Workstation MAC address for Wake-on-LAN
 
 | Symptom | Root Cause | Solution |
 |---|---|---|
-| `Load key ...: Permission denied` | Linux file permissions on private key | Use `sudo ssh` or ensure the bridge service user has read permissions on `/etc/modbus-ups-bridge/workstation_key`. |
-| `Failed publickey ...` (password prompt) | Profile folder collision (`.BOBEV_REF` or `.000`) | Query `$ProfilePath` from registry (Step 4) and ensure `.ssh\authorized_keys` is in the active folder, not an orphaned pre-created folder. |
-| `Failed publickey ...` | UTF-16 encoding with BOM | Save key using `[System.IO.File]::WriteAllText` with `[System.Text.Encoding]::ASCII`. |
-| `Failed publickey ...` | User added to `Administrators` | Windows OpenSSH forces admin keys to `C:\ProgramData\ssh\administrators_authorized_keys`. Remove `UPS-shutdown` from `Administrators`. |
-| `Access is denied (5)` on `shutdown` | Missing shutdown privilege | Check Local Security Policy (`secpol.msc` → *Shut down the system*) and grant it to `UPS-shutdown`. |
-| Diagnostic debug log | Need exact server error | On Windows: `Stop-Service sshd` then `& "$env:SystemRoot\System32\OpenSSH\sshd.exe" -d`. |
+| `Load key ...: Permission denied` | Linux file permissions on private key | Run command with `sudo` (`sudo ssh ...`). The background service runs as root and will read it automatically. |
+| `UPS-shutdown@... password:` prompt | Corrupted key in `authorized_keys` | Re-transfer the key directly using `sudo scp /path/to/key.pub UPS-shutdown@<IP>:.ssh/authorized_keys` to avoid clipboard/wrapping issues. |
+| `Permission denied (publickey)` | NTFS permissions too loose | Re-run the `icacls.exe` script in Step 4 to strip inheritance and remove unauthorized users. |
+| `Permission denied (publickey)` | User is an Administrator | Windows OpenSSH redirects admin keys to `C:\ProgramData\ssh\administrators_authorized_keys`. Remove `UPS-shutdown` from `Administrators`. |
+| `Access is denied (5)` on `shutdown` | Missing shutdown privilege | Check Local Security Policy (`secpol.msc` → *User Rights Assignment* → *Shut down the system*) and ensure `UPS-shutdown` or `Users` is listed. |
+| Host key verification prompt | Workstation host key not in known hosts | Scan and pin the workstation host key: `ssh-keyscan -H <WORKSTATION-IP> \| sudo tee -a /root/.ssh/known_hosts`. |
