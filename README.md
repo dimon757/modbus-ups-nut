@@ -408,6 +408,8 @@ Full explanation and step-by-step instructions: [TESTING.md](TESTING.md).
 
 ## Windows-side setup (per workstation)
 
+For a complete step-by-step setup, ACL configuration, and testing guide, see [docs/windows-ssh-shutdown-setup.md](docs/windows-ssh-shutdown-setup.md).
+
 1. Enable OpenSSH Server (not on by default):
    `Add-WindowsCapability -Online -Name OpenSSH.Server`, then set the
    `sshd` service to auto-start.

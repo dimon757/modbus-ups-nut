@@ -324,7 +324,7 @@ sudo ssh -i /etc/modbus-ups-bridge/proxmox_key root@<proxmox-ip> 'pveversion'
 Answer `yes` to trust the host key. It must print the Proxmox version without prompting for a password. Also verify `nohup` is installed (`which nohup`).
 
 ### Windows workstations
-1. Set up OpenSSH Server, create the local `ups-shutdown` account, and configure the `ForceCommand` lockdown in `sshd_config` (see README, "Windows-side setup").
+1. Set up OpenSSH Server, create the local `ups-shutdown` account, and configure the `ForceCommand` lockdown in `sshd_config` (see [docs/windows-ssh-shutdown-setup.md](windows-ssh-shutdown-setup.md) and README, "Windows-side setup").
 2. Copy the public key into `C:\Users\ups-shutdown\.ssh\authorized_keys`:
    ```bash
    sudo cat /etc/modbus-ups-bridge/workstation_key.pub
