@@ -19,6 +19,7 @@
 
 dir=${MUB_TEST_DIR:-/tmp/mub-test}
 here=$(cd "$(dirname "$0")" && pwd)
+raw_args="$*"
 target=""
 for arg in "$@"; do
     case $arg in *@*) target=$arg ;; esac
@@ -30,7 +31,7 @@ if [ -f "$dir/ssh-booting-$host" ]; then
     count=$(cat "$dir/ssh-booting-$host" 2>/dev/null || echo 0)
     if [ "$count" -gt 0 ]; then
         echo "$((count - 1))" > "$dir/ssh-booting-$host"
-        echo "$(date +%T) $target REFUSED (simulated): $remote_cmd (booting, $count attempt(s) remaining)" >> "$dir/ssh.log"
+        echo "$(date +%T) $target REFUSED (simulated): $remote_cmd (booting, $count attempt(s) remaining) [args: $raw_args]" >> "$dir/ssh.log"
         echo "ssh: connect to host $host port 22: Connection refused (simulated)" >&2
         exit 255
     else
@@ -44,7 +45,7 @@ if [ -f "$dir/ssh-flaky-qm-shutdown-$host" ]; then
             count=$(cat "$dir/ssh-flaky-qm-shutdown-$host" 2>/dev/null || echo 0)
             if [ "$count" -gt 0 ]; then
                 echo "$((count - 1))" > "$dir/ssh-flaky-qm-shutdown-$host"
-                echo "$(date +%T) $target DROPPED (simulated): $remote_cmd ($count drop(s) remaining)" >> "$dir/ssh.log"
+                echo "$(date +%T) $target DROPPED (simulated): $remote_cmd ($count drop(s) remaining) [args: $raw_args]" >> "$dir/ssh.log"
                 echo "kex_exchange_identification: read: Connection reset by peer (simulated)" >&2
                 exit 255
             else
@@ -55,23 +56,23 @@ if [ -f "$dir/ssh-flaky-qm-shutdown-$host" ]; then
 fi
 
 if [ -f "$dir/ssh-fail" ] && grep -qxF "$host" "$dir/ssh-fail"; then
-    echo "$(date +%T) $target FAILED (simulated): $remote_cmd" >> "$dir/ssh.log"
+    echo "$(date +%T) $target FAILED (simulated): $remote_cmd [args: $raw_args]" >> "$dir/ssh.log"
     echo "ssh: connect to host $host port 22: Connection timed out (simulated)" >&2
     exit 255
 fi
 if [ -f "$dir/ssh-hang" ] && grep -qxF "$host" "$dir/ssh-hang"; then
-    echo "$(date +%T) $target HANGING (simulated): $remote_cmd" >> "$dir/ssh.log"
+    echo "$(date +%T) $target HANGING (simulated): $remote_cmd [args: $raw_args]" >> "$dir/ssh.log"
     exec sleep 600
 fi
 
 if [ -f "$dir/ssh-delay-$host" ]; then
     delay=$(cat "$dir/ssh-delay-$host" 2>/dev/null || echo 0)
-    echo "$(date +%T) $target DELAYING (simulated ${delay}s): $remote_cmd" >> "$dir/ssh.log"
+    echo "$(date +%T) $target DELAYING (simulated ${delay}s): $remote_cmd [args: $raw_args]" >> "$dir/ssh.log"
     sleep "$delay"
 fi
 
 if [ -f "$dir/ssh-already-scheduled-$host" ]; then
-    echo "$(date +%T) $target REFUSED (1190 already scheduled): $remote_cmd" >> "$dir/ssh.log"
+    echo "$(date +%T) $target REFUSED (1190 already scheduled): $remote_cmd [args: $raw_args]" >> "$dir/ssh.log"
     echo "A system shutdown has already been scheduled.(1190)" >&2
     rm -f "$dir/ssh-already-scheduled-$host"
     exit 1
@@ -84,7 +85,7 @@ if [ -d "$proxmox" ]; then
             errfile="$proxmox/stderr.$$.$RANDOM"
             out=$(PATH="$here/../pve-bin:$PATH" FAKE_PROXMOX_DIR="$proxmox" sh -c "$remote_cmd" 2>"$errfile")
             rc=$?
-            printf '%s\n' "$(date +%T) $target: $remote_cmd  -> exit $rc" >> "$dir/ssh.log"
+            printf '%s\n' "$(date +%T) $target: $remote_cmd  -> exit $rc [args: $raw_args]" >> "$dir/ssh.log"
             [ -n "$out" ] && printf '%s\n' "$out"
             cat "$errfile" >&2
             rm -f "$errfile"
@@ -103,7 +104,7 @@ if [ -d "$esxi" ]; then
         *vim-cmd*|*esxcli*)
             out=$(PATH="$here/../esxi-bin:$PATH" FAKE_ESXI_DIR="$esxi" sh -c "$remote_cmd" 2>"$esxi/stderr")
             rc=$?
-            printf '%s\n' "$(date +%T) $target: $remote_cmd  -> exit $rc" >> "$dir/ssh.log"
+            printf '%s\n' "$(date +%T) $target: $remote_cmd  -> exit $rc [args: $raw_args]" >> "$dir/ssh.log"
             [ -n "$out" ] && printf '%s\n' "$out"
             cat "$esxi/stderr" >&2
             exit $rc
@@ -114,5 +115,5 @@ if [ -d "$esxi" ]; then
     esac
 fi
 
-echo "$(date +%T) $target: $remote_cmd" >> "$dir/ssh.log"
+echo "$(date +%T) $target: $remote_cmd [args: $raw_args]" >> "$dir/ssh.log"
 exit 0

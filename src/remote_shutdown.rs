@@ -900,6 +900,34 @@ async fn ssh_exec(ep: &Endpoint, opts: &ShutdownOptions, remote_cmd: &str) -> Re
     ssh_exec_timeout(ep, opts, remote_cmd, SSH_TIMEOUT).await
 }
 
+fn build_ssh_args<'a>(
+    ep: &'a Endpoint,
+    opts: &'a ShutdownOptions,
+    remote_cmd: &'a str,
+) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "-i".into(),
+        (&ep.ssh_key_path).into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=10".into(),
+        "-o".into(),
+        "ServerAliveInterval=5".into(),
+        "-o".into(),
+        "ServerAliveCountMax=3".into(),
+    ];
+    if let Some(file) = &opts.known_hosts_file {
+        args.push("-o".into());
+        args.push(format!("UserKnownHostsFile={}", file).into());
+    }
+    args.push(format!("{}@{}", ep.ssh_user, ep.host).into());
+    args.push(remote_cmd.into());
+    args
+}
+
 async fn ssh_exec_timeout(
     ep: &Endpoint,
     opts: &ShutdownOptions,
@@ -907,26 +935,8 @@ async fn ssh_exec_timeout(
     timeout: Duration,
 ) -> Result<String> {
     let mut cmd = Command::new("ssh");
-    cmd.args([
-        "-i",
-        &ep.ssh_key_path,
-        "-o",
-        "BatchMode=yes",
-        "-o",
-        "StrictHostKeyChecking=yes",
-        "-o",
-        "ConnectTimeout=10",
-        "-o",
-        "ServerAliveInterval=5",
-        "-o",
-        "ServerAliveCountMax=3",
-    ]);
-    if let Some(file) = &opts.known_hosts_file {
-        cmd.arg("-o").arg(format!("UserKnownHostsFile={}", file));
-    }
-    cmd.arg(format!("{}@{}", ep.ssh_user, ep.host))
-        .arg(remote_cmd)
-        .kill_on_drop(true);
+    cmd.args(build_ssh_args(ep, opts, remote_cmd));
+    cmd.kill_on_drop(true);
 
     let output = tokio::time::timeout(timeout, cmd.output())
         .await
@@ -1024,6 +1034,49 @@ mod tests {
              > /tmp/ups-shutdown.log 2>&1 < /dev/null &"
         );
         assert!(!cmd.contains("systemctl"));
+    }
+
+    #[test]
+    fn windows_command_formats_correctly() {
+        let ep = endpoint(EndpointKind::Windows);
+        let cmd = remote_command(&ep);
+        assert_eq!(
+            cmd,
+            "shutdown /s /t 10 /c \"Inverter battery low, grid still down -- shutting down.\""
+        );
+        assert!(!cmd.contains("/r")); // Must shut down, never reboot
+        assert!(cmd.starts_with("shutdown /s /t"));
+    }
+
+    #[test]
+    fn ssh_arguments_contain_required_security_options() {
+        let ep = Endpoint {
+            name: "ws-1".into(),
+            kind: EndpointKind::Windows,
+            host: "192.168.1.50".into(),
+            ssh_user: "ups-shutdown".into(),
+            ssh_key_path: "/etc/key".into(),
+            shutdown_delay_secs: 60,
+            mac_address: "AA:BB:CC:DD:EE:FF".into(),
+            ssh_connect_retry_secs: None,
+        };
+        let opts = ShutdownOptions {
+            known_hosts_file: Some("/custom/known_hosts".into()),
+            proxmox: ProxmoxConfig::default(),
+            stagger_secs: 2,
+            ssh_connect_retry_secs: 60,
+        };
+        let args = build_ssh_args(&ep, &opts, "shutdown /s /t 60");
+        let arg_strings: Vec<String> = args.into_iter().map(|s| s.to_string_lossy().into_owned()).collect();
+
+        assert_eq!(arg_strings[0], "-i");
+        assert_eq!(arg_strings[1], "/etc/key");
+        assert!(arg_strings.contains(&"BatchMode=yes".to_string()));
+        assert!(arg_strings.contains(&"StrictHostKeyChecking=yes".to_string()));
+        assert!(arg_strings.contains(&"ConnectTimeout=10".to_string()));
+        assert!(arg_strings.contains(&"UserKnownHostsFile=/custom/known_hosts".to_string()));
+        assert_eq!(arg_strings[arg_strings.len() - 2], "ups-shutdown@192.168.1.50");
+        assert_eq!(arg_strings[arg_strings.len() - 1], "shutdown /s /t 60");
     }
 
     #[test]

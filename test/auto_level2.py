@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automated runner for ALL Level 2 test scenarios (A through Z, 34 scenarios).
+"""Automated runner for ALL Level 2 test scenarios (A through AA, 35 scenarios).
 Configuration:
   - 2 Windows 11 endpoints (ws-1: 10.99.0.1, ws-2: 10.99.0.2)
   - 1 Proxmox endpoint (proxmox: 10.99.0.3, method: vms_then_poweroff)
@@ -363,6 +363,8 @@ class AllLevel2Runner:
             assert "10.99.0.1" in ssh_content, "ws-1 not contacted"
             assert "10.99.0.2" not in ssh_content, "ws-2 contacted unexpectedly"
             assert "10.99.0.3" not in ssh_content, "proxmox contacted unexpectedly"
+            assert "shutdown /s /t 60" in ssh_content, "Windows shutdown command missing or wrong"
+            assert "StrictHostKeyChecking=yes" in ssh_content, "StrictHostKeyChecking missing from ssh args"
 
             with open(f"{DIR}/shutdown_fired") as f:
                 marker = f.read()
@@ -387,6 +389,14 @@ class AllLevel2Runner:
             assert "10.99.0.1" in ssh_content, "ws-1 not contacted"
             assert "10.99.0.2" in ssh_content, "ws-2 not contacted"
             assert "10.99.0.3" in ssh_content, "proxmox not contacted"
+            assert "shutdown /s /t 60" in ssh_content, "Windows shutdown command missing or wrong"
+            assert "StrictHostKeyChecking=yes" in ssh_content, "StrictHostKeyChecking missing from ssh args"
+
+            # Check endpoint order: ws-1 before ws-2 before proxmox
+            pos_ws1 = ssh_content.find("10.99.0.1")
+            pos_ws2 = ssh_content.find("10.99.0.2")
+            pos_pve = ssh_content.find("10.99.0.3")
+            assert pos_ws1 < pos_ws2 < pos_pve, f"Endpoints contacted out of order: ws-1={pos_ws1}, ws-2={pos_ws2}, pve={pos_pve}"
 
             with open(f"{DIR}/shutdown_fired") as f:
                 marker = f.read()
@@ -645,6 +655,7 @@ class AllLevel2Runner:
         self.send_sim_cmd("soc 80")
         self.start_bridge()
         self.wait_for_bridge_log(r"loaded config from .*bridge.*\.toml")
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
 
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
@@ -1055,6 +1066,7 @@ class AllLevel2Runner:
         self.send_sim_cmd("soc 80")
         self.start_bridge()
         self.wait_for_bridge_log(r"loaded config from .*bridge.*\.toml")
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
 
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
@@ -1100,6 +1112,7 @@ class AllLevel2Runner:
         self.send_sim_cmd("soc 80")
         self.start_bridge()
         self.wait_for_bridge_log(r"loaded config from .*bridge.*\.toml")
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
 
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
@@ -1140,6 +1153,7 @@ class AllLevel2Runner:
         self.send_sim_cmd("soc 80")
         self.start_bridge()
         self.wait_for_bridge_log(r"loaded config from .*bridge.*\.toml")
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
 
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
@@ -1177,6 +1191,7 @@ class AllLevel2Runner:
         self.send_sim_cmd("soc 80")
         self.start_bridge()
         self.wait_for_bridge_log(r"loaded config from .*bridge.*\.toml")
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
 
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
@@ -1243,6 +1258,7 @@ class AllLevel2Runner:
         self.send_sim_cmd("soc 80")
         self.start_bridge()
         self.wait_for_bridge_log(r"loaded config from .*bridge.*\.toml")
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
 
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
@@ -1373,6 +1389,7 @@ class AllLevel2Runner:
         self.send_sim_cmd("soc 80")
         self.start_bridge()
         self.wait_for_bridge_log(r"loaded config from .*bridge.*\.toml")
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
 
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
@@ -1414,6 +1431,7 @@ class AllLevel2Runner:
         self.send_sim_cmd("soc 80")
         self.start_bridge()
         self.wait_for_bridge_log(r"loaded config from .*bridge.*\.toml")
+        self.wait_for_bridge_log(r"soc=80\.0% grid=230\.0V")
 
         self.send_sim_cmd("outage")
         self.wait_for_bridge_log(r"state: GridLostDebouncing -> OnBattery", timeout=8)
@@ -1678,6 +1696,11 @@ class AllLevel2Runner:
         assert "completed" in marker
         assert "dispatched: ws-1" in marker
         log("  [OK] ws-1 recorded as dispatched in manifest despite error 1190", Color.GREEN)
+
+        with open(f"{DIR}/ssh.log") as f:
+            ssh_content = f.read()
+        assert "shutdown /s /t 60" in ssh_content, "Windows shutdown command missing or wrong"
+        assert "StrictHostKeyChecking=yes" in ssh_content, "StrictHostKeyChecking missing from ssh args"
 
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
