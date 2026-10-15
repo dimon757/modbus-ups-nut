@@ -177,21 +177,21 @@ Install `mbpoll` (Debian 13 includes version 1.5.2):
 sudo apt install -y mbpoll
 ```
 
-Test reading holding register 0 (device type; note `mbpoll` is 1-indexed, so register 0 is `-r 1`):
+Test reading holding register 0 (device type; using `-0` to match protocol 0-indexed register numbers):
 ```bash
-mbpoll -a 1 -b 9600 -d 8 -s 1 -p none -t 3 -r 1 -c 1 /dev/ttyS0
+mbpoll -m rtu -a 1 -b 9600 -P none -t 4 -0 -1 -r 0 /dev/ttyS0
 ```
 Expect:
 ```
-[1]: 768
+[0]: 768
 ```
 (`768` decimal = `0x0300` hex, confirming single-phase hybrid inverter).
 
-Test reading holding register 184 (battery SOC, `-r 185` in mbpoll):
+Test reading holding register 184 (battery SOC):
 ```bash
-mbpoll -a 1 -b 9600 -d 8 -s 1 -p none -t 3 -r 185 -c 1 /dev/ttyS0
+mbpoll -m rtu -a 1 -b 9600 -P none -t 4 -0 -1 -r 184 /dev/ttyS0
 ```
-Expect: the current battery percentage (e.g. `[185]: 85`).
+Expect: the current battery percentage (e.g. `[184]: 85`).
 
 *If every read times out:* Swap the A and B wires on the RS485 connector.
 
