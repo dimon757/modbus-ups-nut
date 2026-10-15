@@ -89,7 +89,7 @@ All scenarios in this checklist can also be run fully automated:
       `SOC 25.0% <= threshold 30.0% (2 of the last 3 readings) while on battery -- firing shutdown sequence`
 - [ ] `/tmp/mub-test/shutdown_fired` exists (it is written before any ssh call)
 - [ ] `shutdown sequence starting: 3 endpoint(s)`
-- [ ] ssh.log gets 3 lines, **2 s apart**, in config order:
+- [ ] ssh.log gets 3 lines, **2 s apart**, in config order (each recording the command and `[args: ...]`, including `-o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=10`):
   - `ups-shutdown@10.99.0.1: shutdown /s /t 60 /c "Inverter battery low, ..."`
   - `ups-shutdown@10.99.0.2: shutdown /s /t 60 ...`
   - `root@10.99.0.3: nohup sh -c 'sleep 10; /sbin/poweroff' > /tmp/ups-shutdown.log 2>&1 < /dev/null &`
@@ -281,7 +281,7 @@ against simulated VMs (`test/pve-bin/`): after
 `app server` (VM 101, 6 s). Each simulated VM is a line in
 `/tmp/mub-test/proxmox/<host>/vms` (`<id>|<name>|<behaviour>`); its state is in
 `state_<id>`, and `host` appears once the host has been powered off.
-In ssh.log, each executed command ends with `-> exit <code>`.
+In ssh.log, each executed command ends with `-> exit <code> [args: ...]`.
 
 ### N1. VMs shut down, then systemctl poweroff
 

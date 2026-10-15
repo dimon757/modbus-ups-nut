@@ -928,15 +928,23 @@ fn build_ssh_args<'a>(
     args
 }
 
+/// Builds the exact `ssh` process that will be spawned. Kept separate from
+/// `ssh_exec_timeout` so tests can inspect the real program and arguments
+/// (not only the argument helper's output).
+fn build_ssh_command(ep: &Endpoint, opts: &ShutdownOptions, remote_cmd: &str) -> Command {
+    let mut cmd = Command::new("ssh");
+    cmd.args(build_ssh_args(ep, opts, remote_cmd));
+    cmd.kill_on_drop(true);
+    cmd
+}
+
 async fn ssh_exec_timeout(
     ep: &Endpoint,
     opts: &ShutdownOptions,
     remote_cmd: &str,
     timeout: Duration,
 ) -> Result<String> {
-    let mut cmd = Command::new("ssh");
-    cmd.args(build_ssh_args(ep, opts, remote_cmd));
-    cmd.kill_on_drop(true);
+    let mut cmd = build_ssh_command(ep, opts, remote_cmd);
 
     let output = tokio::time::timeout(timeout, cmd.output())
         .await
@@ -1077,6 +1085,71 @@ mod tests {
         assert!(arg_strings.contains(&"UserKnownHostsFile=/custom/known_hosts".to_string()));
         assert_eq!(arg_strings[arg_strings.len() - 2], "ups-shutdown@192.168.1.50");
         assert_eq!(arg_strings[arg_strings.len() - 1], "shutdown /s /t 60");
+    }
+
+    /// ssh uses the FIRST value of a repeated `-o` option, so a stray or
+    /// conflicting duplicate (e.g. `StrictHostKeyChecking=no` placed before the
+    /// helper's arguments) would silently defeat the security options even
+    /// though `build_ssh_args` still contains the right ones. Inspect the real
+    /// spawned command and require every `-o` key to appear exactly once.
+    #[test]
+    fn spawned_ssh_command_has_each_security_option_exactly_once() {
+        let ep = Endpoint {
+            name: "ws-1".into(),
+            kind: EndpointKind::Windows,
+            host: "192.168.1.50".into(),
+            ssh_user: "ups-shutdown".into(),
+            ssh_key_path: "/etc/key".into(),
+            shutdown_delay_secs: 60,
+            mac_address: "AA:BB:CC:DD:EE:FF".into(),
+            ssh_connect_retry_secs: None,
+        };
+        let opts = ShutdownOptions {
+            known_hosts_file: Some("/custom/known_hosts".into()),
+            proxmox: ProxmoxConfig::default(),
+            stagger_secs: 2,
+            ssh_connect_retry_secs: 60,
+        };
+        let cmd = build_ssh_command(&ep, &opts, "shutdown /s /t 60");
+        let std_cmd = cmd.as_std();
+        assert_eq!(std_cmd.get_program().to_string_lossy(), "ssh");
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        // Every "-o" is followed by KEY=VALUE; collect the keys.
+        let mut keys: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "-o" {
+                let kv = args.get(i + 1).expect("-o without a value");
+                keys.push(kv.split('=').next().unwrap().to_string());
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        let mut unique = keys.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), keys.len(), "duplicate -o option in {keys:?}");
+
+        let count = |needle: &str| args.iter().filter(|a| a.as_str() == needle).count();
+        assert_eq!(count("-i"), 1, "-i must appear exactly once: {args:?}");
+        assert_eq!(count("BatchMode=yes"), 1);
+        assert_eq!(count("StrictHostKeyChecking=yes"), 1);
+        assert_eq!(count("ConnectTimeout=10"), 1);
+        assert!(
+            !args.iter().any(|a| a.starts_with("StrictHostKeyChecking=") && a != "StrictHostKeyChecking=yes"),
+            "conflicting StrictHostKeyChecking value in {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("BatchMode=") && a != "BatchMode=yes"),
+            "conflicting BatchMode value in {args:?}"
+        );
+        assert_eq!(args[args.len() - 2], "ups-shutdown@192.168.1.50");
+        assert_eq!(args[args.len() - 1], "shutdown /s /t 60");
     }
 
     #[test]

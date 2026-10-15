@@ -34,6 +34,32 @@ class Color:
 def log(msg, color=Color.RESET):
     print(f"{color}{msg}{Color.RESET}", flush=True)
 
+def assert_ssh_argv_strict(ssh_content):
+    """Every logged ssh call must carry each security option exactly once with
+    the required value. ssh uses the FIRST value of a repeated -o option, so a
+    conflicting duplicate (e.g. StrictHostKeyChecking=no ahead of =yes) would
+    defeat the protection while a plain substring check still passes."""
+    required = {"StrictHostKeyChecking": "yes", "BatchMode": "yes", "ConnectTimeout": "10"}
+    checked = 0
+    for line in ssh_content.splitlines():
+        m = re.search(r"\[args: (.*)\]\s*$", line)
+        if not m:
+            continue
+        toks = m.group(1).split()
+        target = next((i for i, t in enumerate(toks) if "@" in t), None)
+        assert target is not None, f"no user@host target in logged args: {line}"
+        opts = toks[:target]
+        assert opts.count("-i") == 1, f"-i must appear exactly once: {line}"
+        values = [opts[i + 1] for i, t in enumerate(opts[:-1]) if t == "-o"]
+        names = [v.split("=", 1)[0] for v in values]
+        assert len(names) == len(set(names)), f"duplicate ssh -o option: {line}"
+        kv = dict(v.split("=", 1) for v in values if "=" in v)
+        for key, want in required.items():
+            assert kv.get(key) == want, f"ssh option {key} is {kv.get(key)!r}, expected {want!r}: {line}"
+        checked += 1
+    assert checked > 0, "no ssh calls with logged args found in ssh.log"
+
+
 class AllLevel2Runner:
     def __init__(self, config=CONFIG):
         self.config = config
@@ -365,6 +391,7 @@ class AllLevel2Runner:
             assert "10.99.0.3" not in ssh_content, "proxmox contacted unexpectedly"
             assert "shutdown /s /t 60" in ssh_content, "Windows shutdown command missing or wrong"
             assert "StrictHostKeyChecking=yes" in ssh_content, "StrictHostKeyChecking missing from ssh args"
+            assert_ssh_argv_strict(ssh_content)
 
             with open(f"{DIR}/shutdown_fired") as f:
                 marker = f.read()
@@ -391,6 +418,7 @@ class AllLevel2Runner:
             assert "10.99.0.3" in ssh_content, "proxmox not contacted"
             assert "shutdown /s /t 60" in ssh_content, "Windows shutdown command missing or wrong"
             assert "StrictHostKeyChecking=yes" in ssh_content, "StrictHostKeyChecking missing from ssh args"
+            assert_ssh_argv_strict(ssh_content)
 
             # Check endpoint order: ws-1 before ws-2 before proxmox
             pos_ws1 = ssh_content.find("10.99.0.1")
@@ -1701,6 +1729,7 @@ class AllLevel2Runner:
             ssh_content = f.read()
         assert "shutdown /s /t 60" in ssh_content, "Windows shutdown command missing or wrong"
         assert "StrictHostKeyChecking=yes" in ssh_content, "StrictHostKeyChecking missing from ssh args"
+        assert_ssh_argv_strict(ssh_content)
 
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
