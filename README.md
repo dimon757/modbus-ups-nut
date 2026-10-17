@@ -456,9 +456,11 @@ keys, watchdog, logs, starting, updating -- is
    `cargo build --release`, copy `target/release/modbus-ups-bridge` to
    `/usr/local/bin/` and `systemd/modbus-ups-bridge.service` to
    `/etc/systemd/system/`.
-2. Copy `config/bridge.toml.example` to
+2. Copy a configuration template matching your topology (see
+   `docs/example-configs/` for 1 Proxmox + 2 Windows 11, 2 Proxmox + 2 Windows 11,
+   or single Windows 11; or `config/bridge.toml.example`) to
    `/etc/modbus-ups-bridge/bridge.toml`, fill in every VERIFY item and
-   all four endpoints' real hosts/keys/MAC addresses.
+   endpoints' real hosts/keys/MAC addresses.
 3. Generate one SSH keypair for the Proxmox hosts and one for the
    workstations (or per-host, if you'd rather not share), without a
    passphrase, into `/etc/modbus-ups-bridge/`, and

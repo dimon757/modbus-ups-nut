@@ -262,7 +262,13 @@ On the N2840, compiling takes 5–10 minutes on the first run. The result is a s
 sudo install -m 755 target/release/modbus-ups-bridge /usr/local/bin/
 sudo install -m 644 systemd/modbus-ups-bridge.service /etc/systemd/system/
 sudo install -d -m 700 /etc/modbus-ups-bridge
-sudo install -m 600 config/bridge.toml.example /etc/modbus-ups-bridge/bridge.toml
+
+# Choose the template matching your site topology (see docs/example-configs/):
+# - 1 Proxmox + 2 Windows 11: docs/example-configs/bridge-1proxmox-2win11.toml
+# - 2 Proxmox + 2 Windows 11: docs/example-configs/bridge-2proxmox-2win11.toml (or config/bridge.toml.example)
+# - Single Windows 11:        docs/example-configs/bridge-1win11.toml
+sudo install -m 600 docs/example-configs/bridge-1proxmox-2win11.toml /etc/modbus-ups-bridge/bridge.toml
+
 sudo systemctl daemon-reload
 ```
 

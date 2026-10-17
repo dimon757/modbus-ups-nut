@@ -1,0 +1,86 @@
+# modbus-ups-bridge configuration: 1 Proxmox VE Host + 2 Windows 11 Workstations
+# Install to /etc/modbus-ups-bridge/bridge.toml (mode 0600, owned by root/service user).
+
+# Subnet broadcast address for Wake-on-LAN on the dedicated endpoints interface.
+# Must stay above the first [section] header. Never use 255.255.255.255.
+wol_broadcast_addr = "192.168.1.255:9"
+
+# State file location for recording completed/in-flight shutdown sequence.
+# Default: /var/lib/modbus-ups-bridge/shutdown_fired
+# state_file = "/var/lib/modbus-ups-bridge/shutdown_fired"
+
+# SSH known_hosts file containing pinned host keys for all endpoints.
+# Default: /root/.ssh/known_hosts
+# ssh_known_hosts_file = "/root/.ssh/known_hosts"
+
+# Strict inverter sanity checks (refuse startup on configuration mismatch).
+# strict_inverter_checks = false
+
+[modbus]
+device = "/dev/ttyS0"            # Onboard RS485 port wired to the Sunsynk inverter
+baud_rate = 9600                 # Fixed 9600 8N1 Modbus RTU
+slave_id = 1                     # Inverter Modbus address (default 1)
+poll_interval_secs = 5           # Poll interval (1-10s)
+
+[thresholds]
+grid_lost_voltage = 100.0        # Volts; AC voltage below this = grid lost
+use_grid_relay = true            # Also count grid relay open (reg 194) as grid loss
+on_battery_debounce_secs = 60    # Grid loss debounce before on-battery state
+low_battery_fast_debounce_secs = 15 # Fast path when battery is already <= low_battery_soc
+low_battery_soc = 30.0           # Trigger graceful shutdown at 30% battery SOC
+inverter_cutoff_soc = 20.0       # Hardware cutoff of the inverter (reg 217); must be < low_battery_soc
+recovery_debounce_secs = 180     # Grid stable duration required before sending Wake-on-LAN
+stagger_secs = 30                # Delay between starting each endpoint shutdown
+ssh_connect_retry_secs = 300     # Default SSH retry budget for unreachable hosts
+comms_loss_shutdown_secs = 300   # Fail-safe shutdown on prolonged comms loss during outage
+wol_resend_count = 8             # Number of Wake-on-LAN resend rounds
+wol_resend_interval_secs = 120   # Interval between WOL resend bursts
+
+# Shutdown order: top to bottom.
+# Workstations first (with 60s countdown warning for logged-in desktop users),
+# followed by the Proxmox virtualization host.
+# (If preferred, Proxmox can be placed first to prioritize VM shutdown time).
+
+[[endpoints]]
+name = "workstation-1"
+kind = "windows"
+host = "192.168.1.21"
+ssh_user = "ups-shutdown"
+ssh_key_path = "/etc/modbus-ups-bridge/workstation_key"
+shutdown_delay_secs = 60
+mac_address = "AA:BB:CC:DD:EE:21"
+
+[[endpoints]]
+name = "workstation-2"
+kind = "windows"
+host = "192.168.1.22"
+ssh_user = "ups-shutdown"
+ssh_key_path = "/etc/modbus-ups-bridge/workstation_key"
+shutdown_delay_secs = 60
+mac_address = "AA:BB:CC:DD:EE:22"
+
+[[endpoints]]
+name = "proxmox-1"
+kind = "proxmox"
+host = "192.168.1.10"
+ssh_user = "root"
+ssh_key_path = "/etc/modbus-ups-bridge/proxmox_key"
+shutdown_delay_secs = 10
+mac_address = "AA:BB:CC:DD:EE:10"
+# Server reboot / memory training can take longer; allow up to 15 min retry window
+ssh_connect_retry_secs = 900
+
+# Hardware watchdog (omit if /dev/watchdog does not exist)
+[watchdog]
+device = "/dev/watchdog"
+
+# Proxmox shutdown method:
+#   poweroff          -- /sbin/poweroff: systemd stops pve-guests cleanly
+#                        (ordered guest shutdown) and powers off the host (default).
+#   vms_then_poweroff -- the bridge shuts each running VM down itself
+#                        (QEMU guest agent / ACPI), waits up to
+#                        vm_shutdown_timeout_secs, powers off hard any VM
+#                        still running, then systemctl poweroff --no-block.
+[proxmox]
+method = "poweroff"
+vm_shutdown_timeout_secs = 300

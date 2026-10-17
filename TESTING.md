@@ -17,7 +17,7 @@ procedures: [docs/register-verification.md](docs/register-verification.md)
 (inverter registers) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)
 (Proxmox shutdown command).
 
-**Status (2026-10-14).** Level 1: 97 tests, all passing on Debian 13 (96 on
+**Status (2026-10-14).** Level 1: 98 tests, all passing on Debian 13 (97 on
 Windows, where the one Linux-only test is skipped). Level 2: all 35 scenarios
 (A-M plus the 60 s SSH timeout, F2 for mid-sequence restart resumption, F3 for grid flicker during restart, F4 for failed endpoint retry & Proxmox timing, F5 for failed endpoint retry after sequence finishes, N1-N5 for the Proxmox method
 `vms_then_poweroff` against simulated VMs, O for host booting without head-of-line blocking, P for server booting with per-endpoint retry budget, Q for restarting a VM that was still shutting down when the grid returned, R for dropped VM shutdown logins, S/T for inverter-settings handling in default and strict mode, U for a sagging grid with the grid relay open, V for inverter comms loss fail-safe while on battery, W for Windows error 1190 already-scheduled shutdown handling, X for restart mid-sequence with inverter silent, Y for restart mid-sequence with grid up then inverter silent, Z for endpoint finishing shutdown after recovery without resurrecting the marker, and AA for fast debounce on low battery) passing on Debian 13 under WSL2.
@@ -79,7 +79,7 @@ on immediately. A wait of **3600 s** can never pass during the test, so the
 state is guaranteed to stay put. That's also the main limit: the tests
 can't check exact timings ("fires at 60 s, not at 59 s").
 
-### The 97 tests
+### The 98 tests
 
 **State machine -- `src/state.rs`**
 
@@ -122,6 +122,7 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `wol_window_shorter_than_vm_timeout_is_rejected` | For `vms_then_poweroff`, a WOL window shorter than `vm_shutdown_timeout_secs` is refused (marker must not be cleared before host powers off) |
 | `ssh_connect_retry_secs_beyond_limit_is_rejected` | An `ssh_connect_retry_secs` value > 1800 s (global or per-endpoint) is refused |
 | `endpoint_ssh_connect_retry_secs_can_override_global` | An endpoint can set its own `ssh_connect_retry_secs`, overriding the global thresholds default |
+| `doc_example_configs_load_and_validate` | The three documentation example topologies (1 PVE + 2 Win11, 2 PVE + 2 Win11, and 1 Win11) in `docs/example-configs/` load and pass validation |
 
 **Inverter settings check -- `src/modbus.rs`**
 

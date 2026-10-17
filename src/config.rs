@@ -457,6 +457,30 @@ mod tests {
     }
 
     #[test]
+    fn doc_example_configs_load_and_validate() {
+        // 1 Proxmox + 2 Windows 11
+        let path_1p_2w = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/example-configs/bridge-1proxmox-2win11.toml");
+        let cfg_1p_2w = Config::load(path_1p_2w).expect("bridge-1proxmox-2win11.toml should load and validate");
+        assert_eq!(cfg_1p_2w.endpoints.len(), 3);
+        assert_eq!(cfg_1p_2w.endpoints.iter().filter(|ep| ep.kind == EndpointKind::Proxmox).count(), 1);
+        assert_eq!(cfg_1p_2w.endpoints.iter().filter(|ep| ep.kind == EndpointKind::Windows).count(), 2);
+
+        // 2 Proxmox + 2 Windows 11
+        let path_2p_2w = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/example-configs/bridge-2proxmox-2win11.toml");
+        let cfg_2p_2w = Config::load(path_2p_2w).expect("bridge-2proxmox-2win11.toml should load and validate");
+        assert_eq!(cfg_2p_2w.endpoints.len(), 4);
+        assert_eq!(cfg_2p_2w.endpoints.iter().filter(|ep| ep.kind == EndpointKind::Proxmox).count(), 2);
+        assert_eq!(cfg_2p_2w.endpoints.iter().filter(|ep| ep.kind == EndpointKind::Windows).count(), 2);
+
+        // 1 Windows only
+        let path_1w = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/example-configs/bridge-1win11.toml");
+        let cfg_1w = Config::load(path_1w).expect("bridge-1win11.toml should load and validate");
+        assert_eq!(cfg_1w.endpoints.len(), 1);
+        assert_eq!(cfg_1w.endpoints[0].kind, EndpointKind::Windows);
+        assert_eq!(cfg_1w.endpoints[0].name, "workstation-1");
+    }
+
+    #[test]
     fn level2_test_config_loads() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/test/bridge-test.toml");
         let cfg = Config::load(path).expect("test/bridge-test.toml should load and validate");
