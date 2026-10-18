@@ -378,6 +378,13 @@ impl Config {
         for ep in &self.endpoints {
             crate::wol::parse_mac(&ep.mac_address)
                 .with_context(|| format!("endpoint {:?}: mac_address", ep.name))?;
+            if ep.shutdown_delay_secs > 3600 {
+                bail!(
+                    "endpoint {:?}: shutdown_delay_secs is {} s -- must be <= 3600",
+                    ep.name,
+                    ep.shutdown_delay_secs
+                );
+            }
             if let Some(r) = ep.ssh_connect_retry_secs {
                 if r > 1800 {
                     bail!(
@@ -812,5 +819,15 @@ mod tests {
         cfg.validate().unwrap();
         assert_eq!(cfg.thresholds.low_battery_fast_debounce_secs, 60);
     }
+
+    #[test]
+    fn shutdown_delay_secs_beyond_limit_is_rejected() {
+        let err = validate_err(&example_with(
+            "shutdown_delay_secs = 60",
+            "shutdown_delay_secs = 3601",
+        ));
+        assert!(err.contains("shutdown_delay_secs"), "{err}");
+    }
 }
+
 

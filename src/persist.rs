@@ -12,6 +12,9 @@ pub enum ShutdownState {
     Incomplete { dispatched: Vec<String> },
     /// The entire sequence completed.
     Completed,
+    /// Recovery was confirmed and the initial Wake-on-LAN round went out;
+    /// follow-up WOL resend rounds are still in progress.
+    Waking,
 }
 
 /// On-disk record that the shutdown sequence was fired and the matching
@@ -45,21 +48,27 @@ impl ShutdownMarker {
     }
 
     pub fn state(&self) -> ShutdownState {
-        let content = match fs::read_to_string(&self.path) {
-            Ok(c) => c,
+        let raw = match fs::read(&self.path) {
+            Ok(b) => b,
             Err(e) if e.kind() == ErrorKind::NotFound => return ShutdownState::NotSet,
             Err(e) => {
                 log::error!("failed to read shutdown marker {:?}: {}", self.path, e);
-                return ShutdownState::Completed;
+                return ShutdownState::Incomplete {
+                    dispatched: Vec::new(),
+                };
             }
         };
+        let content = String::from_utf8_lossy(&raw);
 
         let mut dispatched = Vec::new();
         let mut completed = false;
+        let mut waking = false;
 
         for line in content.lines() {
             let line = line.trim();
-            if line == "completed" {
+            if line == "waking" {
+                waking = true;
+            } else if line == "completed" {
                 completed = true;
             } else if let Some(name) = line.strip_prefix("dispatched: ") {
                 dispatched.push(name.trim().to_string());
@@ -68,7 +77,9 @@ impl ShutdownMarker {
             }
         }
 
-        if completed {
+        if waking {
+            ShutdownState::Waking
+        } else if completed {
             ShutdownState::Completed
         } else {
             ShutdownState::Incomplete { dispatched }
@@ -96,6 +107,16 @@ impl ShutdownMarker {
         if let Err(e) = self.try_mark_completed() {
             log::error!(
                 "failed to mark shutdown completed in {:?}: {:#}",
+                self.path,
+                e
+            );
+        }
+    }
+
+    pub fn mark_waking(&self) {
+        if let Err(e) = self.try_mark_waking() {
+            log::error!(
+                "failed to mark waking state in {:?}: {:#}",
                 self.path,
                 e
             );
@@ -149,6 +170,20 @@ impl ShutdownMarker {
             .open(&self.path)
             .context("opening marker file for append")?;
         writeln!(f, "completed").context("writing completed marker")?;
+        f.sync_all().context("syncing file")?;
+        sync_parent(&self.path)
+    }
+
+    fn try_mark_waking(&self) -> Result<()> {
+        if let Some(dir) = parent_dir(&self.path) {
+            fs::create_dir_all(dir).with_context(|| format!("creating {:?}", dir))?;
+        }
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .context("opening marker file for append")?;
+        writeln!(f, "waking").context("writing waking marker")?;
         f.sync_all().context("syncing file")?;
         sync_parent(&self.path)
     }
@@ -302,5 +337,57 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn mark_waking_transitions_state_and_set_resets_it() {
+        let dir = std::env::temp_dir().join(format!("mub-marker-waking-{}", std::process::id()));
+        let marker = ShutdownMarker::new(dir.join("shutdown_fired"));
+
+        marker.set();
+        marker.record_dispatched("ws-1");
+        marker.mark_completed();
+        assert_eq!(marker.state(), ShutdownState::Completed);
+
+        marker.mark_waking();
+        assert_eq!(marker.state(), ShutdownState::Waking);
+
+        // A new outage overwrites the marker back to Incomplete
+        marker.set();
+        assert_eq!(
+            marker.state(),
+            ShutdownState::Incomplete { dispatched: vec![] }
+        );
+
+        marker.clear();
+        assert_eq!(marker.state(), ShutdownState::NotSet);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupted_non_utf8_bytes_do_not_falsely_mark_completed() {
+        let dir = std::env::temp_dir().join(format!("mub-marker-corrupt-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let marker_file = dir.join("shutdown_fired");
+
+        // Valid dispatched line followed by invalid UTF-8 bytes from an interrupted write
+        let mut raw = b"# shutdown sequence in progress\ndispatched: ws-1\ndispatched: ".to_vec();
+        raw.extend_from_slice(&[0xFF, 0xFE, 0xFD]);
+        fs::write(&marker_file, &raw).unwrap();
+
+        let marker = ShutdownMarker::new(&marker_file);
+        match marker.state() {
+            ShutdownState::Incomplete { dispatched } => {
+                assert!(
+                    dispatched.contains(&"ws-1".to_string()),
+                    "must preserve intact dispatched lines: {dispatched:?}"
+                );
+            }
+            other => panic!("corrupted mid-sequence marker must remain Incomplete, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
+
 

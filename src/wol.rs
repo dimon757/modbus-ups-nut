@@ -15,8 +15,17 @@ use tokio::net::UdpSocket;
 /// does nothing -- those machines instead depend on each one's own BIOS
 /// "Power On after AC Loss" setting once the inverter's output returns.
 pub async fn wake_all(endpoints: &[Endpoint], broadcast_addr: &str) {
+    let socket = match bind_broadcast_socket().await {
+        Ok(s) => s,
+        Err(e) => {
+            for ep in endpoints {
+                log::error!("WOL failed for {} ({}): {:#}", ep.name, ep.mac_address, e);
+            }
+            return;
+        }
+    };
     for ep in endpoints {
-        if let Err(e) = wake_one(&ep.mac_address, broadcast_addr).await {
+        if let Err(e) = wake_one(&socket, &ep.mac_address, broadcast_addr).await {
             log::error!("WOL failed for {} ({}): {:#}", ep.name, ep.mac_address, e);
         } else {
             log::info!("WOL sent to {} ({})", ep.name, ep.mac_address);
@@ -33,6 +42,7 @@ pub async fn wake_all(endpoints: &[Endpoint], broadcast_addr: &str) {
 /// machine that is still on ignores the packet, then finishes powering off
 /// and would stay off on grid power. Later rounds catch it once it's down;
 /// machines already running ignore them.
+#[allow(dead_code)]
 pub async fn wake_all_repeated(
     endpoints: &[Endpoint],
     broadcast_addr: &str,
@@ -48,23 +58,26 @@ pub async fn wake_all_repeated(
     }
 }
 
-/// Async so the current_thread runtime is not blocked while the UDP send
-/// waits on the kernel. Uses tokio's UdpSocket rather than std::net.
-async fn wake_one(mac: &str, broadcast_addr: &str) -> Result<()> {
-    let mac_bytes = parse_mac(mac)?;
-
-    let mut packet = Vec::with_capacity(6 + 16 * 6);
-    packet.extend_from_slice(&[0xFFu8; 6]);
-    for _ in 0..16 {
-        packet.extend_from_slice(&mac_bytes);
-    }
-
+async fn bind_broadcast_socket() -> Result<UdpSocket> {
     let socket = UdpSocket::bind("0.0.0.0:0")
         .await
         .context("binding UDP socket for WOL")?;
     socket
         .set_broadcast(true)
         .context("enabling SO_BROADCAST")?;
+    Ok(socket)
+}
+
+/// Async so the current_thread runtime is not blocked while the UDP send
+/// waits on the kernel. Uses tokio's UdpSocket rather than std::net.
+async fn wake_one(socket: &UdpSocket, mac: &str, broadcast_addr: &str) -> Result<()> {
+    let mac_bytes = parse_mac(mac)?;
+
+    let mut packet = [0xFFu8; 6 + 16 * 6];
+    for chunk in packet[6..].chunks_exact_mut(6) {
+        chunk.copy_from_slice(&mac_bytes);
+    }
+
     socket
         .send_to(&packet, broadcast_addr)
         .await

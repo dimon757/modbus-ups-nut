@@ -372,14 +372,26 @@ async fn proxmox_vms_then_poweroff(
     // 1. Which VMs exist, and which are running -- read from the host now,
     //    not from a list that can go stale. If the host is still booting from a
     //    recent wake-up, this initial query retries until sshd is up.
-    let listing = ssh_exec_with_retry(ep, opts, "qm list", SSH_TIMEOUT, stop)
-        .await
-        .context("listing VMs")?;
-    let vms = parse_qmlist(&listing);
-    let running = if vms.is_empty() {
-        Vec::new()
-    } else {
-        running_vms(ep, opts, &vms).await.context("reading VM power states")?
+    //    If SSH connects to the host, but `qm list` itself fails (e.g. pvedaemon
+    //    down or hung), do not abandon the host poweroff: fall back to step 5 so
+    //    systemd/pve-guests stops guests and powers the host off cleanly.
+    let (vms, running) = match ssh_exec_with_retry(ep, opts, "qm list", SSH_TIMEOUT, stop).await {
+        Ok(listing) => parse_qmlist_with_running(&listing),
+        Err(e) => {
+            if *stop.borrow()
+                || is_transient_connection_error(&e)
+                || is_ssh_connection_failure(&e)
+                || is_ssh_auth_or_config_error(&e)
+            {
+                return Err(e).context("listing VMs");
+            }
+            log::error!(
+                "{}: failed to list VMs ({:#}) -- proceeding directly to host poweroff",
+                ep.name,
+                e
+            );
+            (Vec::new(), Vec::new())
+        }
     };
     if *stop.borrow() {
         bail!("recovery confirmed -- cancelled Proxmox shutdown on {}", ep.name);
@@ -497,9 +509,10 @@ async fn proxmox_vms_then_poweroff(
         bail!("recovery confirmed -- skipping hard VM stops and host poweroff on {}", ep.name);
     }
 
-    // 3. Whatever is still running now gets powered off hard: VMs that
-    //    didn't stop in time (timed out), and those that refused the guest
+    // 3. Whatever is still running now gets powered off hard in parallel: VMs
+    //    that didn't stop in time (timed out), and those that refused the guest
     //    shutdown (no point waiting for those).
+    let mut hard_stop_tasks = JoinSet::new();
     for vm in &pending {
         log::error!(
             "{}: VM {} still running after {} s -- powering it off hard",
@@ -507,7 +520,13 @@ async fn proxmox_vms_then_poweroff(
             vm.name,
             opts.proxmox.vm_shutdown_timeout_secs
         );
-        power_off_hard(ep, opts, vm, stop).await;
+        let ep = ep.clone();
+        let opts = opts.clone();
+        let vm = vm.clone();
+        let stop_rx = stop.clone();
+        hard_stop_tasks.spawn(async move {
+            power_off_hard(&ep, &opts, &vm, &stop_rx).await;
+        });
     }
     for vm in &refused {
         log::error!(
@@ -515,8 +534,15 @@ async fn proxmox_vms_then_poweroff(
             ep.name,
             vm.name
         );
-        power_off_hard(ep, opts, vm, stop).await;
+        let ep = ep.clone();
+        let opts = opts.clone();
+        let vm = vm.clone();
+        let stop_rx = stop.clone();
+        hard_stop_tasks.spawn(async move {
+            power_off_hard(&ep, &opts, &vm, &stop_rx).await;
+        });
     }
+    while hard_stop_tasks.join_next().await.is_some() {}
 
     if *stop.borrow() {
         restart_stopped_vms(ep, opts, &running).await;
@@ -548,7 +574,17 @@ async fn proxmox_vms_then_poweroff(
         restart_stopped_vms(ep, opts, &running).await;
         bail!("recovery confirmed -- skipping Proxmox host poweroff on {}", ep.name);
     }
-    match ssh_exec(ep, opts, "systemctl poweroff --no-block").await {
+    let poweroff_retry_budget = retry_budget.min(Duration::from_secs(30));
+    match qm_shutdown_with_retry(
+        ep,
+        opts,
+        "systemctl poweroff --no-block",
+        SSH_TIMEOUT,
+        poweroff_retry_budget,
+        stop,
+    )
+    .await
+    {
         Ok(_) => log::warn!("{}: host power-off scheduled via systemctl poweroff", ep.name),
         Err(e) => {
             if *stop.borrow() {
@@ -564,13 +600,28 @@ async fn proxmox_vms_then_poweroff(
                 e
             );
             let fallback = "nohup /sbin/poweroff > /dev/null 2>&1 < /dev/null &";
-            ssh_exec(ep, opts, fallback)
+            qm_shutdown_with_retry(ep, opts, fallback, SSH_TIMEOUT, poweroff_retry_budget, stop)
                 .await
                 .context("fallback /sbin/poweroff")?;
             log::warn!("{}: host power-off scheduled via /sbin/poweroff", ep.name);
         }
     }
     Ok(())
+}
+
+/// Checks if an SSH error is a permanent authentication, host key, DNS, or local
+/// configuration error (where SSH itself never ran a remote command).
+fn is_ssh_auth_or_config_error(err: &anyhow::Error) -> bool {
+    let s = format!("{:#}", err).to_lowercase();
+    s.contains("permission denied")
+        || s.contains("host key verification failed")
+        || s.contains("offending key")
+        || s.contains("identification has changed")
+        || s.contains("could not resolve hostname")
+        || s.contains("name or service not known")
+        || s.contains("no such file or directory")
+        || s.contains("bad configuration option")
+        || s.contains("spawning ssh")
 }
 
 /// One VM's `qm shutdown` over SSH. Retries only when ssh could not connect
@@ -759,13 +810,23 @@ async fn power_off_hard(
         );
         return;
     }
-    if let Err(e) = ssh_exec(ep, opts, &format!("qm stop {}", vm.id)).await {
+    // Pass `--skiplock 1` so a lingering lock left by a timed-out `qm shutdown`
+    // or a backup job does not block hard power-off on low battery. Retry transient
+    // SSH connection drops briefly via `qm_shutdown_with_retry`.
+    let mut stop_rx = stop.clone();
+    let budget = Duration::from_secs(
+        ep.effective_ssh_connect_retry_secs(opts.ssh_connect_retry_secs)
+            .min(15),
+    );
+    let cmd = format!("qm stop {} --skiplock 1", vm.id);
+    if let Err(e) = qm_shutdown_with_retry(ep, opts, &cmd, SSH_TIMEOUT, budget, &mut stop_rx).await {
         log::error!("{}: hard power-off of VM {} failed: {:#}", ep.name, vm.name, e);
     }
 }
 
 /// The subset of `vms` whose power state is "running". One SSH call for
 /// all of them. A VM whose state can't be read counts as running.
+#[allow(dead_code)]
 async fn running_vms(ep: &Endpoint, opts: &ShutdownOptions, vms: &[Vm]) -> Result<Vec<Vm>> {
     let out = ssh_exec(ep, opts, &power_states_command(vms)).await?;
     Ok(select_running(vms, &out))
@@ -779,6 +840,43 @@ fn power_states_command(vms: &[Vm]) -> String {
     )
 }
 
+/// Parses `qm list` output into `(all_vms, running_vms)`, where `running_vms`
+/// includes any VM whose status in `qm list` is not `"stopped"` (matching
+/// `select_running` fail-safe semantics without requiring a second SSH round-trip).
+pub fn parse_qmlist_with_running(out: &str) -> (Vec<Vm>, Vec<Vm>) {
+    let mut all = Vec::new();
+    let mut running = Vec::new();
+    for line in out.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.len() < 3 {
+            continue;
+        }
+        let Ok(id) = tokens[0].parse::<u32>() else {
+            continue;
+        };
+        // Use rposition so a VM whose name contains a status keyword (e.g.
+        // "stopped-db" or "app running prod") still matches the actual STATUS
+        // column on the right rather than truncating or dropping the VM.
+        let Some(status_idx) = tokens[1..]
+            .iter()
+            .rposition(|&t| matches!(t, "running" | "stopped" | "paused" | "suspended" | "prelaunch"))
+        else {
+            continue;
+        };
+        if status_idx == 0 {
+            continue;
+        }
+        let status = tokens[1 + status_idx];
+        let name = tokens[1..=status_idx].join(" ");
+        let vm = Vm { id, name };
+        if status != "stopped" {
+            running.push(vm.clone());
+        }
+        all.push(vm);
+    }
+    (all, running)
+}
+
 /// Parses `qm list` output.
 /// Example lines:
 ///       VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID       
@@ -786,23 +884,7 @@ fn power_states_command(vms: &[Vm]) -> String {
 ///        101 app server (prod)    running    4096              50.00 5678      
 ///        102 db01                 stopped    8192             100.00 0         
 pub fn parse_qmlist(out: &str) -> Vec<Vm> {
-    out.lines()
-        .filter_map(|line| {
-            let tokens: Vec<&str> = line.split_whitespace().collect();
-            if tokens.len() < 3 {
-                return None;
-            }
-            let id: u32 = tokens[0].parse().ok()?;
-            let status_idx = tokens[1..]
-                .iter()
-                .position(|&t| matches!(t, "running" | "stopped" | "paused" | "suspended" | "prelaunch"))?;
-            if status_idx == 0 {
-                return None;
-            }
-            let name = tokens[1..=status_idx].join(" ");
-            Some(Vm { id, name })
-        })
-        .collect()
+    parse_qmlist_with_running(out).0
 }
 
 /// From `power_states_command` output (`<id> status: running` per line), the VMs
@@ -1165,6 +1247,35 @@ mod tests {
             vec![vm(100, "dc01"), vm(101, "app server (prod)"), vm(102, "db01")]
         );
         assert!(parse_qmlist("      VMID NAME                 STATUS     MEM(MB)\n").is_empty());
+    }
+
+    #[test]
+    fn parses_qmlist_with_status_keywords_in_names_and_extracts_running() {
+        let out = "\
+      VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID       
+       100 running              running    2048              32.00 1234      
+       101 stopped db           running    4096              50.00 5678      
+       102 app running prod     stopped    8192             100.00 0         
+       103 paused-vm            paused     2048              32.00 9012      
+";
+        let (all, running) = parse_qmlist_with_running(out);
+        assert_eq!(
+            all,
+            vec![
+                vm(100, "running"),
+                vm(101, "stopped db"),
+                vm(102, "app running prod"),
+                vm(103, "paused-vm"),
+            ]
+        );
+        assert_eq!(
+            running,
+            vec![
+                vm(100, "running"),
+                vm(101, "stopped db"),
+                vm(103, "paused-vm"),
+            ]
+        );
     }
 
     #[test]

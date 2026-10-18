@@ -56,7 +56,14 @@ async fn main() -> Result<()> {
 async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
     let marker = ShutdownMarker::new(&cfg.state_file);
     let marker_state = marker.state();
-    let resume = marker_state != ShutdownState::NotSet;
+    // Start latched only when endpoints are still shut down awaiting recovery
+    // (Incomplete or Completed). If Waking, Round 1 of WOL already woke them,
+    // so the state machine must start in Idle (ready to protect against a new
+    // outage) while Supervisor finishes the remaining WOL resend rounds.
+    let resume = matches!(
+        marker_state,
+        ShutdownState::Incomplete { .. } | ShutdownState::Completed
+    );
     let pending_resume_endpoints = match &marker_state {
         ShutdownState::Incomplete { dispatched } => {
             let remaining: Vec<_> = cfg
@@ -82,6 +89,14 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
             );
             None
         }
+        ShutdownState::Waking => {
+            log::warn!(
+                "{} indicates an interrupted Wake-on-LAN resend window -- resuming WOL resends \
+                 while monitoring in Idle for any new outage",
+                cfg.state_file
+            );
+            None
+        }
         ShutdownState::NotSet => None,
     };
     let mut sm = StateMachine::new(cfg.thresholds.clone(), resume);
@@ -94,6 +109,9 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
         pending_resume_endpoints,
         grid_lost_at_last_reading: None,
     };
+    if marker_state == ShutdownState::Waking {
+        sup.spawn_wake();
+    }
 
     let poll_interval = Duration::from_secs(cfg.modbus.poll_interval_secs);
     let strict = cfg.strict_inverter_checks();
@@ -335,20 +353,39 @@ impl Supervisor<'_> {
                         self.winding_down = Some(task);
                     }
                 }
-                let endpoints = self.cfg.endpoints.clone();
-                let addr = self.cfg.wol_broadcast_addr.clone();
-                let resends = self.cfg.thresholds.wol_resend_count;
-                let interval = Duration::from_secs(self.cfg.thresholds.wol_resend_interval_secs);
-                let marker = self.marker.clone();
-                self.wake_task = Some(tokio::spawn(async move {
-                    wol::wake_all_repeated(&endpoints, &addr, resends, interval).await;
-                    // Only after the last round: a reboot mid-way resumes
-                    // latched and runs the whole round again on recovery.
-                    marker.clear();
-                }));
+                self.spawn_wake();
             }
             Action::None => {}
         }
+    }
+
+    fn spawn_wake(&mut self) {
+        if let Some(old) = self.wake_task.take() {
+            old.abort();
+        }
+        let endpoints = self.cfg.endpoints.clone();
+        let addr = self.cfg.wol_broadcast_addr.clone();
+        let resends = self.cfg.thresholds.wol_resend_count;
+        let interval = Duration::from_secs(self.cfg.thresholds.wol_resend_interval_secs);
+        let marker = self.marker.clone();
+        self.wake_task = Some(tokio::spawn(async move {
+            for round in 0..=resends {
+                if round > 0 {
+                    tokio::time::sleep(interval).await;
+                }
+                log::info!("Wake-on-LAN round {}/{}", round + 1, resends + 1);
+                wol::wake_all(&endpoints, &addr).await;
+                if round == 0 && resends > 0 {
+                    // Round 1 went out, so endpoints have been signalled to wake up.
+                    // Record Waking so a restart + new outage during the resend window
+                    // starts in Idle (ready to shut them down again) rather than latched.
+                    marker.mark_waking();
+                }
+            }
+            // Only after the last round: a reboot mid-way resumes the
+            // remaining WOL rounds until all resends have completed.
+            marker.clear();
+        }));
     }
 }
 
