@@ -36,3 +36,6 @@ mub-test/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Graphify output
+graphify-out/

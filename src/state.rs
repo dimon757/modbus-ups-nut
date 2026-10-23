@@ -157,17 +157,21 @@ impl StateMachine {
         let voltage_lost = reading.grid_voltage < self.thresholds.grid_lost_voltage;
         let relay_open = self.thresholds.use_grid_relay && reading.grid_relay_closed == Some(false);
         let grid_lost = voltage_lost || relay_open;
-        self.last_grid_lost = grid_lost;
         if !grid_lost {
+            self.last_grid_lost = false;
             self.grid_lost_since = None;
         } else if self.grid_lost_since.is_none() {
             self.grid_lost_since = Some(Instant::now());
         }
-        if self.recent_soc_low.len() == LOW_SOC_WINDOW {
-            self.recent_soc_low.pop_front();
+        if matches!(self.phase, Phase::Idle) && !grid_lost {
+            self.recent_soc_low.clear();
+        } else {
+            if self.recent_soc_low.len() == LOW_SOC_WINDOW {
+                self.recent_soc_low.pop_front();
+            }
+            self.recent_soc_low
+                .push_back(reading.battery_soc_pct <= self.thresholds.low_battery_soc);
         }
-        self.recent_soc_low
-            .push_back(reading.battery_soc_pct <= self.thresholds.low_battery_soc);
         let soc_low = self.recent_soc_low.iter().filter(|&&low| low).count() >= LOW_SOC_NEEDED;
         let confirmed_debounce = if self.thresholds.low_battery_fast_debounce_secs > 0 && soc_low {
             self.thresholds
@@ -189,6 +193,7 @@ impl StateMachine {
             }
             Phase::GridLostDebouncing => {
                 if !grid_lost {
+                    self.recent_soc_low.clear();
                     self.enter(Phase::Idle);
                 } else {
                     let fast_limit = self.thresholds.low_battery_fast_debounce_secs;
@@ -238,6 +243,7 @@ impl StateMachine {
                 } else if self.elapsed_in_phase()
                     >= Duration::from_secs(self.thresholds.recovery_debounce_secs)
                 {
+                    self.recent_soc_low.clear();
                     self.enter(Phase::Idle);
                     if self.shutdown_fired {
                         self.shutdown_fired = false;
@@ -245,6 +251,13 @@ impl StateMachine {
                     }
                 }
             }
+        }
+
+        if grid_lost
+            && (grid_lost_confirmed
+                || matches!(self.phase, Phase::OnBattery | Phase::ShutdownLatched))
+        {
+            self.last_grid_lost = true;
         }
 
         let status = BridgeStatus {
@@ -673,5 +686,32 @@ mod tests {
         sm.backdate_grid_lost_since(Duration::from_secs(5));
         let (status, _) = sm.observe(reading(GRID_DOWN, 25.0));
         assert!(status.grid_lost_confirmed, "confirmed after 15s fast debounce with low battery");
+    }
+
+    #[test]
+    fn comms_loss_during_unconfirmed_blip_does_not_fire() {
+        let mut t = with_comms_loss(300);
+        t.on_battery_debounce_secs = 60;
+        let mut sm = StateMachine::new(t, false);
+
+        // Single un-debounced grid drop -> enters GridLostDebouncing (not OnBattery)
+        sm.observe(reading(GRID_DOWN, 80.0));
+        assert!(matches!(sm.phase, Phase::GridLostDebouncing));
+
+        // RS485 comms lost before grid loss was confirmed: must not fire shutdown
+        assert!(matches!(sm.comms_lost(Duration::from_secs(3600)), Action::None));
+    }
+
+    #[test]
+    fn low_soc_while_on_grid_does_not_prearm_outage_window() {
+        let mut sm = StateMachine::new(thresholds(3600), false);
+        // Low SOC readings while on healthy grid (Idle)
+        for _ in 0..3 {
+            assert!(matches!(sm.observe(reading(GRID_UP, 20.0)).1, Action::None));
+        }
+        // Outage starts with healthy SOC, followed by a single stray low reading:
+        // must not fire because the Idle low readings did not pre-fill the window.
+        on_battery(&mut sm, 50.0);
+        assert!(matches!(sm.observe(reading(GRID_DOWN, 25.0)).1, Action::None));
     }
 }

@@ -57,7 +57,10 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
     let marker = ShutdownMarker::new(&cfg.state_file);
     let marker_state = marker.state();
     // Start latched only when endpoints are still shut down awaiting recovery
-    // (Incomplete or Completed). If Waking, Round 1 of WOL already woke them,
+    // (Incomplete or Completed). Even if Incomplete has `dispatched: []`, the
+    // first endpoint's SSH shutdown command may have been in flight when the
+    // bridge crashed (before `record_dispatched` could be written), so recovery
+    // must still send Wake-on-LAN. If Waking, Round 1 of WOL already woke them,
     // so the state machine must start in Idle (ready to protect against a new
     // outage) while Supervisor finishes the remaining WOL resend rounds.
     let resume = matches!(
@@ -110,7 +113,7 @@ async fn run(cfg: Config, mut wdt: watchdog::Watchdog) -> Result<()> {
         grid_lost_at_last_reading: None,
     };
     if marker_state == ShutdownState::Waking {
-        sup.spawn_wake();
+        sup.spawn_wake(true);
     }
 
     let poll_interval = Duration::from_secs(cfg.modbus.poll_interval_secs);
@@ -248,6 +251,23 @@ impl Supervisor<'_> {
     /// so one glitchy reading right after a reboot can't shut down the
     /// endpoints the previous run never reached.
     fn resume_if_grid_down(&mut self, grid_lost: bool, grid_lost_confirmed: bool) {
+        if !grid_lost
+            && self.pending_resume_endpoints.is_none()
+            && self.shutdown_task.as_ref().is_some_and(|(t, _)| t.is_finished())
+        {
+            if let ShutdownState::Incomplete { dispatched } = self.marker.state() {
+                let remaining: Vec<_> = self
+                    .cfg
+                    .endpoints
+                    .iter()
+                    .filter(|ep| !dispatched.contains(&ep.name))
+                    .cloned()
+                    .collect();
+                if !remaining.is_empty() {
+                    self.pending_resume_endpoints = Some(remaining);
+                }
+            }
+        }
         let Some(remaining) = self.pending_resume_endpoints.as_ref() else {
             return;
         };
@@ -353,13 +373,13 @@ impl Supervisor<'_> {
                         self.winding_down = Some(task);
                     }
                 }
-                self.spawn_wake();
+                self.spawn_wake(false);
             }
             Action::None => {}
         }
     }
 
-    fn spawn_wake(&mut self) {
+    fn spawn_wake(&mut self, resuming_waking: bool) {
         if let Some(old) = self.wake_task.take() {
             old.abort();
         }
@@ -368,8 +388,9 @@ impl Supervisor<'_> {
         let resends = self.cfg.thresholds.wol_resend_count;
         let interval = Duration::from_secs(self.cfg.thresholds.wol_resend_interval_secs);
         let marker = self.marker.clone();
+        let start_round = if resuming_waking && resends > 0 { 1 } else { 0 };
         self.wake_task = Some(tokio::spawn(async move {
-            for round in 0..=resends {
+            for round in start_round..=resends {
                 if round > 0 {
                     tokio::time::sleep(interval).await;
                 }

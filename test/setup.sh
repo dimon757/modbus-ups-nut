@@ -81,6 +81,9 @@ start)
     if [ ! -x "$DIR/venv/bin/python" ]; then
         echo "creating Python venv with pinned pymodbus..."
         python3 -m venv "$DIR/venv" || { echo "venv failed: sudo apt install python3-venv"; exit 1; }
+    fi
+    if ! "$DIR/venv/bin/python" -c "import pymodbus" >/dev/null 2>&1; then
+        echo "installing Python test dependencies..."
         "$DIR/venv/bin/pip" install -q -r "$HERE/requirements.txt"
     fi
     echo "checking the simulator's register map..."

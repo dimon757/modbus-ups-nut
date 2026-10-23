@@ -17,7 +17,7 @@ procedures: [docs/register-verification.md](docs/register-verification.md)
 (inverter registers) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)
 (Proxmox shutdown command).
 
-**Status (2026-10-14).** Level 1: 98 tests, all passing on Debian 13 (97 on
+**Status (2026-10-23).** Level 1: 105 tests, all passing on Debian 13 (104 on
 Windows, where the one Linux-only test is skipped). Level 2: all 35 scenarios
 (A-M plus the 60 s SSH timeout, F2 for mid-sequence restart resumption, F3 for grid flicker during restart, F4 for failed endpoint retry & Proxmox timing, F5 for failed endpoint retry after sequence finishes, N1-N5 for the Proxmox method
 `vms_then_poweroff` against simulated VMs, O for host booting without head-of-line blocking, P for server booting with per-endpoint retry budget, Q for restarting a VM that was still shutting down when the grid returned, R for dropped VM shutdown logins, S/T for inverter-settings handling in default and strict mode, U for a sagging grid with the grid relay open, V for inverter comms loss fail-safe while on battery, W for Windows error 1190 already-scheduled shutdown handling, X for restart mid-sequence with inverter silent, Y for restart mid-sequence with grid up then inverter silent, Z for endpoint finishing shutdown after recovery without resurrecting the marker, and AA for fast debounce on low battery) passing on Debian 13 under WSL2.
@@ -79,7 +79,7 @@ on immediately. A wait of **3600 s** can never pass during the test, so the
 state is guaranteed to stay put. That's also the main limit: the tests
 can't check exact timings ("fires at 60 s, not at 59 s").
 
-### The 98 tests
+### The 105 tests
 
 **State machine -- `src/state.rs`**
 
@@ -99,6 +99,18 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `voltage_alone_would_have_missed_the_sag` | Same readings with `use_grid_relay = false` | No shutdown ever -- shows what the relay check adds |
 | `unreadable_relay_falls_back_to_voltage` | No relay value (register 194 unreadable) | Behaves exactly as before: the voltage alone decides |
 | `recovery_waits_for_the_relay_to_close` | After a shutdown the voltage is back but the relay is still open | Stays latched, no Wake-on-LAN, until the relay closes |
+| `comms_loss_on_battery_fires_after_the_limit` | Confirmed on battery, RS485 goes silent for `comms_loss_shutdown_secs` | Fires fail-safe shutdown once, then wakes on recovery |
+| `comms_loss_with_grid_present_never_fires` | Grid healthy, RS485 goes silent for an hour | Never shuts down when the grid was up |
+| `comms_loss_before_any_reading_never_fires` | RS485 silent from startup | Never shuts down without a confirmed on-battery state |
+| `comms_loss_disabled_with_zero` | `comms_loss_shutdown_secs = 0` | Disables the comms-loss fail-safe |
+| `comms_loss_during_unconfirmed_blip_does_not_fire` | Single un-debounced grid dip (`GridLostDebouncing`), then RS485 silence | Never shuts down unless grid loss was confirmed (`OnBattery`) |
+| `low_soc_while_on_grid_does_not_prearm_outage_window` | Low SOC readings on healthy grid (`Idle`), then outage with 1 stray low reading | Pre-outage readings in `Idle` are cleared and never pre-fill the 2-of-3 outage window |
+| `grid_lost_confirmed_needs_the_debounce` | Grid drops with long debounce | `grid_lost_confirmed` stays false until the debounce elapses |
+| `fast_debounce_fires_early_when_battery_already_low` | Outage starts with SOC ≤ `low_battery_soc` | Transitions and fires after `low_battery_fast_debounce_secs` (15 s) instead of waiting 60 s |
+| `fast_debounce_filters_short_blip_with_low_battery` | Short blip (< 15 s) with low battery | Filtered back to `Idle` with no shutdown |
+| `fast_debounce_does_not_fire_when_battery_normal` | Outage with healthy battery (80 %) | Waits the full 60 s `on_battery_debounce_secs` |
+| `fast_debounce_disabled_with_zero` | `low_battery_fast_debounce_secs = 0` | Waits the full normal debounce even when battery is low |
+| `grid_lost_confirmed_respects_fast_debounce_on_low_battery` | Resumed state with low battery | Confirms grid loss after `low_battery_fast_debounce_secs` |
 
 **Configuration -- `src/config.rs`**
 
@@ -123,6 +135,12 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `ssh_connect_retry_secs_beyond_limit_is_rejected` | An `ssh_connect_retry_secs` value > 1800 s (global or per-endpoint) is refused |
 | `endpoint_ssh_connect_retry_secs_can_override_global` | An endpoint can set its own `ssh_connect_retry_secs`, overriding the global thresholds default |
 | `doc_example_configs_load_and_validate` | The three documentation example topologies (1 PVE + 2 Win11, 2 PVE + 2 Win11, and 1 Win11) in `docs/example-configs/` load and pass validation |
+| `low_battery_fast_debounce_secs_defaults_to_15` | `low_battery_fast_debounce_secs` defaults to 15 s when omitted |
+| `low_battery_fast_debounce_secs_can_be_configured_or_disabled` | Custom values and `0` (disabled) are accepted |
+| `low_battery_fast_debounce_secs_beyond_limit_is_rejected` | Values > 3600 s are refused |
+| `low_battery_fast_debounce_secs_must_not_exceed_normal_debounce` | Values > `on_battery_debounce_secs` are refused |
+| `shutdown_delay_secs_beyond_limit_is_rejected` | Endpoint `shutdown_delay_secs` > 3600 s is refused |
+| `empty_or_flag_like_endpoint_fields_are_rejected` | Empty or flag-like (`-`) `host`/`ssh_user`, empty `name`/`ssh_key_path`, and whitespace in `ssh_known_hosts_file` are refused |
 
 **Inverter settings check -- `src/modbus.rs`**
 
@@ -217,7 +235,7 @@ after that it takes seconds.
 
 | Command | Runs |
 |---|---|
-| `cargo test` | All tests (53 on Linux, 52 on Windows) |
+| `cargo test` | All tests (105 on Linux, 104 on Windows) |
 | `cargo test state::` | Only tests whose name contains `state::` (the state machine) |
 | `cargo test grid_flap` | Only tests with `grid_flap` in the name |
 | `cargo test -- --nocapture` | All tests, also showing the bridge's log messages |
@@ -228,7 +246,7 @@ after that it takes seconds.
 A good run ends with:
 
 ```
-test result: ok. 53 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
 ```
 
 A failing test is named, followed by the line where the check failed --
@@ -321,7 +339,7 @@ anything: the fake `ssh` never connects, Wake-on-LAN only goes to
 | `wol_listen.py` | Prints each Wake-on-LAN packet and the MAC it targets, grouped into rounds |
 | `bridge-test.toml` | Legacy test config (short waits, local addresses, own marker and `known_hosts`, no watchdog), Proxmox method `poweroff` |
 | `bridge-test-vms.toml` | The same, with Proxmox method `vms_then_poweroff` and a 15 s VM timeout -- for scenarios N (`./run-bridge.sh vms`) |
-| `run-bridge.sh` | Builds the bridge and starts it with the test config, the fake `ssh` first on `PATH`, and debug logging |
+| `run-bridge.sh` | Builds the bridge and starts it with the active `test/bridge.toml` (or `vms` / `poweroff` / `1win`), the fake `ssh` first on `PATH`, and debug logging |
 | `requirements.txt` | pymodbus 3.15.0 and pyserial 3.5, pinned -- pymodbus changes its API between versions |
 | `CHECKLIST.md` | The 35 scenarios (A-M, F2-F5, N1-N5, O-Z, AA), with the exact log lines to expect |
 
@@ -488,6 +506,7 @@ The simulator and bridge can keep running.
 | X | Restart mid-sequence, inverter silent | `ssh-fail`, stop the simulator before restarting | The endpoint the previous run never reached is shut down after `comms_loss_shutdown_secs`, without any reading |
 | Y | Restart mid-sequence, grid up then comms lost | Incomplete marker, `restore`, kill simulator before recovery | Last reading saw grid up; waiting endpoint spared despite silence; recovery wakes endpoints cleanly |
 | Z | Late endpoint command acceptance after recovery | `ssh-delay` file, `restore` mid-sequence | Endpoint completes command after recovery confirmed; marker write skipped; marker file not resurrected |
+| AA | Fast debounce on low battery | `soc 25`, 1 s blip then sustained `outage` | 1 s blip filtered to `Idle`; sustained outage with low battery transitions to `OnBattery` and fires after `low_battery_fast_debounce_secs` (2 s) instead of 5 s |
 
 #### Step 8 -- finish
 

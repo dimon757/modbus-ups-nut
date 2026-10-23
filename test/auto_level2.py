@@ -87,7 +87,11 @@ class AllLevel2Runner:
             try:
                 with open(f"/proc/{pid_str}/cmdline", "rb") as f:
                     cmd = f.read().decode(errors="ignore")
-                    if ("inverter_sim.py" in cmd or "wol_listen.py" in cmd or "target/debug/modbus-ups-bridge" in cmd) and "run_all_level2" not in cmd:
+                    if (
+                        ("inverter_sim.py" in cmd or "wol_listen.py" in cmd or "target/debug/modbus-ups-bridge" in cmd)
+                        and "run_all_level2" not in cmd
+                        and "auto_level2" not in cmd
+                    ):
                         os.kill(int(pid_str), signal.SIGTERM)
             except (FileNotFoundError, ProcessLookupError, PermissionError):
                 pass
@@ -98,6 +102,15 @@ class AllLevel2Runner:
         if not os.path.exists(VENV_PYTHON):
             log("--> Setting up virtualenv...", Color.CYAN)
             subprocess.run(["python3", "-m", "venv", f"{DIR}/venv"], check=True)
+        if (
+            subprocess.run(
+                [VENV_PYTHON, "-c", "import pymodbus"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode
+            != 0
+        ):
+            log("--> Installing Python test dependencies...", Color.CYAN)
             subprocess.run([f"{DIR}/venv/bin/pip", "install", "-q", "-r", f"{TEST_DIR}/requirements.txt"], check=True)
 
         subprocess.run(["chmod", "+x", f"{TEST_DIR}/bin/ssh", f"{TEST_DIR}/pve-bin/qm", f"{TEST_DIR}/pve-bin/systemctl"], check=False)
@@ -161,12 +174,12 @@ class AllLevel2Runner:
 
     def start_wol_listener(self):
         log("--> Starting Wake-on-LAN listener on 127.0.0.1:40009...", Color.CYAN)
-        wol_log = open(f"{DIR}/wol.log", "a")
-        self.wol_proc = subprocess.Popen(
-            ["python3", f"{TEST_DIR}/wol_listen.py", "40009"],
-            stdout=wol_log,
-            stderr=subprocess.STDOUT
-        )
+        with open(f"{DIR}/wol.log", "a") as wol_log:
+            self.wol_proc = subprocess.Popen(
+                ["python3", f"{TEST_DIR}/wol_listen.py", "40009"],
+                stdout=wol_log,
+                stderr=subprocess.STDOUT
+            )
         time.sleep(0.5)
         log("    WOL listener active.", Color.GREEN)
 
@@ -2078,7 +2091,7 @@ class AllLevel2Runner:
         finally:
             self.cleanup()
 
-if __name__ == "__main__":
+def main():
     import argparse
     parser = argparse.ArgumentParser(description="Automated Level 2 scenario test runner")
     parser.add_argument("--1win", "--single", "-1", dest="single_win", action="store_true",
@@ -2101,3 +2114,7 @@ if __name__ == "__main__":
 
     runner = AllLevel2Runner(config=cfg)
     runner.run(args.scenarios if args.scenarios else None)
+
+
+if __name__ == "__main__":
+    main()

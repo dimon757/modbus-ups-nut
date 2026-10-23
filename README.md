@@ -44,44 +44,47 @@ that controls each is named alongside it.
 flowchart TD
     start(["Bridge starts"]) --> marker{"Shutdown marker<br/>state on SSD?"}
     marker -- "not set" --> poll
+    marker -- "waking (Round 1 sent)" --> resume_wol["Resume remaining WOL rounds<br/>(Rounds 2..N in background)"] --> poll
     marker -- "completed" --> latched
     marker -- "incomplete manifest" --> m_grid{"Inverter status<br/>after restart?"}
-    m_grid -- "grid down confirmed" --> resume["Resume sequence for<br/>remaining endpoints"] --> done_seq["Mark completed"] --> latched
+    m_grid -- "grid down confirmed" --> resume["Resume sequence for<br/>remaining endpoints"] --> seq_outcome{"All endpoints<br/>succeeded?"}
     m_grid -- "silent for 300 s<br/>(grid not seen up)<br/><i>comms_loss_shutdown_secs</i>" --> resume
     m_grid -- "grid flickered back" --> hold_wait["Hold remaining sequence<br/>pending recovery confirmation"] --> recover
 
-    poll["Poll the inverter every 5 s<br/>SOC · grid voltage · grid relay · load · battery power"] --> lost{"Grid lost?<br/>voltage below 100 V<br/>or grid relay open<br/><i>grid_lost_voltage · use_grid_relay</i>"}
+    poll["Poll the inverter every 5 s<br/>SOC · grid voltage · grid relay · load · battery power<br/><i>(clears outage SOC window while grid is up)</i>"] --> lost{"Grid lost?<br/>voltage below 100 V<br/>or grid relay open<br/><i>grid_lost_voltage · use_grid_relay</i>"}
     lost -- "no" --> poll
-    lost -- "yes" --> deb{"Grid still lost?<br/>60 s normal debounce<br/><i>on_battery_debounce_secs</i><br/>(15 s if SOC ≤ 30 %<br/><i>low_battery_fast_debounce_secs</i>)"}
-    deb -- "no, grid came back" --> poll
-    deb -- "yes" --> onbatt["On battery"]
+    lost -- "yes" --> deb{"Grid still lost?<br/>60 s normal debounce<br/><i>on_battery_debounce_secs</i><br/>(15 s if SOC ≤ 30 % on 2 of 3<br/>outage readings · <i>low_battery_fast_debounce_secs</i>)"}
+    deb -- "no, grid came back<br/>(clear outage SOC window)" --> poll
+    deb -- "yes" --> onbatt["On battery<br/><i>(comms-loss fail-safe armed)</i>"]
 
     onbatt --> back1{"Grid back?<br/>voltage OK &<br/>relay closed"}
     back1 -- "yes" --> recover
     back1 -- "no" --> comms{"RS485 comms lost<br/>for 300 s while on battery?<br/><i>comms_loss_shutdown_secs</i>"}
     comms -- "yes: unobserved drain" --> write["Write + fsync<br/>shutdown marker"]
-    comms -- "no" --> low{"SOC at or below 30 % on<br/>2 of the last 3 readings?<br/><i>low_battery_soc</i>"}
+    comms -- "no" --> low{"SOC at or below 30 % on<br/>2 of the last 3 outage readings?<br/><i>low_battery_soc</i>"}
     low -- "no" --> onbatt
     low -- "yes" --> write
 
     write --> seq["SSH shutdown sequence<br/>(cancels any previous in-flight task)<br/>record successfully dispatched endpoint in manifest<br/>(skip marker write if recovery confirmed)<br/>(failed endpoints & mid-flight VMs omitted for retry)<br/>concurrent background retries for booting hosts<br/>immediate advance for subsequent endpoints (stagger_secs on success)<br/>(default 300 s retry budget, or per-endpoint override)"]
     seq --> win["Windows<br/>shutdown /s /t 60<br/><i>(error 1190 already-scheduled<br/>treated as accepted)</i>"]
     seq --> pve["Proxmox VE<br/>poweroff (pve-guests)<br/>or vms_then_poweroff<br/>(parallel qm shutdown --timeout)"]
-    win --> done_seq
-    pve --> done_seq
+    win --> seq_outcome
+    pve --> seq_outcome
+    seq_outcome -- "yes" --> done_seq["Mark completed"] --> latched
+    seq_outcome -- "no (some failed)" --> inc_seq["Leave marker incomplete<br/>(withhold completed)"] --> latched
 
     latched["Latched<br/>never fires a second time"] --> healthy{"Grid back?<br/>voltage OK &<br/>relay closed<br/>(whatever the SOC)"}
     healthy -- "no" --> latched
     healthy -- "yes" --> recover
 
     recover{"Grid stays up for 180 s?<br/><i>recovery_debounce_secs</i>"}
-    recover -- "no, lost again" --> sent{"Shutdown already sent<br/>or held pending?"}
-    sent -- "yes, held sequence pending" --> resume
+    recover -- "no, lost again" --> sent{"Shutdown already sent<br/>or incomplete/held pending?"}
+    sent -- "yes, held or failed<br/>endpoints pending" --> resume
     sent -- "yes, fully dispatched" --> latched
     sent -- "no" --> onbatt
-    recover -- "yes" --> fired{"Did this outage<br/>shut anything down?"}
+    recover -- "yes<br/>(clear outage SOC window)" --> fired{"Did this outage<br/>shut anything down?"}
     fired -- "no, just a blip" --> poll
-    fired -- "yes" --> wol["Wake-on-LAN to every endpoint<br/>(stops in-flight shutdown sequence,<br/>suppresses qm stop & host poweroff,<br/>restarts stopped VMs via qm start,<br/>& spares held endpoints)<br/>now, then 8 more rounds 2 min apart<br/><i>wol_resend_count · wol_resend_interval_secs</i>"]
+    fired -- "yes" --> wol["Wake-on-LAN to every endpoint<br/>(stops in-flight shutdown sequence,<br/>suppresses qm stop & host poweroff,<br/>restarts stopped VMs via qm start,<br/>& spares held endpoints)<br/>Round 1 now + mark waking,<br/>then 8 more rounds 2 min apart<br/><i>wol_resend_count · wol_resend_interval_secs</i>"]
     wol --> clear["Delete the<br/>shutdown marker"]
     clear --> poll
 
@@ -91,54 +94,61 @@ flowchart TD
     classDef wake fill:#bfdbfe,stroke:#1d4ed8,color:#1e3a8a
     class poll,start ok
     class onbatt,deb,hold_wait warn
-    class write,seq,win,pve,resume,done_seq,latched bad
-    class wol,clear wake
+    class write,seq,win,pve,resume,done_seq,inc_seq,latched bad
+    class wol,resume_wol,clear wake
 ```
 
 Around the whole loop: the watchdog is fed on every poll (and during
 reconnection cycles), so if the bridge hangs the box reboots itself.
-If the inverter stops answering while the grid is healthy, the bridge
-logs the error and keeps retrying without shutting down; if communication
-is lost while already on battery (or following an interrupted shutdown restart
-without the grid having been seen up), `comms_loss_shutdown_secs` acts as a fail-safe
-and fires (or resumes) the shutdown sequence before the battery drains unobserved
-into the inverter's cutoff. If the grid was seen healthy before comms dropped,
-waiting endpoints are spared from shutdown.
+If the inverter stops answering while the grid is healthy (or during an
+unconfirmed grid dip in `GridLostDebouncing`), the bridge logs the error
+and keeps retrying without shutting down; once on-battery operation has
+been confirmed (`OnBattery`) -- or following an interrupted shutdown restart
+without the grid having been seen up -- `comms_loss_shutdown_secs` acts as a
+fail-safe and fires (or resumes) the shutdown sequence before the battery drains
+unobserved into the inverter's cutoff. If the grid was seen healthy before comms
+dropped, waiting endpoints are spared from shutdown.
 
 When an outage begins, the bridge debounces for `on_battery_debounce_secs` (60 s)
-to filter short blips before declaring on-battery operation. If the battery is already
-low (SOC at or below `low_battery_soc`), waiting the full 60 s would needlessly drain
-the battery toward the inverter's cutoff; in this case, `low_battery_fast_debounce_secs`
-(default 15 s, 0 to disable; must be ≤ `on_battery_debounce_secs`) accelerates the transition to on-battery operation once
-the grid has remained down for that shorter wait, immediately evaluating the low-battery
-shutdown trigger. Short blips are still filtered by this shorter wait.
+to filter short blips before declaring on-battery operation. Only SOC readings
+taken while the grid is lost count toward the 2-of-3 low-battery window (readings
+from `Idle` while the grid was healthy are cleared so pre-outage readings or a stray
+BMS glitch on grid cannot pre-arm the trigger). If the battery is already low during
+the outage (SOC at or below `low_battery_soc` on 2 of the last 3 outage readings),
+waiting the full 60 s would needlessly drain the battery toward the inverter's cutoff;
+in this case, `low_battery_fast_debounce_secs` (default 15 s, 0 to disable; must be ≤
+`on_battery_debounce_secs`) accelerates the transition to on-battery operation once
+the grid has remained down for that shorter wait, immediately firing the low-battery
+shutdown sequence. Short blips are still filtered by this shorter wait.
 
 ### State machine (`src/state.rs`)
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Idle : no marker
-    [*] --> ShutdownLatched : marker found at startup (resumes remaining if incomplete & on battery or inverter silent without grid up)
-    Idle --> GridLostDebouncing : grid lost
-    GridLostDebouncing --> Idle : grid back
+    [*] --> Idle : marker not set or waking (waking resumes remaining WOL rounds 2..N)
+    [*] --> ShutdownLatched : marker incomplete or completed at startup
+    Idle --> GridLostDebouncing : grid lost (starts fresh outage SOC window)
+    GridLostDebouncing --> Idle : grid back (clears outage SOC window)
     GridLostDebouncing --> OnBattery : still lost (debounce or fast debounce if SOC low)
     OnBattery --> RecoveryDebouncing : grid back
     OnBattery --> ShutdownLatched : SOC low OR comms lost on battery, FIRE
-    ShutdownLatched --> RecoveryDebouncing : grid back
-    RecoveryDebouncing --> ShutdownLatched : grid lost, sent or SOC low
+    ShutdownLatched --> RecoveryDebouncing : grid back (reloads any incomplete endpoints)
+    RecoveryDebouncing --> ShutdownLatched : grid lost, sent or SOC low (resumes incomplete once confirmed)
     RecoveryDebouncing --> OnBattery : grid lost, SOC ok
-    RecoveryDebouncing --> Idle : healthy (debounce), WOL
+    RecoveryDebouncing --> Idle : healthy (debounce), clears SOC window, WOL
 ```
 
 | Transition | Exact condition | Action |
 |---|---|---|
-| GridLostDebouncing → OnBattery | grid lost for `on_battery_debounce_secs` (or `low_battery_fast_debounce_secs` if SOC ≤ `low_battery_soc` on 2 of the last 3 readings) | -- |
-| OnBattery → ShutdownLatched | SOC ≤ `low_battery_soc` on 2 of the last 3 readings OR RS485 comms lost for `comms_loss_shutdown_secs` while on battery | **fire** the shutdown sequence (aborts any previous in-flight task) |
-| ShutdownLatched → RecoveryDebouncing | grid back (whatever the SOC) | -- |
-| RecoveryDebouncing → ShutdownLatched | grid lost and the shutdown was already sent | -- (no second shutdown) |
-| RecoveryDebouncing → ShutdownLatched | grid lost, not yet sent, SOC low on 2 of the last 3 readings | **fire** the shutdown sequence (aborts any previous in-flight task) |
+| Idle → GridLostDebouncing | grid lost (`grid_voltage < grid_lost_voltage` or `grid_relay` open) | Starts fresh 2-of-3 outage SOC window |
+| GridLostDebouncing → Idle | grid back before debounce expires | Clears outage SOC window |
+| GridLostDebouncing → OnBattery | grid lost for `on_battery_debounce_secs` (or `low_battery_fast_debounce_secs` if SOC ≤ `low_battery_soc` on 2 of the last 3 outage readings) | Arms `comms_loss_shutdown_secs`; if SOC already low, **fire** immediately (`OnBattery → ShutdownLatched`) |
+| OnBattery → ShutdownLatched | SOC ≤ `low_battery_soc` on 2 of the last 3 outage readings OR RS485 comms lost for `comms_loss_shutdown_secs` while confirmed on battery | **fire** the shutdown sequence (aborts any previous in-flight task) |
+| ShutdownLatched → RecoveryDebouncing | grid back (whatever the SOC) | Reloads any failed endpoints from an `Incomplete` marker so they can be retried if the grid drops again |
+| RecoveryDebouncing → ShutdownLatched | grid lost and the shutdown was already sent | Resumes any held/failed endpoints once grid loss is confirmed (no duplicate shutdown for already-dispatched hosts) |
+| RecoveryDebouncing → ShutdownLatched | grid lost, not yet sent, SOC low on 2 of the last 3 outage readings | **fire** the shutdown sequence (aborts any previous in-flight task) |
 | RecoveryDebouncing → OnBattery | grid lost, not yet sent, SOC not (yet) confirmed low | -- |
-| RecoveryDebouncing → Idle | grid back for `recovery_debounce_secs` (3 min) | **Wake-on-LAN** (stops in-flight shutdown, suppresses VM hard stops & host poweroff, restarts stopped VMs via `qm start`, with resends), only if a shutdown was sent |
+| RecoveryDebouncing → Idle | grid back for `recovery_debounce_secs` (3 min) | Clears outage SOC window; **Wake-on-LAN** (stops in-flight shutdown, suppresses VM hard stops & host poweroff, restarts stopped VMs via `qm start`, marks `waking` after Round 1, with resends), only if a shutdown was sent |
 
 *\* **Grid lost** is triggered if grid voltage < `grid_lost_voltage` OR grid relay (register 194) is open (`use_grid_relay = true`). **Grid back** requires both to be healthy: grid voltage at/above threshold AND grid relay closed (or unreadable).*
 
@@ -207,10 +217,12 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
   read, the voltage alone decides. Recovery needs both healthy: the voltage
   back *and* the relay closed.
 - **Grid lost + SOC at or below `low_battery_soc` on 2 of the last 3
-  readings → shutdown sequence fires once**, latched so it doesn't re-fire
-  while still down or on a flapping grid. Requiring two readings means one
-  stray value (say 0 % while the battery's BMS link hiccups) can't shut the
-  site down; a real low battery fires one poll (5 s) later.
+  outage readings → shutdown sequence fires once**, latched so it doesn't re-fire
+  while still down or on a flapping grid. Only readings taken while the grid is
+  lost count toward the 3-reading window (readings while in `Idle` on healthy grid
+  are cleared, so low pre-outage readings or a stray 0 % BMS hiccup on grid can't
+  pre-arm the window); a real low battery during an outage fires once two outage
+  readings are at or below threshold.
 - **`low_battery_soc` must be set higher than `inverter_cutoff_soc`** (the
   inverter's own hardware/firmware low-SOC protection). The bridge checks
   this at startup and refuses to run if it isn't -- otherwise the inverter
@@ -231,8 +243,8 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
     bridge restarts during long VM shutdowns.
   - Endpoints that failed to shut down are **omitted** from the manifest. If any endpoint
     fails or exhausts its retry budget, `completed` is withheld from the marker; any subsequent
-    restart during the outage (even long after the sequence ended) sees the marker as incomplete
-    and retries only the failed machines.
+    restart during the outage -- or a grid flicker (`ShutdownLatched → RecoveryDebouncing → ShutdownLatched`)
+    after the initial sequence finished -- sees the marker as incomplete and retries only the failed machines.
   - If the bridge restarts mid-sequence and the grid flickers back for just one reading,
     remaining shutdowns are **not** discarded; they are held pending recovery confirmation.
     If the grid drops back down before `recovery_debounce_secs` (3 minutes), the remaining
@@ -243,6 +255,9 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
     If no valid reading arrives for `comms_loss_shutdown_secs` (default 300 s), the fail-safe
     resumes the sequence (`inverter silent: resuming shutdown sequence`), shutting down the
     remaining endpoints before the inverter's hard hardware cutoff drops them ungracefully.
+  - Once Round 1 of Wake-on-LAN is sent on recovery, the marker is updated to `waking`. If the
+    bridge restarts during the WOL resend window, it starts in `Idle` (ready to protect against
+    any new outage) while resuming only the remaining WOL resend rounds (`2..=N`).
   - The marker file is removed only after the final Wake-on-LAN round finishes.
   Delete the file by hand only if you've brought the endpoints back yourself and don't
   want the wake-up round.
@@ -253,7 +268,7 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
 - **Windows shutdown command treats already-scheduled shutdowns (Error 1190) as accepted.**
   If an SSH retry to a Windows machine occurs after a call that timed out client-side but actually initiated shutdown remotely, Windows returns `ERROR_SHUTDOWN_IN_PROGRESS` (1190: *"A system shutdown has already been scheduled"*). The bridge recognises the `(1190)` error suffix in any system language and treats the endpoint as successfully dispatched without retrying.
 - **Fail-safe shutdown on losing inverter communication mid-outage (`comms_loss_shutdown_secs`).**
-  If the inverter stops answering over RS485 (adapter unplugged, cable fault, serial driver issue) while the last valid reading indicated grid loss, the battery is draining unobserved. If no valid reading arrives for `comms_loss_shutdown_secs` (default 300 s / 5 minutes; 0 to disable), the bridge triggers the graceful shutdown sequence rather than letting the battery drain into the inverter's hard hardware cutoff. If the inverter went silent while the grid was healthy, it merely logs errors and retries indefinitely.
+  If the inverter stops answering over RS485 (adapter unplugged, cable fault, serial driver issue) while confirmed on battery (`OnBattery`), the battery is draining unobserved. If no valid reading arrives for `comms_loss_shutdown_secs` (default 300 s / 5 minutes; 0 to disable), the bridge triggers the graceful shutdown sequence rather than letting the battery drain into the inverter's hard hardware cutoff. If the inverter went silent while the grid was healthy (or during a single un-debounced dip in `GridLostDebouncing`), it merely logs errors and retries indefinitely.
   This fail-safe also protects a restart that interrupted a shutdown: if the inverter stays silent for `comms_loss_shutdown_secs` after a restart with an incomplete manifest, the endpoints the previous run never reached are shut down automatically.
 - **If the inverter cuts output on its own hardware protection instead**
   (bridge missed the window, misconfiguration, whatever) -- there's no
@@ -332,9 +347,10 @@ a `grid_lost_voltage` outside 1.0-400.0 V, a poll interval outside 1-10 s
 (the watchdog margin), a `low_battery_fast_debounce_secs` > `on_battery_debounce_secs`
 (or > 3600 s), a malformed `wol_broadcast_addr` (or global `255.255.255.255`),
 `wol_resend_count` > 100, `wol_resend_interval_secs` > 3600, a malformed MAC address,
-duplicate endpoint names, and (when `vms_then_poweroff` is selected) a WOL
-window shorter than `vm_shutdown_timeout_secs`. SSH key files that are missing
-or readable by others are logged as errors (ssh refuses such keys).
+duplicate or empty endpoint names, empty or flag-like (`-`) `host` / `ssh_user` values,
+empty `ssh_key_path`, whitespace in `ssh_known_hosts_file`, and (when `vms_then_poweroff`
+is selected) a WOL window shorter than `vm_shutdown_timeout_secs`. SSH key files that are
+missing or readable by others are logged as errors (ssh refuses such keys).
 
 ## Layout
 
@@ -390,7 +406,7 @@ or readable by others are logged as errors (ssh refuses such keys).
 
 Full explanation and step-by-step instructions: [TESTING.md](TESTING.md).
 
-1. **Unit tests** -- `cargo test` (94 tests). The decision logic, config parsing, the
+1. **Unit tests** -- `cargo test` (105 tests). The decision logic, config parsing, the
    inverter-settings check, the Proxmox commands, the marker file manifest, SSH connection
    retries for booting hosts, Wake-on-LAN rounds, and debounce timers, in under a second with no hardware.
 2. **Simulated site** -- `test/`: the real binary against an inverter

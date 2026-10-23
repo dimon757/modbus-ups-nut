@@ -104,6 +104,9 @@ impl ShutdownMarker {
     }
 
     pub fn mark_completed(&self) {
+        if self.state() == ShutdownState::Completed {
+            return;
+        }
         if let Err(e) = self.try_mark_completed() {
             log::error!(
                 "failed to mark shutdown completed in {:?}: {:#}",
@@ -114,6 +117,9 @@ impl ShutdownMarker {
     }
 
     pub fn mark_waking(&self) {
+        if self.state() == ShutdownState::Waking {
+            return;
+        }
         if let Err(e) = self.try_mark_waking() {
             log::error!(
                 "failed to mark waking state in {:?}: {:#}",

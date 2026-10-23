@@ -374,8 +374,42 @@ impl Config {
                 );
             }
         }
+        if let Some(ref kh) = self.ssh_known_hosts_file {
+            if kh.trim().is_empty() || kh.chars().any(char::is_whitespace) {
+                bail!(
+                    "ssh_known_hosts_file {:?} must not be empty or contain whitespace",
+                    kh
+                );
+            }
+        }
         let mut names = std::collections::HashSet::new();
         for ep in &self.endpoints {
+            if ep.name.trim().is_empty() {
+                bail!("endpoint name must not be empty");
+            }
+            if ep.host.trim().is_empty()
+                || ep.host.starts_with('-')
+                || ep.host.chars().any(char::is_whitespace)
+            {
+                bail!(
+                    "endpoint {:?}: host {:?} must not be empty, start with '-', or contain whitespace",
+                    ep.name,
+                    ep.host
+                );
+            }
+            if ep.ssh_user.trim().is_empty()
+                || ep.ssh_user.starts_with('-')
+                || ep.ssh_user.chars().any(char::is_whitespace)
+            {
+                bail!(
+                    "endpoint {:?}: ssh_user {:?} must not be empty, start with '-', or contain whitespace",
+                    ep.name,
+                    ep.ssh_user
+                );
+            }
+            if ep.ssh_key_path.trim().is_empty() {
+                bail!("endpoint {:?}: ssh_key_path must not be empty", ep.name);
+            }
             crate::wol::parse_mac(&ep.mac_address)
                 .with_context(|| format!("endpoint {:?}: mac_address", ep.name))?;
             if ep.shutdown_delay_secs > 3600 {
@@ -827,6 +861,21 @@ mod tests {
             "shutdown_delay_secs = 3601",
         ));
         assert!(err.contains("shutdown_delay_secs"), "{err}");
+    }
+
+    #[test]
+    fn empty_or_flag_like_endpoint_fields_are_rejected() {
+        let err_host = validate_err(&example_with("host = \"10.x.x.x\"", "host = \"-oProxyCommand=bad\""));
+        assert!(err_host.contains("host"), "{err_host}");
+
+        let err_user = validate_err(&example_with("ssh_user = \"ups-shutdown\"", "ssh_user = \"\""));
+        assert!(err_user.contains("ssh_user"), "{err_user}");
+
+        let err_key = validate_err(&example_with(
+            "ssh_key_path = \"/etc/modbus-ups-bridge/workstation_key\"",
+            "ssh_key_path = \"   \"",
+        ));
+        assert!(err_key.contains("ssh_key_path"), "{err_key}");
     }
 }
 

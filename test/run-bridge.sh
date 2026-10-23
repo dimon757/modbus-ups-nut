@@ -8,12 +8,16 @@ REPO=$(dirname "$HERE")
 
 [ -e /tmp/mub-test/ttyBR ] || { echo "no virtual serial cable -- run ./setup.sh first"; exit 1; }
 
-# ./run-bridge.sh          -> bridge-test-vms.toml (Proxmox method vms_then_poweroff) [default]
+# ./run-bridge.sh          -> bridge.toml (active switched config; default vms_then_poweroff)
+# ./run-bridge.sh vms      -> bridge-test-vms.toml (Proxmox method vms_then_poweroff)
 # ./run-bridge.sh poweroff -> bridge-test.toml     (Proxmox method poweroff)
+# ./run-bridge.sh 1win     -> bridge-1win.toml     (1 Windows 11 endpoint, no Proxmox)
 case "${1:-}" in
-    ""|vms) CONFIG="$HERE/bridge-test-vms.toml" ;;
+    "") CONFIG="$HERE/bridge.toml" ;;
+    vms) CONFIG="$HERE/bridge-test-vms.toml" ;;
     poweroff) CONFIG="$HERE/bridge-test.toml" ;;
-    *) echo "usage: $0 [vms|poweroff]"; exit 1 ;;
+    1win) CONFIG="$HERE/bridge-1win.toml" ;;
+    *) echo "usage: $0 [vms|poweroff|1win]"; exit 1 ;;
 esac
 
 cargo build --quiet --manifest-path "$REPO/Cargo.toml"

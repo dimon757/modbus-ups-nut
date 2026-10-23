@@ -35,7 +35,7 @@ the four commands to run, one per terminal:
    -- type commands at the `sim>` prompt (`help` lists them)
 2. **Wake-on-LAN**: `python3 wol_listen.py`
 3. **ssh log**: `tail -f /tmp/mub-test/ssh.log`
-4. **bridge**: `./run-bridge.sh` -- debug log, one line per poll (every 1 s)
+4. **bridge**: `./run-bridge.sh` -- uses the active `test/bridge.toml` (or `./run-bridge.sh vms | poweroff | 1win`), debug log, one line per poll (every 1 s)
 
 Between scenarios, `./setup.sh reset` clears the ssh log, the marker and any
 simulated SSH failures. When done: `./setup.sh clean`.
