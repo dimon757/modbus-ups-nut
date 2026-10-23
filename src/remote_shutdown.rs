@@ -883,6 +883,7 @@ pub fn parse_qmlist_with_running(out: &str) -> (Vec<Vm>, Vec<Vm>) {
 ///        100 dc01                 running    2048              32.00 1234      
 ///        101 app server (prod)    running    4096              50.00 5678      
 ///        102 db01                 stopped    8192             100.00 0         
+#[cfg(test)]
 pub fn parse_qmlist(out: &str) -> Vec<Vm> {
     parse_qmlist_with_running(out).0
 }
