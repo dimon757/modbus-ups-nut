@@ -17,7 +17,7 @@ procedures: [docs/register-verification.md](docs/register-verification.md)
 (inverter registers) and [docs/proxmox-shutdown-test.md](docs/proxmox-shutdown-test.md)
 (Proxmox shutdown command).
 
-**Status (2026-10-23).** Level 1: 105 tests, all passing on Debian 13 (104 on
+**Status (2026-10-24).** Level 1: 112 tests, all passing on Debian 13 (111 on
 Windows, where the one Linux-only test is skipped). Level 2: all 35 scenarios
 (A-M plus the 60 s SSH timeout, F2 for mid-sequence restart resumption, F3 for grid flicker during restart, F4 for failed endpoint retry & Proxmox timing, F5 for failed endpoint retry after sequence finishes, N1-N5 for the Proxmox method
 `vms_then_poweroff` against simulated VMs, O for host booting without head-of-line blocking, P for server booting with per-endpoint retry budget, Q for restarting a VM that was still shutting down when the grid returned, R for dropped VM shutdown logins, S/T for inverter-settings handling in default and strict mode, U for a sagging grid with the grid relay open, V for inverter comms loss fail-safe while on battery, W for Windows error 1190 already-scheduled shutdown handling, X for restart mid-sequence with inverter silent, Y for restart mid-sequence with grid up then inverter silent, Z for endpoint finishing shutdown after recovery without resurrecting the marker, and AA for fast debounce on low battery) passing on Debian 13 under WSL2.
@@ -79,7 +79,7 @@ on immediately. A wait of **3600 s** can never pass during the test, so the
 state is guaranteed to stay put. That's also the main limit: the tests
 can't check exact timings ("fires at 60 s, not at 59 s").
 
-### The 105 tests
+### The 112 tests
 
 **State machine -- `src/state.rs`**
 
@@ -141,6 +141,10 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `low_battery_fast_debounce_secs_must_not_exceed_normal_debounce` | Values > `on_battery_debounce_secs` are refused |
 | `shutdown_delay_secs_beyond_limit_is_rejected` | Endpoint `shutdown_delay_secs` > 3600 s is refused |
 | `empty_or_flag_like_endpoint_fields_are_rejected` | Empty or flag-like (`-`) `host`/`ssh_user`, empty `name`/`ssh_key_path`, and whitespace in `ssh_known_hosts_file` are refused |
+| `non_ipv4_or_portless_wol_address_is_rejected` | IPv6, `0.0.0.0`, or port `0` in `wol_broadcast_addr` is refused |
+| `modbus_slave_id_and_baud_rate_are_range_checked` | `modbus.slave_id` outside `1..=247` or `modbus.baud_rate = 0` is refused |
+| `zero_debounces_are_rejected` | `on_battery_debounce_secs = 0` or `recovery_debounce_secs = 0` is refused |
+| `wol_window_problems_flag_unrecallable_delays_beyond_the_window` | Flags Windows / Proxmox `poweroff` endpoints whose `shutdown_delay_secs` (+ 120 s power-off margin) exceeds `recovery_debounce_secs` + the WOL resend window |
 
 **Inverter settings check -- `src/modbus.rs`**
 
@@ -156,6 +160,7 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `unreadable_grid_relay_warns_only_when_it_is_used` | A missing/odd register 194 logs a warning (voltage-only detection), unless `use_grid_relay = false` |
 | `every_modbus_exception_text_counts_as_register_not_available` | All nine Modbus exception messages of the library ("Modbus function N: ...") mean "register not available" (voltage-only fallback), not a transport fault |
 | `transport_and_framing_errors_are_not_exceptions` | Broken pipe, I/O error, EOF, invalid response and the like still make the caller reconnect |
+| `decode_grid_voltage_rejects_garbled_readings_above_500v` | Rejects garbled register 150 readings above 500.0 V (e.g. `0xFFFF` = `6553.5 V`) as a poll error rather than treating them as "grid healthy" |
 
 **Other modules**
 
@@ -177,6 +182,7 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `remote_shutdown::resilience_tests::vm_reconnect_budget_never_exceeds_the_guest_timeout` | A VM's reconnect budget is the endpoint's, capped at `vm_shutdown_timeout_secs` |
 | `remote_shutdown::resilience_tests::restart_plan_starts_stopped_vms_and_keeps_watching_the_rest` | After a cancelled shutdown: stopped VMs are started, VMs still shutting down (or unlisted) keep being watched |
 | `remote_shutdown::resilience_tests::restart_plan_with_nothing_stopped_changes_nothing` | Nothing stopped yet -> nothing started, everything still watched |
+| `remote_shutdown::resilience_tests::hung_or_failing_qmlist_falls_back_to_host_poweroff_while_unreachable_host_aborts` | A hung (`timed out after 60s`) or non-zero `qm list` falls back to Step 5 host power-off, whereas an unreachable host, auth failure, or confirmed recovery aborts |
 | `config::strict_inverter_checks_line_in_the_example_can_be_uncommented` | Switching the option on exactly as the example config says loads without error |
 | `tests::accepts_valid_settings_in_default_and_strict_modes` (main.rs) | Valid inverter settings are accepted either way |
 | `tests::refuses_wrong_device_type_even_in_non_strict_mode` (main.rs) | A wrong device type (data can't be trusted) is refused, with the reason |
@@ -196,6 +202,7 @@ can't check exact timings ("fires at 60 s, not at 59 s").
 | `watchdog::feeds_then_disarms_through_a_clone_with_magic_v` | Feeding writes a zero byte; a requested stop writes the magic `V` through the stop handler's second handle, so `systemctl stop` doesn't reboot the box |
 | `watchdog::without_a_watchdog_configured_everything_is_a_no_op` | With no `[watchdog]` section (e.g. the test config), feeding and disarming do nothing |
 | `wol::parse_mac_handles_whitespace_and_separators` | MAC address parsing handles leading/trailing whitespace, dash or colon separators, and rejects invalid octets |
+| `wol::parse_mac_rejects_malformed_octets_and_mixed_separators` | Rejects `+F`, `0AA`, single-digit octets, internal whitespace, and mixed `:`/`-` separators |
 | `wol::sends_first_round_plus_resends` | Wake-on-LAN sends 1 + N rounds of valid 102-byte packets (caught on a local socket) |
 
 ### How to run them
@@ -235,7 +242,7 @@ after that it takes seconds.
 
 | Command | Runs |
 |---|---|
-| `cargo test` | All tests (105 on Linux, 104 on Windows) |
+| `cargo test` | All tests (112 on Linux, 111 on Windows) |
 | `cargo test state::` | Only tests whose name contains `state::` (the state machine) |
 | `cargo test grid_flap` | Only tests with `grid_flap` in the name |
 | `cargo test -- --nocapture` | All tests, also showing the bridge's log messages |
@@ -246,7 +253,7 @@ after that it takes seconds.
 A good run ends with:
 
 ```
-test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+test result: ok. 112 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
 ```
 
 A failing test is named, followed by the line where the check failed --

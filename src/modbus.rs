@@ -139,10 +139,11 @@ impl ModbusClient {
         if soc_raw > 100 {
             bail!("battery SOC register read {} (valid range 0-100)", soc_raw);
         }
+        let grid_voltage = decode_grid_voltage(grid_raw)?;
 
         Ok(InverterReading {
             battery_soc_pct: soc_raw as f64,
-            grid_voltage: grid_raw as f64 / GRID_VOLTAGE_SCALE,
+            grid_voltage,
             grid_relay_closed: decode_grid_relay(relay_raw),
             load_power_w: load_raw as i16 as f64,
             battery_power_w: batt_raw as i16 as f64,
@@ -230,6 +231,23 @@ fn is_modbus_exception_error(err_str: &str) -> bool {
         || err_str.contains("server device")
         || err_str.contains("memory parity")
         || err_str.contains("gateway")
+}
+
+/// Register 150 -> grid voltage in volts. Anything above 500 V from a
+/// single-phase 230 V inverter is a garbled read (e.g. 0xFFFF = 6553.5 V)
+/// and must fail the poll rather than look like "grid present".
+fn decode_grid_voltage(raw: u16) -> Result<f64> {
+    const MAX_SANITY_GRID_VOLTAGE: f64 = 500.0;
+    let volts = raw as f64 / GRID_VOLTAGE_SCALE;
+    if volts > MAX_SANITY_GRID_VOLTAGE {
+        bail!(
+            "grid voltage register read {:.1} V (raw {}, valid range 0.0-{:.1} V)",
+            volts,
+            raw,
+            MAX_SANITY_GRID_VOLTAGE
+        );
+    }
+    Ok(volts)
 }
 
 /// Register 194 -> relay state. Only 0 and 1 are defined; anything else is
@@ -493,5 +511,14 @@ mod tests {
         assert!(s.contains("version (reg 2) unreadable"), "{s}");
         assert!(s.contains("reg 54 unreadable"), "{s}");
         assert!(s.contains("reg 194) unreadable"), "{s}");
+    }
+
+    #[test]
+    fn decode_grid_voltage_rejects_garbled_readings_above_500v() {
+        assert_eq!(decode_grid_voltage(0).unwrap(), 0.0);
+        assert_eq!(decode_grid_voltage(2300).unwrap(), 230.0);
+        assert_eq!(decode_grid_voltage(5000).unwrap(), 500.0);
+        assert!(decode_grid_voltage(5001).is_err());
+        assert!(decode_grid_voltage(0xFFFF).is_err());
     }
 }

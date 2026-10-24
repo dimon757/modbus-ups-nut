@@ -31,6 +31,7 @@ async fn main() -> Result<()> {
         .ssh_key_problems()
         .into_iter()
         .chain(remote_shutdown::known_host_problems(&cfg))
+        .chain(cfg.wol_window_problems())
     {
         log::error!("{}", problem);
     }

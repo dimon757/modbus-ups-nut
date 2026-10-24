@@ -42,7 +42,8 @@ that controls each is named alongside it.
 
 ```mermaid
 flowchart TD
-    start(["Bridge starts"]) --> marker{"Shutdown marker<br/>state on SSD?"}
+    start(["Bridge starts"]) --> validate["Validate config & log startup checks<br/>(IPv4 WOL addr · slave_id 1-247 · baud_rate > 0 ·<br/>debounces ≥ 1 s · strict 2-hex-digit MAC ·<br/>SSH keys · known_hosts · WOL window vs shutdown_delay_secs)"]
+    validate --> marker{"Shutdown marker<br/>state on SSD?"}
     marker -- "not set" --> poll
     marker -- "waking (Round 1 sent)" --> resume_wol["Resume remaining WOL rounds<br/>(Rounds 2..N in background)"] --> poll
     marker -- "completed" --> latched
@@ -51,7 +52,7 @@ flowchart TD
     m_grid -- "silent for 300 s<br/>(grid not seen up)<br/><i>comms_loss_shutdown_secs</i>" --> resume
     m_grid -- "grid flickered back" --> hold_wait["Hold remaining sequence<br/>pending recovery confirmation"] --> recover
 
-    poll["Poll the inverter every 5 s<br/>SOC · grid voltage · grid relay · load · battery power<br/><i>(clears outage SOC window while grid is up)</i>"] --> lost{"Grid lost?<br/>voltage below 100 V<br/>or grid relay open<br/><i>grid_lost_voltage · use_grid_relay</i>"}
+    poll["Poll the inverter every 5 s<br/>SOC (0-100 %) · grid voltage (0-500 V) ·<br/>grid relay · load · battery power<br/><i>(rejects garbled reads; clears outage SOC window while grid is up)</i>"] --> lost{"Grid lost?<br/>voltage below 100 V<br/>or grid relay open<br/><i>grid_lost_voltage · use_grid_relay</i>"}
     lost -- "no" --> poll
     lost -- "yes" --> deb{"Grid still lost?<br/>60 s normal debounce<br/><i>on_battery_debounce_secs</i><br/>(15 s if SOC ≤ 30 % on 2 of 3<br/>outage readings · <i>low_battery_fast_debounce_secs</i>)"}
     deb -- "no, grid came back<br/>(clear outage SOC window)" --> poll
@@ -65,11 +66,14 @@ flowchart TD
     low -- "no" --> onbatt
     low -- "yes" --> write
 
-    write --> seq["SSH shutdown sequence<br/>(cancels any previous in-flight task)<br/>record successfully dispatched endpoint in manifest<br/>(skip marker write if recovery confirmed)<br/>(failed endpoints & mid-flight VMs omitted for retry)<br/>concurrent background retries for booting hosts<br/>immediate advance for subsequent endpoints (stagger_secs on success)<br/>(default 300 s retry budget, or per-endpoint override)"]
+    write --> seq["SSH shutdown sequence<br/>(cancels any previous in-flight task;<br/>retry SSH calls raced against stop channel)<br/>record successfully dispatched endpoint in manifest<br/>(skip marker write if recovery confirmed)<br/>(failed endpoints & mid-flight VMs omitted for retry)<br/>concurrent background retries for booting hosts<br/>immediate advance for subsequent endpoints (stagger_secs on success)<br/>(default 300 s retry budget, or per-endpoint override;<br/>retry attempt timeouts capped to remaining budget)"]
+    seq -- "recovery confirmed<br/>(stop channel cancels retries<br/>& remaining endpoints)" --> wol
     seq --> win["Windows<br/>shutdown /s /t 60<br/><i>(error 1190 already-scheduled<br/>treated as accepted)</i>"]
     seq --> pve["Proxmox VE<br/>poweroff (pve-guests)<br/>or vms_then_poweroff<br/>(parallel qm shutdown --timeout)"]
+    pve -- "qm list failed or hung (60 s)<br/>after SSH connected" --> pve_fb["Fallback directly to<br/>Step 5 host poweroff<br/>(systemctl poweroff --no-block)"]
     win --> seq_outcome
     pve --> seq_outcome
+    pve_fb --> seq_outcome
     seq_outcome -- "yes" --> done_seq["Mark completed"] --> latched
     seq_outcome -- "no (some failed)" --> inc_seq["Leave marker incomplete<br/>(withhold completed)"] --> latched
 
@@ -92,9 +96,9 @@ flowchart TD
     classDef warn fill:#fde68a,stroke:#b45309,color:#78350f
     classDef bad fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
     classDef wake fill:#bfdbfe,stroke:#1d4ed8,color:#1e3a8a
-    class poll,start ok
+    class poll,start,validate ok
     class onbatt,deb,hold_wait warn
-    class write,seq,win,pve,resume,done_seq,inc_seq,latched bad
+    class write,seq,win,pve,pve_fb,resume,done_seq,inc_seq,latched bad
     class wol,resume_wol,clear wake
 ```
 
@@ -293,8 +297,8 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
    | 0 | device type (0x0300 = single-phase storage) | -- |
    | 2 | protocol version (logged only) | e.g. 0x0102 = 1.2 |
    | 54 | V119 "AC power ratio" / V117 "EEPROM initial" (logged only, never written) | -- |
-   | 150 | grid side voltage L1-N (decides grid lost, together with 194) | 0.1 V |
-   | 178 | load side total power | 1 W, unsigned |
+   | 150 | grid side voltage L1-N (decides grid lost, together with 194) | 0.1 V, 0.0-500.0 V |
+   | 178 | load side total power | 1 W, signed |
    | 184 | battery SOC | 1 %, 0-100 |
    | 190 | battery output power | 1 W, signed |
    | 194 | grid side relay status: 0 open (off grid) / 1 closed (on grid) -- with 150, decides grid lost | -- |
@@ -343,18 +347,24 @@ uses one RS485 port and a few MB of RAM; the rest is headroom.
    rather than transport faults, preventing reconnect loops on unsupported registers).
 
 The bridge checks at startup, and refuses to start on, a wrong SOC range,
-a `grid_lost_voltage` outside 1.0-400.0 V, a poll interval outside 1-10 s
-(the watchdog margin), a `low_battery_fast_debounce_secs` > `on_battery_debounce_secs`
-(or > 3600 s), a malformed `wol_broadcast_addr` (or global `255.255.255.255`),
-`wol_resend_count` > 100, `wol_resend_interval_secs` > 3600, a malformed MAC address,
-duplicate or empty endpoint names, empty or flag-like (`-`) `host` / `ssh_user` values,
-empty `ssh_key_path`, whitespace in `ssh_known_hosts_file`, and (when `vms_then_poweroff`
-is selected) a WOL window shorter than `vm_shutdown_timeout_secs`. SSH key files that are
-missing or readable by others are logged as errors (ssh refuses such keys).
+a `grid_lost_voltage` outside 1.0-400.0 V, a `modbus.baud_rate` of 0, a
+`modbus.slave_id` outside 1-247, a poll interval outside 1-10 s (the watchdog
+margin), an `on_battery_debounce_secs` or `recovery_debounce_secs` of 0, a
+`low_battery_fast_debounce_secs` > `on_battery_debounce_secs` (or > 3600 s), a
+malformed `wol_broadcast_addr` (must be IPv4 with a non-zero port, not `0.0.0.0`
+or global `255.255.255.255`), `wol_resend_count` > 100, `wol_resend_interval_secs` > 3600,
+a malformed MAC address (must be 6 two-hex-digit octets with consistent `:` or `-`
+separators), duplicate or empty endpoint names, empty or flag-like (`-`) `host` /
+`ssh_user` values, empty `ssh_key_path`, whitespace in `ssh_known_hosts_file`, and
+(when `vms_then_poweroff` is selected) a WOL window shorter than `vm_shutdown_timeout_secs`.
+At startup it also logs an error for any SSH key file that is missing or readable by
+others (ssh refuses such keys), any endpoint missing from `known_hosts`, and any
+Windows or Proxmox `poweroff` endpoint whose unrecallable `shutdown_delay_secs` (+ 120 s
+power-off margin) exceeds `recovery_debounce_secs` + the WOL resend window.
 
 ## Layout
 
-- `src/modbus.rs` -- polls the four registers (plus the grid relay flag, register 194) over RS485 RTU.
+- `src/modbus.rs` -- polls the four registers (plus the grid relay flag, register 194) over RS485 RTU, rejecting garbled SOC (> 100 %) or grid voltage (> 500.0 V) reads.
 - `src/state.rs` -- debounced state machine (Idle / GridLostDebouncing /
   OnBattery / ShutdownLatched / RecoveryDebouncing). Fires the shutdown
   sequence exactly once per outage, and one Wake-on-LAN round (with its
@@ -363,20 +373,24 @@ missing or readable by others are logged as errors (ssh refuses such keys).
   and sequence completion across reboots, enabling mid-sequence resumption
   without duplicate commands.
 - `src/remote_shutdown.rs` -- SSH shutdown sequence, endpoints started in
-  configured order, `stagger_secs` apart. Each endpoint's initial SSH connection
-  automatically retries transient connection errors (connection refused / timed out)
-  every 2 s up to `ssh_connect_retry_secs` (e.g. if the host is still booting from a
-  recent wake-up). Windows: native `shutdown /s /t ... /c "..."`. Proxmox VE, by `[proxmox] method`:
+  configured order, `stagger_secs` apart. Retry SSH calls and stagger sleeps are raced
+  against the recovery stop signal so confirmed recovery cancels pending retries and
+  remaining endpoints immediately (and skips marker writes if an already-started foreground
+  call finishes after recovery). Each endpoint's initial SSH connection automatically retries transient
+  connection errors (connection refused / timed out) every 2 s up to `ssh_connect_retry_secs`
+  (with retry attempt timeouts capped to the remaining budget). Windows: native
+  `shutdown /s /t ... /c "..."`. Proxmox VE, by `[proxmox] method`:
   `poweroff` (default) sends `/sbin/poweroff`, detached with `nohup` --
   Debian/Proxmox's systemd unit `pve-guests.service` stops all running VMs
   and containers gracefully with their configured timeout/ordering, then powers
   off the host; `vms_then_poweroff` has the bridge shut every running VM down
   in parallel (`qm shutdown <id> --timeout <secs>`, QEMU guest agent / ACPI; the calls
   start 250 ms apart so sshd's login limit doesn't drop some, and a call whose SSH
-  connection fails is retried -- a VM the request never reached is **not** powered off hard),
-  power off hard any VM still running after `vm_shutdown_timeout_secs` (`qm stop`),
-  then `systemctl poweroff --no-block` (falls back to `/sbin/poweroff` if refused)
-  -- each such host runs in parallel with the rest of the sequence. If recovery is confirmed
+  connection fails is retried -- a VM the request never reached is **not** powered off hard;
+  if `qm list` fails or hangs past the 60 s wrapper timeout after SSH connects, the bridge
+  falls back directly to host power-off), power off hard any VM still running after
+  `vm_shutdown_timeout_secs` (`qm stop`), then `systemctl poweroff --no-block` (falls back
+  to `/sbin/poweroff` if refused) -- each such host runs in parallel with the rest of the sequence. If recovery is confirmed
   while VM shutdowns are in progress or during the power-off delay, the bridge aborts destructive
   hard stops, cancels host power-off, and keeps watching the VMs for up to
   `vm_shutdown_timeout_secs` (+15 s), restarting each one that stops (including VMs still
@@ -406,7 +420,7 @@ missing or readable by others are logged as errors (ssh refuses such keys).
 
 Full explanation and step-by-step instructions: [TESTING.md](TESTING.md).
 
-1. **Unit tests** -- `cargo test` (105 tests). The decision logic, config parsing, the
+1. **Unit tests** -- `cargo test` (112 tests). The decision logic, config parsing, the
    inverter-settings check, the Proxmox commands, the marker file manifest, SSH connection
    retries for booting hosts, Wake-on-LAN rounds, and debounce timers, in under a second with no hardware.
 2. **Simulated site** -- `test/`: the real binary against an inverter

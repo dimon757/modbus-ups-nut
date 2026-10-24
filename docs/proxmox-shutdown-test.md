@@ -128,22 +128,24 @@ Sends exactly what the bridge sends, from the bridge box with the bridge's key:
 
 ```mermaid
 flowchart TD
-    start(["Start vms_then_poweroff on Proxmox host"]) --> list["List VMs: qm list"]
-    list --> states["Query power states in batch: qm status"]
-    states --> chk_rec0{"Recovery confirmed?<br/>(stop channel)"}
-    chk_rec0 -- "yes" --> cancel_exit(["Cancel Proxmox shutdown<br/>(no destructive steps)"])
+    start(["Start vms_then_poweroff on Proxmox host"]) --> list["List VMs & running status: qm list<br/>(retries SSH connect failures up to ssh_connect_retry_secs;<br/>attempt timeouts capped to remaining budget;<br/>raced against recovery stop channel)"]
+    list --> list_res{"qm list result?"}
+    list_res -- "SSH unreachable / auth error /<br/>recovery confirmed" --> cancel_exit(["Cancel / Abort Proxmox shutdown<br/>(no destructive steps)"])
+    list_res -- "qm list failed or hung (60 s timeout)<br/>after SSH connected" --> fb_log["Log error & proceed directly<br/>to Step 5 host power-off"] --> chk_delay
+    list_res -- "OK (parsed VMs & running list)" --> chk_rec0{"Recovery confirmed?<br/>(stop channel)"}
+    chk_rec0 -- "yes" --> cancel_exit
     chk_rec0 -- "no" --> running{"Any VMs running?"}
     running -- "no" --> chk_delay
     running -- "yes" --> spawn["Spawn parallel shutdown tasks<br/>(250 ms apart, up to 10 s spread)"]
 
     subgraph parallel ["Parallel Execution per Running VM"]
         direction TB
-        vm_call["qm shutdown ID --timeout vm_shutdown_timeout_secs"] --> vm_eval{"SSH / qm result"}
+        vm_call["qm shutdown ID --timeout vm_shutdown_timeout_secs<br/>(raced against recovery stop channel)"] --> vm_eval{"SSH / qm result"}
         vm_eval -- "SSH handshake failed" --> ssh_retry{"Retry budget<br/>remaining?"}
-        ssh_retry -- "yes" --> vm_retry_sleep["Wait 2 s"] --> vm_call
+        ssh_retry -- "yes" --> vm_retry_sleep["Wait 2 s<br/>(timeout capped to remaining budget)"] --> vm_call
         ssh_retry -- "exhausted" --> vm_unreached["Unreachable: skip hard stop<br/>(host poweroff stops it)"]
         vm_eval -- "Clean exit (code 0)" --> vm_done["VM stopped gracefully"]
-        vm_eval -- "Guest agent missing / timeout" --> vm_pending["Mark pending for hard stop"]
+        vm_eval -- "Guest agent missing / timeout" --> vm_pending["Mark pending/refused for hard stop"]
     end
 
     spawn --> parallel
@@ -179,7 +181,7 @@ Run the individual steps by hand from the bridge box to verify each command:
    ```bash
    sudo ssh -i /etc/modbus-ups-bridge/proxmox_key -o BatchMode=yes root@<proxmox-host> "qm list"
    ```
-   Note the test VM's VMID.
+   Note the test VM's VMID and its `STATUS` column (`running` vs `stopped`). The bridge parses both the VM list and running status directly from `qm list` (retrying SSH connection failures if the host is still booting); if SSH connects to the host but `qm list` itself fails or hangs past the 60 s timeout (e.g. `pvedaemon` wedged), the bridge falls back directly to Step 5 (`systemctl poweroff --no-block`) so `pve-guests.service` stops guests and powers the host off cleanly.
 2. **Read VM power state**:
    ```bash
    sudo ssh -i /etc/modbus-ups-bridge/proxmox_key -o BatchMode=yes root@<proxmox-host> 'for id in <vmid>; do echo "$id $(qm status $id)"; done'

@@ -98,6 +98,8 @@ class AllLevel2Runner:
         time.sleep(0.5)
 
     def init_keys_and_dirs(self):
+        log("--> Building modbus-ups-bridge...", Color.CYAN)
+        subprocess.run(["cargo", "build", "--quiet"], cwd=REPO_DIR, check=True)
         os.makedirs(DIR, exist_ok=True)
         if not os.path.exists(VENV_PYTHON):
             log("--> Setting up virtualenv...", Color.CYAN)

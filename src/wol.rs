@@ -88,13 +88,23 @@ async fn wake_one(socket: &UdpSocket, mac: &str, broadcast_addr: &str) -> Result
 
 pub(crate) fn parse_mac(mac: &str) -> Result<[u8; 6]> {
     let trimmed = mac.trim();
-    let parts: Vec<&str> = trimmed.split([':', '-']).collect();
+    // One separator style throughout: "AA:BB:.." or "AA-BB-..", never mixed.
+    let sep = if trimmed.contains(':') { ':' } else { '-' };
+    if trimmed.contains(':') && trimmed.contains('-') {
+        bail!("invalid MAC address {:?}: mixes ':' and '-' separators", mac);
+    }
+    let parts: Vec<&str> = trimmed.split(sep).collect();
     if parts.len() != 6 {
         bail!("invalid MAC address {:?}: expected 6 colon/dash-separated octets", mac);
     }
     let mut out = [0u8; 6];
     for (i, p) in parts.iter().enumerate() {
-        out[i] = u8::from_str_radix(p.trim(), 16)
+        // Exactly two hex digits: `from_str_radix` alone would also accept
+        // "+F" or "0AA", silently turning a typo into some other MAC.
+        if p.len() != 2 || !p.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!("invalid octet {:?} in MAC address {:?}: expected two hex digits", p, mac);
+        }
+        out[i] = u8::from_str_radix(p, 16)
             .with_context(|| format!("invalid octet {:?} in MAC address {:?}", p, mac))?;
     }
     Ok(out)
@@ -130,6 +140,16 @@ mod tests {
         );
         assert!(parse_mac("AA:BB:CC:DD:EE").is_err());
         assert!(parse_mac("AA:BB:CC:DD:EE:GG").is_err());
+    }
+
+    #[test]
+    fn parse_mac_rejects_malformed_octets_and_mixed_separators() {
+        assert!(parse_mac("AA:BB:CC:DD:EE:+F").is_err());
+        assert!(parse_mac("AA:BB:CC:DD:EE:0AA").is_err());
+        assert!(parse_mac("AA:BB:CC:DD:EE:F").is_err());
+        assert!(parse_mac("AA:BB:CC:DD:EE: F").is_err());
+        assert!(parse_mac("AA:BB-CC:DD:EE:FF").is_err());
+        assert_eq!(parse_mac("aa:bb:cc:dd:ee:ff").unwrap(), [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
     }
 
     #[tokio::test]

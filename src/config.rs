@@ -355,6 +355,34 @@ impl Config {
                 self.wol_broadcast_addr
             );
         }
+        // The WOL socket is IPv4 (bound to 0.0.0.0): an IPv6 target would
+        // pass here and then fail every send, only noticed after an outage.
+        if !wol_sock.is_ipv4() || wol_sock.ip().is_unspecified() || wol_sock.port() == 0 {
+            bail!(
+                "wol_broadcast_addr {:?} must be an IPv4 address with a non-zero port, \
+                 e.g. \"192.168.1.255:9\"",
+                self.wol_broadcast_addr
+            );
+        }
+        if self.modbus.baud_rate == 0 {
+            bail!("modbus.baud_rate must not be 0 (the protocol uses 9600)");
+        }
+        // 0 is the Modbus broadcast address -- a slave never answers it, so
+        // every read would time out. 248-255 are reserved.
+        if !(1..=247).contains(&self.modbus.slave_id) {
+            bail!(
+                "modbus.slave_id is {} -- must be 1-247",
+                self.modbus.slave_id
+            );
+        }
+        // 0 would let a single reading start the outage handling or, worse,
+        // confirm recovery and send Wake-on-LAN on a flapping grid.
+        if t.on_battery_debounce_secs == 0 {
+            bail!("thresholds.on_battery_debounce_secs must be at least 1 s");
+        }
+        if t.recovery_debounce_secs == 0 {
+            bail!("thresholds.recovery_debounce_secs must be at least 1 s");
+        }
         if !(10..=1800).contains(&self.proxmox.vm_shutdown_timeout_secs) {
             bail!(
                 "proxmox.vm_shutdown_timeout_secs is {} -- must be 10-1800",
@@ -481,6 +509,44 @@ impl Config {
             }
         }
         out
+    }
+
+    /// Endpoints whose delayed shutdown could outlast every Wake-on-LAN
+    /// round. A Windows `shutdown /s /t N` or a Proxmox `poweroff`
+    /// endpoint's detached `sleep N; poweroff` cannot be recalled once sent:
+    /// if the grid returns right after dispatch, the machine still powers
+    /// off N seconds later. It is only woken again if a WOL round goes out
+    /// after it is down, i.e. if `shutdown_delay_secs` plus the time to shut
+    /// down fits inside `recovery_debounce_secs` + the resend window.
+    /// (`vms_then_poweroff` Proxmox endpoints apply their delay locally and
+    /// recovery cancels it, so they are not affected.) Logged at startup.
+    pub fn wol_window_problems(&self) -> Vec<String> {
+        /// Rough time an endpoint needs to actually power off once its
+        /// countdown ends.
+        const SHUTDOWN_MARGIN_SECS: u64 = 120;
+        let t = &self.thresholds;
+        let last_wol_secs = t
+            .recovery_debounce_secs
+            .saturating_add(u64::from(t.wol_resend_count).saturating_mul(t.wol_resend_interval_secs));
+        self.endpoints
+            .iter()
+            .filter(|ep| {
+                !(ep.kind == EndpointKind::Proxmox && self.proxmox.method == ProxmoxMethod::VmsThenPoweroff)
+            })
+            .filter_map(|ep| {
+                let off_by = u64::from(ep.shutdown_delay_secs).saturating_add(SHUTDOWN_MARGIN_SECS);
+                (off_by > last_wol_secs).then(|| {
+                    format!(
+                        "endpoint {}: shutdown_delay_secs ({} s) + ~{} s to power off exceeds \
+                         recovery_debounce_secs + WOL resend window ({} s) -- if the grid returns \
+                         right after its shutdown is sent, it may power off after the last \
+                         Wake-on-LAN round and stay off; raise wol_resend_count / \
+                         wol_resend_interval_secs or lower shutdown_delay_secs",
+                        ep.name, ep.shutdown_delay_secs, SHUTDOWN_MARGIN_SECS, last_wol_secs
+                    )
+                })
+            })
+            .collect()
     }
 }
 
@@ -876,6 +942,53 @@ mod tests {
             "ssh_key_path = \"   \"",
         ));
         assert!(err_key.contains("ssh_key_path"), "{err_key}");
+    }
+
+    #[test]
+    fn non_ipv4_or_portless_wol_address_is_rejected() {
+        for bad in ["[ff02::1]:9", "0.0.0.0:9", "192.168.1.255:0"] {
+            let err = validate_err(&example_with(
+                "wol_broadcast_addr = \"192.168.1.255:9\"",
+                &format!("wol_broadcast_addr = \"{bad}\""),
+            ));
+            assert!(err.contains("wol_broadcast_addr"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn modbus_slave_id_and_baud_rate_are_range_checked() {
+        let err = validate_err(&example_with("slave_id = 1 ", "slave_id = 0 "));
+        assert!(err.contains("slave_id"), "{err}");
+        let err = validate_err(&example_with("slave_id = 1 ", "slave_id = 248 "));
+        assert!(err.contains("slave_id"), "{err}");
+        let err = validate_err(&example_with("baud_rate = 9600", "baud_rate = 0"));
+        assert!(err.contains("baud_rate"), "{err}");
+    }
+
+    #[test]
+    fn zero_debounces_are_rejected() {
+        let err = validate_err(&example_with("recovery_debounce_secs = 180", "recovery_debounce_secs = 0"));
+        assert!(err.contains("recovery_debounce_secs"), "{err}");
+        let err = validate_err(
+            &example_with("on_battery_debounce_secs = 60", "on_battery_debounce_secs = 0")
+                .replacen("low_battery_fast_debounce_secs = 15", "low_battery_fast_debounce_secs = 0", 1),
+        );
+        assert!(err.contains("on_battery_debounce_secs"), "{err}");
+    }
+
+    #[test]
+    fn wol_window_problems_flag_unrecallable_delays_beyond_the_window() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config/bridge.toml.example");
+        let cfg = Config::load(path).unwrap();
+        assert!(cfg.wol_window_problems().is_empty(), "{:?}", cfg.wol_window_problems());
+
+        // 180 s debounce + 8 x 120 s window = 1140 s; 1800 s + margin is beyond it.
+        let text = example_with("shutdown_delay_secs = 60", "shutdown_delay_secs = 1800");
+        let cfg: Config = toml::from_str(&text).unwrap();
+        cfg.validate().unwrap();
+        let problems = cfg.wol_window_problems();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("shutdown_delay_secs (1800 s)"), "{}", problems[0]);
     }
 }
 

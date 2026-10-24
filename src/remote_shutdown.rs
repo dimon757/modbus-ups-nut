@@ -296,12 +296,27 @@ async fn ssh_exec_with_retry(
 ) -> Result<String> {
     let start = tokio::time::Instant::now();
     let retry_budget = Duration::from_secs(ep.effective_ssh_connect_retry_secs(opts.ssh_connect_retry_secs));
+    let mut first = true;
 
     loop {
         if *stop.borrow() {
             bail!("recovery confirmed -- cancelled shutdown on {}", ep.name);
         }
-        match ssh_exec_timeout(ep, opts, remote_cmd, timeout).await {
+        let attempt_timeout = if first || retry_budget.is_zero() {
+            timeout
+        } else {
+            timeout
+                .min(retry_budget.saturating_sub(start.elapsed()))
+                .max(Duration::from_secs(1))
+        };
+        first = false;
+        let res = tokio::select! {
+            res = ssh_exec_timeout(ep, opts, remote_cmd, attempt_timeout) => res,
+            _ = stopped(stop) => {
+                bail!("recovery confirmed -- cancelled shutdown on {}", ep.name);
+            }
+        };
+        match res {
             Ok(out) => return Ok(out),
             Err(e) => {
                 let elapsed = start.elapsed();
@@ -372,17 +387,13 @@ async fn proxmox_vms_then_poweroff(
     // 1. Which VMs exist, and which are running -- read from the host now,
     //    not from a list that can go stale. If the host is still booting from a
     //    recent wake-up, this initial query retries until sshd is up.
-    //    If SSH connects to the host, but `qm list` itself fails (e.g. pvedaemon
-    //    down or hung), do not abandon the host poweroff: fall back to step 5 so
-    //    systemd/pve-guests stops guests and powers the host off cleanly.
+    //    If SSH connects to the host, but `qm list` itself fails or hangs (e.g.
+    //    pvedaemon down or wedged), do not abandon the host poweroff: fall back
+    //    to step 5 so systemd/pve-guests stops guests and powers the host off.
     let (vms, running) = match ssh_exec_with_retry(ep, opts, "qm list", SSH_TIMEOUT, stop).await {
         Ok(listing) => parse_qmlist_with_running(&listing),
         Err(e) => {
-            if *stop.borrow()
-                || is_transient_connection_error(&e)
-                || is_ssh_connection_failure(&e)
-                || is_ssh_auth_or_config_error(&e)
-            {
+            if should_abort_on_qmlist_error(*stop.borrow(), &e) {
                 return Err(e).context("listing VMs");
             }
             log::error!(
@@ -609,6 +620,13 @@ async fn proxmox_vms_then_poweroff(
     Ok(())
 }
 
+/// Whether a `qm list` failure means the host itself cannot be reached or
+/// recovery cancelled the sequence (abort), vs `qm list` having failed or
+/// hung after SSH connected (fall back to direct host poweroff).
+fn should_abort_on_qmlist_error(stopped: bool, err: &anyhow::Error) -> bool {
+    stopped || is_ssh_connection_failure(err) || is_ssh_auth_or_config_error(err)
+}
+
 /// Checks if an SSH error is a permanent authentication, host key, DNS, or local
 /// configuration error (where SSH itself never ran a remote command).
 fn is_ssh_auth_or_config_error(err: &anyhow::Error) -> bool {
@@ -636,11 +654,26 @@ async fn qm_shutdown_with_retry(
     stop: &mut watch::Receiver<bool>,
 ) -> Result<String> {
     let start = tokio::time::Instant::now();
+    let mut first = true;
     loop {
         if *stop.borrow() {
             bail!("recovery confirmed -- cancelled shutdown on {}", ep.name);
         }
-        match ssh_exec_timeout(ep, opts, cmd, ssh_timeout).await {
+        let attempt_timeout = if first || budget.is_zero() {
+            ssh_timeout
+        } else {
+            ssh_timeout
+                .min(budget.saturating_sub(start.elapsed()))
+                .max(Duration::from_secs(1))
+        };
+        first = false;
+        let res = tokio::select! {
+            res = ssh_exec_timeout(ep, opts, cmd, attempt_timeout) => res,
+            _ = stopped(stop) => {
+                bail!("recovery confirmed -- cancelled shutdown on {}", ep.name);
+            }
+        };
+        match res {
             Ok(out) => return Ok(out),
             Err(e) => {
                 let elapsed = start.elapsed();
@@ -1486,5 +1519,24 @@ mod resilience_tests {
         ));
         assert!(!windows_shutdown_already_scheduled("Access is denied.(5)"));
         assert!(!windows_shutdown_already_scheduled(""));
+    }
+
+    #[test]
+    fn hung_or_failing_qmlist_falls_back_to_host_poweroff_while_unreachable_host_aborts() {
+        // Hung `qm list` hits our 60 s wrapper timeout after SSH connected:
+        // must fall back to host poweroff (`should_abort_on_qmlist_error == false`).
+        let hung = err("ssh to 10.99.0.3 timed out after 60s");
+        assert!(!should_abort_on_qmlist_error(false, &hung));
+
+        // Non-zero exit from `qm list` (e.g. pvedaemon down): also fall back.
+        let failed = err("ssh to 10.99.0.3 exited Some(2): stderr=ipcc_send_rec failed");
+        assert!(!should_abort_on_qmlist_error(false, &failed));
+
+        // Unreachable host, auth failure, or recovery confirmed: abort.
+        let refused = err("ssh to 10.99.0.3 exited Some(255): stderr=ssh: connect to host 10.99.0.3 port 22: Connection refused");
+        assert!(should_abort_on_qmlist_error(false, &refused));
+        let perm = err("ssh to 10.99.0.3 exited Some(255): stderr=Permission denied (publickey).");
+        assert!(should_abort_on_qmlist_error(false, &perm));
+        assert!(should_abort_on_qmlist_error(true, &hung));
     }
 }
