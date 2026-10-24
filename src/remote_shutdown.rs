@@ -310,13 +310,7 @@ async fn ssh_exec_with_retry(
                 .max(Duration::from_secs(1))
         };
         first = false;
-        let res = tokio::select! {
-            res = ssh_exec_timeout(ep, opts, remote_cmd, attempt_timeout) => res,
-            _ = stopped(stop) => {
-                bail!("recovery confirmed -- cancelled shutdown on {}", ep.name);
-            }
-        };
-        match res {
+        match ssh_exec_timeout(ep, opts, remote_cmd, attempt_timeout).await {
             Ok(out) => return Ok(out),
             Err(e) => {
                 let elapsed = start.elapsed();
@@ -667,13 +661,7 @@ async fn qm_shutdown_with_retry(
                 .max(Duration::from_secs(1))
         };
         first = false;
-        let res = tokio::select! {
-            res = ssh_exec_timeout(ep, opts, cmd, attempt_timeout) => res,
-            _ = stopped(stop) => {
-                bail!("recovery confirmed -- cancelled shutdown on {}", ep.name);
-            }
-        };
-        match res {
+        match ssh_exec_timeout(ep, opts, cmd, attempt_timeout).await {
             Ok(out) => return Ok(out),
             Err(e) => {
                 let elapsed = start.elapsed();

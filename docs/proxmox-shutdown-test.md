@@ -128,7 +128,7 @@ Sends exactly what the bridge sends, from the bridge box with the bridge's key:
 
 ```mermaid
 flowchart TD
-    start(["Start vms_then_poweroff on Proxmox host"]) --> list["List VMs & running status: qm list<br/>(retries SSH connect failures up to ssh_connect_retry_secs;<br/>attempt timeouts capped to remaining budget;<br/>raced against recovery stop channel)"]
+    start(["Start vms_then_poweroff on Proxmox host"]) --> list["List VMs & running status: qm list<br/>(retries SSH connect failures up to ssh_connect_retry_secs;<br/>attempt timeouts capped to remaining budget)"]
     list --> list_res{"qm list result?"}
     list_res -- "SSH unreachable / auth error /<br/>recovery confirmed" --> cancel_exit(["Cancel / Abort Proxmox shutdown<br/>(no destructive steps)"])
     list_res -- "qm list failed or hung (60 s timeout)<br/>after SSH connected" --> fb_log["Log error & proceed directly<br/>to Step 5 host power-off"] --> chk_delay
@@ -140,7 +140,7 @@ flowchart TD
 
     subgraph parallel ["Parallel Execution per Running VM"]
         direction TB
-        vm_call["qm shutdown ID --timeout vm_shutdown_timeout_secs<br/>(raced against recovery stop channel)"] --> vm_eval{"SSH / qm result"}
+        vm_call["qm shutdown ID --timeout vm_shutdown_timeout_secs"] --> vm_eval{"SSH / qm result"}
         vm_eval -- "SSH handshake failed" --> ssh_retry{"Retry budget<br/>remaining?"}
         ssh_retry -- "yes" --> vm_retry_sleep["Wait 2 s<br/>(timeout capped to remaining budget)"] --> vm_call
         ssh_retry -- "exhausted" --> vm_unreached["Unreachable: skip hard stop<br/>(host poweroff stops it)"]

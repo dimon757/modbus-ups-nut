@@ -66,8 +66,8 @@ flowchart TD
     low -- "no" --> onbatt
     low -- "yes" --> write
 
-    write --> seq["SSH shutdown sequence<br/>(cancels any previous in-flight task;<br/>retry SSH calls raced against stop channel)<br/>record successfully dispatched endpoint in manifest<br/>(skip marker write if recovery confirmed)<br/>(failed endpoints & mid-flight VMs omitted for retry)<br/>concurrent background retries for booting hosts<br/>immediate advance for subsequent endpoints (stagger_secs on success)<br/>(default 300 s retry budget, or per-endpoint override;<br/>retry attempt timeouts capped to remaining budget)"]
-    seq -- "recovery confirmed<br/>(stop channel cancels retries<br/>& remaining endpoints)" --> wol
+    write --> seq["SSH shutdown sequence<br/>(cancels any previous in-flight task)<br/>record successfully dispatched endpoint in manifest<br/>(skip marker write if recovery confirmed)<br/>(failed endpoints & mid-flight VMs omitted for retry)<br/>concurrent background retries for booting hosts<br/>immediate advance for subsequent endpoints (stagger_secs on success)<br/>(default 300 s retry budget, or per-endpoint override;<br/>retry attempt timeouts capped to remaining budget)"]
+    seq -- "recovery confirmed<br/>(stop channel cancels retries,<br/>VM waits & remaining endpoints)" --> wol
     seq --> win["Windows<br/>shutdown /s /t 60<br/><i>(error 1190 already-scheduled<br/>treated as accepted)</i>"]
     seq --> pve["Proxmox VE<br/>poweroff (pve-guests)<br/>or vms_then_poweroff<br/>(parallel qm shutdown --timeout)"]
     pve -- "qm list failed or hung (60 s)<br/>after SSH connected" --> pve_fb["Fallback directly to<br/>Step 5 host poweroff<br/>(systemctl poweroff --no-block)"]
