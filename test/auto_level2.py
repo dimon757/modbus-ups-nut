@@ -476,16 +476,17 @@ class AllLevel2Runner:
 
         with open(f"{DIR}/wol.log") as f:
             wol_content = f.read()
+        assert "INVALID" not in wol_content, f"Malformed WOL packet detected: {wol_content}"
         if self.is_single_windows:
-            assert "AA:BB:CC:00:00:01" in wol_content
+            assert wol_content.count("AA:BB:CC:00:00:01  ok") == 4, f"Expected 4 valid WOL packets for ws-1, got:\n{wol_content}"
             assert "AA:BB:CC:00:00:02" not in wol_content
             assert "AA:BB:CC:00:00:03" not in wol_content
-            log("  [OK] Wake-on-LAN magic packet confirmed received for ws-1 target", Color.GREEN)
+            log("  [OK] Wake-on-LAN magic packet confirmed received (4/4 valid rounds) for ws-1 target", Color.GREEN)
         else:
-            assert "AA:BB:CC:00:00:01" in wol_content
-            assert "AA:BB:CC:00:00:02" in wol_content
-            assert "AA:BB:CC:00:00:03" in wol_content
-            log("  [OK] Wake-on-LAN magic packets confirmed received for all 3 targets", Color.GREEN)
+            assert wol_content.count("AA:BB:CC:00:00:01  ok") == 4, f"Expected 4 valid WOL packets for ws-1, got:\n{wol_content}"
+            assert wol_content.count("AA:BB:CC:00:00:02  ok") == 4, f"Expected 4 valid WOL packets for ws-2, got:\n{wol_content}"
+            assert wol_content.count("AA:BB:CC:00:00:03  ok") == 4, f"Expected 4 valid WOL packets for proxmox, got:\n{wol_content}"
+            log("  [OK] Wake-on-LAN magic packets confirmed received (4/4 valid rounds) for all 3 targets", Color.GREEN)
         log("--> SCENARIO D: PASSED", Color.GREEN + Color.BOLD)
 
     def test_scenario_e(self):
@@ -512,7 +513,14 @@ class AllLevel2Runner:
         line = self.wait_for_bridge_log(r"firing shutdown sequence", timeout=8)
         log(f"  [OK] {line}", Color.GREEN)
         self.wait_for_bridge_log(r"shutdown sequence complete", timeout=25)
-        log("  [OK] All 3 endpoints safely shut down during grid flicker", Color.GREEN)
+        assert os.path.exists(f"{DIR}/shutdown_fired"), "Marker file must exist after Scenario E shutdown"
+        with open(f"{DIR}/ssh.log") as f:
+            ssh_content = f.read()
+        assert "10.99.0.1" in ssh_content, "ws-1 not contacted in Scenario E"
+        if not self.is_single_windows:
+            assert "10.99.0.2" in ssh_content, "ws-2 not contacted in Scenario E"
+            assert "10.99.0.3" in ssh_content, "proxmox not contacted in Scenario E"
+        log("  [OK] All endpoints safely shut down and verified in ssh.log during grid flicker", Color.GREEN)
         log("--> SCENARIO E: PASSED", Color.GREEN + Color.BOLD)
 
     def test_scenario_f(self):
@@ -1174,7 +1182,16 @@ class AllLevel2Runner:
         log(f"  [OK] {line}", Color.GREEN)
 
         self.wait_for_bridge_log(r"shutdown sequence complete", timeout=10)
-        log("  [OK] Sequence completed after hard power-off fallback", Color.GREEN)
+        for vm_id in (100, 101, 108, 109):
+            with open(f"{DIR}/proxmox/10.99.0.3/state_{vm_id}") as f:
+                assert f.read().strip() == "off", f"VM {vm_id} must be off after Scenario N2"
+        with open(f"{DIR}/ssh.log") as f:
+            ssh_content = f.read()
+        assert "qm stop 108" in ssh_content, "Expected hard stop (qm stop 108) for no-tools-vm"
+        assert "qm stop 109" in ssh_content, "Expected hard stop (qm stop 109) for stuck-vm"
+        with open(f"{DIR}/proxmox/10.99.0.3/host") as f:
+            assert "poweroff via systemctl" in f.read()
+        log("  [OK] Sequence completed and all VM/host state files verified after hard power-off fallback", Color.GREEN)
 
         self.send_sim_cmd("restore")
         self.send_sim_cmd("soc 80")
