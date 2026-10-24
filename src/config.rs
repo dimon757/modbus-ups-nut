@@ -512,18 +512,20 @@ impl Config {
     }
 
     /// Endpoints whose delayed shutdown could outlast every Wake-on-LAN
-    /// round. A Windows `shutdown /s /t N` or a Proxmox `poweroff`
+    /// resend. A Windows `shutdown /s /t N` or a Proxmox `poweroff`
     /// endpoint's detached `sleep N; poweroff` cannot be recalled once sent:
     /// if the grid returns right after dispatch, the machine still powers
-    /// off N seconds later. It is only woken again if a WOL round goes out
-    /// after it is down, i.e. if `shutdown_delay_secs` plus the time to shut
-    /// down fits inside `recovery_debounce_secs` + the resend window.
+    /// off N seconds later. It is only woken again if a WOL packet goes out
+    /// after its countdown ends, i.e. if `shutdown_delay_secs` fits inside
+    /// `recovery_debounce_secs` + the resend window.
     /// (`vms_then_poweroff` Proxmox endpoints apply their delay locally and
     /// recovery cancels it, so they are not affected.) Logged at startup.
     pub fn wol_window_problems(&self) -> Vec<String> {
-        /// Rough time an endpoint needs to actually power off once its
-        /// countdown ends.
-        const SHUTDOWN_MARGIN_SECS: u64 = 120;
+        if let Ok(sock) = self.wol_broadcast_addr.parse::<std::net::SocketAddr>() {
+            if sock.ip().is_loopback() {
+                return Vec::new();
+            }
+        }
         let t = &self.thresholds;
         let last_wol_secs = t
             .recovery_debounce_secs
@@ -534,15 +536,15 @@ impl Config {
                 !(ep.kind == EndpointKind::Proxmox && self.proxmox.method == ProxmoxMethod::VmsThenPoweroff)
             })
             .filter_map(|ep| {
-                let off_by = u64::from(ep.shutdown_delay_secs).saturating_add(SHUTDOWN_MARGIN_SECS);
-                (off_by > last_wol_secs).then(|| {
+                let delay = u64::from(ep.shutdown_delay_secs);
+                (delay > last_wol_secs).then(|| {
                     format!(
-                        "endpoint {}: shutdown_delay_secs ({} s) + ~{} s to power off exceeds \
+                        "endpoint {}: shutdown_delay_secs ({} s) exceeds \
                          recovery_debounce_secs + WOL resend window ({} s) -- if the grid returns \
                          right after its shutdown is sent, it may power off after the last \
-                         Wake-on-LAN round and stay off; raise wol_resend_count / \
+                         WOL resend and stay off; raise wol_resend_count / \
                          wol_resend_interval_secs or lower shutdown_delay_secs",
-                        ep.name, ep.shutdown_delay_secs, SHUTDOWN_MARGIN_SECS, last_wol_secs
+                        ep.name, ep.shutdown_delay_secs, last_wol_secs
                     )
                 })
             })
